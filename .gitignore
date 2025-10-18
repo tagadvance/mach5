@@ -1,3 +1,13 @@
+*.cer
+*.crt
+*.cert
+*.csr
+*.key
+*.srl
+*.pem
+*.p12
+*.jks
+
 # From https://github.com/github/gitignore/blob/master/Gradle.gitignore
 .gradle
 /build/

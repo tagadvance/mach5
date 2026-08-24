@@ -106,13 +106,73 @@ impl Default for Tls {
 	}
 }
 
+/// A thread count, either absolute or relative to the core count using Maven's
+/// `-T` convention: `"1C"` is one per core, `"2C"` two per core, `"0.5C"` half.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum Threads {
+	Count(usize),
+	PerCore(String),
+}
+
+impl Default for Threads {
+	fn default() -> Self {
+		Self::PerCore("1C".to_string())
+	}
+}
+
+impl Threads {
+	/// Resolve to a concrete count, never less than one.
+	pub fn resolve(&self) -> usize {
+		let cores = available_cores();
+
+		let count = match self {
+			// 0 has always meant "decide for me".
+			Self::Count(0) => cores,
+			Self::Count(n) => *n,
+			Self::PerCore(spec) => parse_threads(spec, cores).unwrap_or_else(|| {
+				log::warn!("unparsable worker_threads {spec:?}; using one per core");
+
+				cores
+			}),
+		};
+
+		count.max(1)
+	}
+}
+
+/// Parse `"2C"`, `"0.5C"` or a plain `"8"`.
+fn parse_threads(spec: &str, cores: usize) -> Option<usize> {
+	let spec = spec.trim();
+
+	let Some(multiplier) = spec.strip_suffix(['C', 'c']) else {
+		return spec.parse::<usize>().ok();
+	};
+
+	let multiplier: f64 = multiplier.trim().parse().ok()?;
+	if !multiplier.is_finite() || multiplier <= 0.0 {
+		return None;
+	}
+
+	Some((multiplier * cores as f64).round() as usize)
+}
+
+/// Parallelism available to this process. Deliberately not the physical core
+/// count: this respects cgroup CPU limits and affinity masks, so it stays
+/// correct inside a container.
+fn available_cores() -> usize {
+	std::thread::available_parallelism()
+		.map(|n| n.get())
+		.unwrap_or(4)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Limits {
 	/// Cap on a buffered request body; bounds what one stream can allocate.
 	pub max_request_body_mb: usize,
-	/// Upstream fetch workers. 0 means one per available core.
-	pub worker_threads: usize,
+	/// Upstream fetch workers, absolute (`8`) or per-core (`"1C"`, `"2C"`).
+	pub worker_threads: Threads,
 	pub connect_timeout_seconds: u64,
 	pub read_timeout_seconds: u64,
 	/// How long a plugin may take per hook before it is abandoned.
@@ -123,7 +183,7 @@ impl Default for Limits {
 	fn default() -> Self {
 		Self {
 			max_request_body_mb: 10,
-			worker_threads: 0,
+			worker_threads: Threads::default(),
 			connect_timeout_seconds: 10,
 			read_timeout_seconds: 30,
 			plugin_timeout_seconds: 10,
@@ -224,13 +284,7 @@ impl Config {
 	}
 
 	pub fn worker_threads(&self) -> usize {
-		if self.limits.worker_threads > 0 {
-			return self.limits.worker_threads;
-		}
-
-		std::thread::available_parallelism()
-			.map(|n| n.get())
-			.unwrap_or(4)
+		self.limits.worker_threads.resolve()
 	}
 }
 
@@ -312,6 +366,36 @@ mod tests {
 
 		assert_eq!(expanded, home().join(".cache/mach5"));
 		assert_eq!(expand_tilde(Path::new("/abs/path")), Path::new("/abs/path"));
+	}
+
+	#[test]
+	fn threads_follow_the_maven_per_core_convention() {
+		assert_eq!(parse_threads("1C", 8), Some(8));
+		assert_eq!(parse_threads("2C", 8), Some(16));
+		assert_eq!(parse_threads("0.5C", 8), Some(4));
+		assert_eq!(parse_threads("2c", 8), Some(16), "lowercase suffix works");
+		assert_eq!(parse_threads(" 2C ", 8), Some(16), "surrounding space is fine");
+		// A bare number is an absolute count, not a multiplier.
+		assert_eq!(parse_threads("6", 8), Some(6));
+	}
+
+	#[test]
+	fn nonsense_thread_specs_are_rejected() {
+		assert_eq!(parse_threads("C", 8), None);
+		assert_eq!(parse_threads("xC", 8), None);
+		assert_eq!(parse_threads("-2C", 8), None);
+		assert_eq!(parse_threads("0C", 8), None);
+	}
+
+	#[test]
+	fn thread_count_parses_from_either_toml_form() {
+		let per_core = Config::from_str("[limits]\nworker_threads = \"2C\"\n").unwrap();
+		let absolute = Config::from_str("[limits]\nworker_threads = 3\n").unwrap();
+
+		assert_eq!(absolute.worker_threads(), 3);
+		assert_eq!(per_core.worker_threads(), 2 * available_cores());
+		// Default is one per core.
+		assert_eq!(Config::default().worker_threads(), available_cores());
 	}
 
 	#[test]

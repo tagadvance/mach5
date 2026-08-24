@@ -40,8 +40,11 @@ refresh_margin_minutes = 60
 [limits]
 # Cap on a buffered request body; bounds what a single stream can allocate.
 max_request_body_mb = 10
-# Upstream fetch workers. 0 means one per available core.
-worker_threads = 0
+# Upstream fetch workers, using Maven's -T convention: "1C" is one per core,
+# "2C" two per core, "0.5C" half. A bare number is an absolute count.
+# "Core" here is the parallelism available to the process, so it stays correct
+# under a container CPU limit.
+worker_threads = "1C"
 connect_timeout_seconds = 10
 read_timeout_seconds = 30
 # How long a plugin may take per hook before it is abandoned.

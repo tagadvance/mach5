@@ -9,6 +9,7 @@
 mod blocklist;
 mod ca;
 mod config;
+mod encoding;
 mod interceptor;
 mod interstitial;
 mod plugin;
@@ -290,12 +291,15 @@ fn handle_job(
 			log::warn!("failed reading upstream body for {}: {e}", job.request.url);
 		}
 
+		// Interceptors rewrite plain bytes; the coding goes back on afterwards.
+		let (body, coding) = encoding::decode(&mut head.headers, body);
 		let mut response = ProxyResponse {
 			status: head.status,
 			headers: head.headers,
 			body,
 		};
 		interceptor.on_response(&job.request, &mut response);
+		response.body = encoding::encode(&mut response.headers, response.body, coding);
 
 		return send(Payload::Full(response));
 	}

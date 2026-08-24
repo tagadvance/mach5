@@ -32,6 +32,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::ca::CertAuthority;
 use crate::config::Config;
+use crate::encoding;
 use crate::interceptor::{Chain, Interceptor, ProxyRequest, ProxyResponse, ResponseHead};
 use crate::interstitial;
 use crate::upstream;
@@ -320,12 +321,15 @@ fn fetch_blocking(
 			log::warn!("failed reading upstream body for {}: {e}", request.url);
 		}
 
+		// Interceptors rewrite plain bytes; the coding goes back on afterwards.
+		let (body, coding) = encoding::decode(&mut head.headers, body);
 		let mut response = ProxyResponse {
 			status: head.status,
 			headers: head.headers,
 			body,
 		};
 		interceptor.on_response(&request, &mut response);
+		response.body = encoding::encode(&mut response.headers, response.body, coding);
 		apply_alt_svc(&shared.config, &mut response.headers);
 		let _ = head_tx.send(Outcome::Buffered(response));
 

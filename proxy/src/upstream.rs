@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use crate::config::Config;
+use crate::encoding;
 use crate::interceptor::ProxyRequest;
 
 /// Builds the shared upstream HTTP agent.
@@ -48,8 +49,15 @@ fn is_tls_failure(message: &str) -> bool {
 pub fn call(agent: &ureq::Agent, req: &ProxyRequest) -> Result<ureq::Response, FetchError> {
 	let mut request = agent.request(&req.method, &req.url);
 	for (name, value) in &req.headers {
+		// Negotiated below instead: relaying the client's value verbatim invites
+		// a coding the interceptors cannot decode.
+		if name.eq_ignore_ascii_case("accept-encoding") {
+			continue;
+		}
+
 		request = request.set(name, value);
 	}
+	request = request.set("accept-encoding", &encoding::negotiate(&req.headers));
 
 	let result = if req.body.is_empty() {
 		request.call()

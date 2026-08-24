@@ -1,0 +1,50 @@
+# mach5 configuration for the container.
+#
+# Paths are relative to /etc/mach5, which is the image's working directory and
+# where compose mounts the plugins and CA.
+#
+# The difference from the repo-root mach5.toml is the ports: here everything is
+# on 443, because that is what clients actually connect to.
+
+listen = "0.0.0.0:443"
+listen_tcp = "0.0.0.0:443"
+
+[ca]
+# Mounted read-only by compose. Generate these once and keep them off the repo.
+cert = "security/mach5_root.crt"
+key = "security/mach5_root.pem"
+
+[http]
+# Advertise HTTP/3 on the port clients reach us on.
+alt_svc = 'h3=":443"; ma=86400'
+keep_alive = true
+idle_timeout_seconds = 60
+max_header_bytes = 65536
+
+[paths]
+# A named volume, so re-encoded assets survive a container restart.
+cache_dir = "/var/cache/mach5"
+
+[plugins]
+dir = "plugins"
+enabled = true
+stamp_responses = false
+
+[tls]
+leaf_ttl_hours = 24
+clock_skew_minutes = 60
+refresh_margin_minutes = 60
+
+[limits]
+max_request_body_mb = 10
+worker_threads = "1C"
+connect_timeout_seconds = 10
+read_timeout_seconds = 30
+plugin_timeout_seconds = 10
+
+[quic]
+max_datagram_size = 1350
+max_idle_timeout_ms = 30000
+initial_max_data = 10000000
+initial_max_stream_data = 1000000
+initial_max_streams = 100

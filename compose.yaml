@@ -1,0 +1,41 @@
+services:
+  mach5:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mach5-proxy:latest
+    container_name: mach5
+    restart: unless-stopped
+
+    # Browsers open TCP 443 first and only move to QUIC once they have seen the
+    # Alt-Svc header, so both are required. UDP is not optional either — without
+    # it the Alt-Svc advertisement points at a closed door.
+    ports:
+      - "443:443/tcp"
+      - "443:443/udp"
+
+    # The process runs as an unprivileged user, so it needs this one capability
+    # to bind 443 rather than running as root.
+    cap_add:
+      - NET_BIND_SERVICE
+
+    volumes:
+      - ./docker/mach5.toml:/etc/mach5/mach5.toml:ro
+      - ./plugins:/etc/mach5/plugins:ro
+      # The root CA. Read-only, and never baked into the image.
+      - ./security:/etc/mach5/security:ro
+      - mach5-cache:/var/cache/mach5
+
+    environment:
+      # info is a reasonable default; RUST_LOG=debug for handshake detail.
+      RUST_LOG: ${RUST_LOG:-info}
+
+    # IMPORTANT: the proxy must not resolve through the wildcard DNS server that
+    # points every name at this proxy, or it will resolve every origin back to
+    # itself and loop. Point it at pi-hole (or any resolver that gives real
+    # answers) instead.
+    dns:
+      - ${MACH5_UPSTREAM_DNS:-1.1.1.1}
+
+volumes:
+  mach5-cache:

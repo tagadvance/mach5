@@ -46,8 +46,12 @@ impl CertAuthority {
 	pub fn from_config(config: &Config) -> Result<Self, Box<dyn Error>> {
 		match (&config.ca.cert, &config.ca.key) {
 			(Some(cert_path), Some(key_path)) => {
-				let cert_pem = std::fs::read_to_string(cert_path)?;
-				let key_pem = std::fs::read_to_string(key_path)?;
+				// Name the file in the error: "No such file or directory" with
+				// no path is a miserable thing to debug inside a container.
+				let cert_pem = std::fs::read_to_string(cert_path)
+					.map_err(|e| format!("cannot read [ca] cert {}: {e}", cert_path.display()))?;
+				let key_pem = std::fs::read_to_string(key_path)
+					.map_err(|e| format!("cannot read [ca] key {}: {e}", key_path.display()))?;
 				log::info!("loaded root CA from {}", cert_path.display());
 
 				Self::from_pem(&cert_pem, &key_pem, config)

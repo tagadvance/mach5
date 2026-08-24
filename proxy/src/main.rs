@@ -10,6 +10,8 @@ mod ca;
 mod config;
 mod interceptor;
 mod plugin;
+mod tcp;
+mod upstream;
 
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
@@ -17,7 +19,6 @@ use std::io::Read;
 use std::net::SocketAddr;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use boring::ssl::{select_next_proto, AlpnError, SslContextBuilder, SslMethod, SslVersion};
 use quiche::h3::NameValue;
@@ -111,6 +112,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 	}
 
 	let ca = Arc::new(CertAuthority::from_config(&config)?);
+	tcp::spawn(config.clone(), ca.clone())?;
+
 	let mut quic_config = build_quic_config(ca, &config)?;
 	let h3_config = quiche::h3::Config::new()?;
 
@@ -188,11 +191,7 @@ fn spawn_workers(
 	let (res_tx, res_rx) = std::sync::mpsc::channel::<FetchResult>();
 	let job_rx = Arc::new(Mutex::new(job_rx));
 
-	let agent = ureq::AgentBuilder::new()
-		.redirects(0) // pass 3xx through to the client; it re-requests and we intercept again
-		.timeout_connect(Duration::from_secs(config.limits.connect_timeout_seconds))
-		.timeout_read(Duration::from_secs(config.limits.read_timeout_seconds))
-		.build();
+	let agent = upstream::agent(&config);
 
 	for _ in 0..config.worker_threads() {
 		let job_rx = job_rx.clone();
@@ -252,7 +251,7 @@ fn handle_job(
 		Ok(())
 	};
 
-	let resp = match call_upstream(agent, &job.request) {
+	let resp = match upstream::call(agent, &job.request) {
 		Ok(resp) => resp,
 		Err(message) => {
 			return send(Payload::Full(ProxyResponse {
@@ -265,7 +264,7 @@ fn handle_job(
 
 	let mut head = ResponseHead {
 		status: resp.status(),
-		headers: response_headers(&resp),
+		headers: upstream::response_headers(&resp),
 	};
 
 	if interceptor.wants_body(&job.request, &head) {
@@ -305,40 +304,6 @@ fn handle_job(
 	send(Payload::End)
 }
 
-/// Perform the upstream request, mapping transport failures to a message.
-fn call_upstream(agent: &ureq::Agent, req: &ProxyRequest) -> Result<ureq::Response, String> {
-	let mut request = agent.request(&req.method, &req.url);
-	for (name, value) in &req.headers {
-		request = request.set(name, value);
-	}
-
-	let result = if req.body.is_empty() {
-		request.call()
-	} else {
-		// ureq derives Content-Length from the payload.
-		request.send_bytes(&req.body)
-	};
-
-	match result {
-		Ok(resp) => Ok(resp),
-		// An HTTP error status is a perfectly good response to relay.
-		Err(ureq::Error::Status(_, resp)) => Ok(resp),
-		// TODO: distinguish TLS validation failures and render a proper
-		// interstitial with a per-host bypass instead of this plain 502.
-		Err(ureq::Error::Transport(t)) => Err(format!("mach5: upstream fetch failed: {t}\n")),
-	}
-}
-
-fn response_headers(resp: &ureq::Response) -> Vec<(String, String)> {
-	resp.headers_names()
-		.into_iter()
-		.filter(|name| !is_hop_by_hop(name))
-		.filter_map(|name| {
-			resp.header(&name)
-				.map(|value| (name.clone(), value.to_string()))
-		})
-		.collect()
-}
 
 fn drain_results(results: &Receiver<FetchResult>, clients: &mut ClientMap) {
 	while let Ok(result) = results.try_recv() {
@@ -843,7 +808,7 @@ fn build_request(list: &[quiche::h3::Header]) -> Option<ProxyRequest> {
 			b":path" => path = Some(value),
 			b":scheme" => scheme = Some(value),
 			name if name.starts_with(b":") => {}
-			name if is_hop_by_hop(&String::from_utf8_lossy(name)) => {}
+			name if upstream::is_hop_by_hop(&String::from_utf8_lossy(name)) => {}
 			// ureq derives Host from the URL; a second one would conflict.
 			b"host" => {}
 			name => headers.push((String::from_utf8_lossy(name).into_owned(), value)),
@@ -867,7 +832,7 @@ fn build_request(list: &[quiche::h3::Header]) -> Option<ProxyRequest> {
 
 /// Host portion of an `:authority`, dropping any `:port` and keeping an IPv6
 /// literal's brackets.
-fn authority_host(authority: &str) -> &str {
+pub(crate) fn authority_host(authority: &str) -> &str {
 	if authority.starts_with('[') {
 		return authority.find(']').map_or(authority, |i| &authority[..=i]);
 	}
@@ -875,23 +840,6 @@ fn authority_host(authority: &str) -> &str {
 	authority
 		.split_once(':')
 		.map_or(authority, |(host, _port)| host)
-}
-
-/// Hop-by-hop headers are meaningful only on a single connection and must not be
-/// forwarded across the proxy (RFC 9110 §7.6.1), plus framing headers we set
-/// ourselves.
-fn is_hop_by_hop(name: &str) -> bool {
-	matches!(
-		name.to_ascii_lowercase().as_str(),
-		"connection"
-			| "keep-alive"
-			| "proxy-authenticate"
-			| "proxy-authorization"
-			| "te" | "trailer"
-			| "transfer-encoding"
-			| "upgrade"
-			| "content-length"
-	)
 }
 
 /// Build an address-validation token: a marker, the client's address, and the

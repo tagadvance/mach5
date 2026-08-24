@@ -10,6 +10,7 @@ pub struct ProxyRequest {
 	pub method: String,
 	pub url: String,
 	pub headers: Vec<(String, String)>,
+	pub body: Vec<u8>,
 }
 
 /// A response coming back from upstream.
@@ -64,6 +65,7 @@ mod tests {
 			method: "GET".to_string(),
 			url: "https://example.com/".to_string(),
 			headers: Vec::new(),
+			body: Vec::new(),
 		};
 		let mut resp = response();
 

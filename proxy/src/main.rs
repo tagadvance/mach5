@@ -27,6 +27,10 @@ const MAX_DATAGRAM_SIZE: usize = 1350;
 const SOCKET: mio::Token = mio::Token(0);
 const WAKER: mio::Token = mio::Token(1);
 
+/// Cap on a buffered request body. Bodies are held in memory until the request
+/// is complete, so this bounds what one stream can make us allocate.
+const MAX_REQUEST_BODY: usize = 10 * 1024 * 1024;
+
 /// A request handed off to a worker for fetching.
 struct FetchJob {
 	conn: quiche::ConnectionId<'static>,
@@ -55,6 +59,9 @@ struct Client {
 	conn: quiche::Connection,
 	http3: Option<quiche::h3::Connection>,
 	pending: Vec<Pending>,
+	/// Requests whose headers have arrived but whose body is still streaming in,
+	/// keyed by stream id.
+	partial: HashMap<u64, ProxyRequest>,
 }
 
 type ClientMap = HashMap<quiche::ConnectionId<'static>, Client>;
@@ -197,7 +204,14 @@ fn fetch(agent: &ureq::Agent, req: &ProxyRequest) -> ProxyResponse {
 		request = request.set(name, value);
 	}
 
-	let resp = match request.call() {
+	let result = if req.body.is_empty() {
+		request.call()
+	} else {
+		// ureq derives Content-Length from the payload.
+		request.send_bytes(&req.body)
+	};
+
+	let resp = match result {
 		Ok(resp) => resp,
 		Err(ureq::Error::Status(_, resp)) => resp,
 		Err(ureq::Error::Transport(t)) => {
@@ -344,6 +358,7 @@ fn recv_packet(
 					conn,
 					http3: None,
 					pending: Vec::new(),
+					partial: HashMap::new(),
 				},
 			);
 
@@ -387,7 +402,14 @@ fn drive_http3(
 			continue;
 		};
 
-		poll_requests(&key, &mut client.conn, http3, jobs);
+		poll_requests(
+			&key,
+			&mut client.conn,
+			http3,
+			&mut client.partial,
+			&mut client.pending,
+			jobs,
+		);
 		pump_responses(&mut client.conn, http3, &mut client.pending);
 	}
 }
@@ -396,32 +418,41 @@ fn poll_requests(
 	key: &quiche::ConnectionId<'static>,
 	conn: &mut quiche::Connection,
 	http3: &mut quiche::h3::Connection,
+	partial: &mut HashMap<u64, ProxyRequest>,
+	pending: &mut Vec<Pending>,
 	jobs: &Sender<FetchJob>,
 ) {
+	let mut buf = [0u8; 16_384];
+
 	loop {
 		match http3.poll(conn) {
-			Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+			Ok((stream_id, quiche::h3::Event::Headers { list, more_frames })) => {
 				match build_request(&list) {
+					// No body to wait for: dispatch straight away.
+					Some(request) if !more_frames => dispatch(key, stream_id, request, jobs),
+					// A body (or trailers) follows; hold the request until the
+					// stream finishes so we forward it whole.
 					Some(request) => {
-						log::info!("proxying stream={stream_id} {} {}", request.method, request.url);
-
-						// TODO: forward request bodies (POST/PUT) — read them from
-						// the stream's Data events before dispatching.
-						let job = FetchJob {
-							conn: key.clone(),
-							stream_id,
-							request,
-						};
-						if jobs.send(job).is_err() {
-							log::error!("worker pool is gone; cannot dispatch request");
-						}
+						partial.insert(stream_id, request);
 					}
 					None => log::warn!("stream={stream_id} missing pseudo-headers; ignoring"),
 				}
 			}
-			Ok((_, quiche::h3::Event::Data)) => {}
-			Ok((_, quiche::h3::Event::Finished)) => {}
-			Ok((_, quiche::h3::Event::Reset(_))) => {}
+			Ok((stream_id, quiche::h3::Event::Data)) => {
+				if let Err(status) = read_body(http3, conn, stream_id, partial, &mut buf) {
+					partial.remove(&stream_id);
+					pending.push(error_response(stream_id, status, "request body too large"));
+				}
+			}
+			Ok((stream_id, quiche::h3::Event::Finished)) => {
+				if let Some(request) = partial.remove(&stream_id) {
+					dispatch(key, stream_id, request, jobs);
+				}
+			}
+			Ok((stream_id, quiche::h3::Event::Reset(code))) => {
+				log::debug!("stream={stream_id} reset by peer (code {code})");
+				partial.remove(&stream_id);
+			}
 			Ok((_, quiche::h3::Event::PriorityUpdate)) => {}
 			Ok((_, quiche::h3::Event::GoAway)) => {}
 			Err(quiche::h3::Error::Done) => break,
@@ -431,6 +462,89 @@ fn poll_requests(
 				break;
 			}
 		}
+	}
+}
+
+/// Drain the body bytes currently readable on `stream_id` into its pending
+/// request. Errs with an HTTP status when the body exceeds [`MAX_REQUEST_BODY`].
+fn read_body(
+	http3: &mut quiche::h3::Connection,
+	conn: &mut quiche::Connection,
+	stream_id: u64,
+	partial: &mut HashMap<u64, ProxyRequest>,
+	buf: &mut [u8],
+) -> Result<(), u16> {
+	loop {
+		let read = match http3.recv_body(conn, stream_id, buf) {
+			Ok(0) => return Ok(()),
+			Ok(n) => n,
+			Err(quiche::h3::Error::Done) => return Ok(()),
+			Err(e) => {
+				log::debug!("recv_body on stream={stream_id} failed: {e}");
+
+				return Ok(());
+			}
+		};
+
+		// Body bytes on a stream we are not tracking (e.g. already rejected):
+		// keep draining so the stream does not stall, but discard them.
+		let Some(request) = partial.get_mut(&stream_id) else {
+			continue;
+		};
+
+		if !append_bounded(&mut request.body, &buf[..read], MAX_REQUEST_BODY) {
+			log::warn!("stream={stream_id} body exceeds {MAX_REQUEST_BODY} bytes; rejecting");
+
+			return Err(413);
+		}
+	}
+}
+
+/// Append `chunk` to `body`, refusing rather than growing past `cap`. Guards
+/// against a client exhausting memory with an endless body.
+fn append_bounded(body: &mut Vec<u8>, chunk: &[u8], cap: usize) -> bool {
+	if body.len() + chunk.len() > cap {
+		return false;
+	}
+
+	body.extend_from_slice(chunk);
+
+	true
+}
+
+fn dispatch(
+	key: &quiche::ConnectionId<'static>,
+	stream_id: u64,
+	request: ProxyRequest,
+	jobs: &Sender<FetchJob>,
+) {
+	log::info!(
+		"proxying stream={stream_id} {} {} ({} body bytes)",
+		request.method,
+		request.url,
+		request.body.len()
+	);
+
+	let job = FetchJob {
+		conn: key.clone(),
+		stream_id,
+		request,
+	};
+	if jobs.send(job).is_err() {
+		log::error!("worker pool is gone; cannot dispatch request");
+	}
+}
+
+fn error_response(stream_id: u64, status: u16, message: &str) -> Pending {
+	Pending {
+		stream_id,
+		response: ProxyResponse {
+			status,
+			headers: vec![("content-type".to_string(), "text/plain".to_string())],
+			body: format!("mach5: {message}\n").into_bytes(),
+		},
+		headers_sent: false,
+		body_offset: 0,
 	}
 }
 
@@ -557,6 +671,7 @@ fn build_request(list: &[quiche::h3::Header]) -> Option<ProxyRequest> {
 		method: method?,
 		url,
 		headers,
+		body: Vec::new(),
 	})
 }
 
@@ -654,6 +769,24 @@ mod tests {
 		assert_eq!(req.url, "https://example.com/index.html");
 		// host (ureq sets it) and hop-by-hop headers are dropped; user-agent kept.
 		assert_eq!(req.headers, vec![("user-agent".to_string(), "curl".to_string())]);
+	}
+
+	#[test]
+	fn append_bounded_accepts_up_to_cap() {
+		let mut body = Vec::new();
+
+		assert!(append_bounded(&mut body, b"abc", 6));
+		assert!(append_bounded(&mut body, b"def", 6), "exact fit is allowed");
+		assert_eq!(body, b"abcdef");
+	}
+
+	#[test]
+	fn append_bounded_rejects_overflow_without_growing() {
+		let mut body = Vec::new();
+		append_bounded(&mut body, b"abcde", 6);
+
+		assert!(!append_bounded(&mut body, b"xy", 6));
+		assert_eq!(body, b"abcde", "rejected chunk must not be appended");
 	}
 
 	#[test]

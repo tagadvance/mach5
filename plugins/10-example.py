@@ -26,6 +26,17 @@ def log(message):
     print(f"[10-example] {message}", file=sys.stderr, flush=True)
 
 
+def on_init(_msg):
+    """Register what this plugin wants to see.
+
+    Constraints are ANDed, matched case-insensitively as substrings, and can
+    name any header including custom `x-*` ones. Declaring a response
+    content-type means images and video are never buffered for us — they stream
+    straight through to the client.
+    """
+    return {"match": {"response": {"content-type": "text/html"}}}
+
+
 def on_request(msg):
     url = msg.get("url", "")
     host = url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
@@ -40,8 +51,9 @@ def on_request(msg):
 
 
 def on_response(msg):
-    headers = {name.lower(): value for name, value in msg.get("headers", [])}
-    if "text/html" not in headers.get("content-type", ""):
+    # The proxy only routes matching responses here, but a body is still absent
+    # when it is streaming past unbuffered — nothing to rewrite in that case.
+    if msg.get("streaming"):
         return {}
 
     body = base64.b64decode(msg.get("body_b64", ""))
@@ -67,7 +79,12 @@ def main():
 
         try:
             msg = json.loads(line)
-            reply = on_request(msg) if msg.get("hook") == "request" else on_response(msg)
+            handler = {
+                "init": on_init,
+                "request": on_request,
+                "response": on_response,
+            }.get(msg.get("hook"), lambda _msg: {})
+            reply = handler(msg)
         except Exception as e:  # never die: a broken plugin should not break browsing
             log(f"error: {e}")
             reply = {}

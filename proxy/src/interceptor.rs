@@ -20,12 +20,32 @@ pub struct ProxyResponse {
 	pub body: Vec<u8>,
 }
 
+/// A response's status and headers, known before its body has been read.
+pub struct ResponseHead {
+	pub status: u16,
+	pub headers: Vec<(String, String)>,
+}
+
 /// Hooks run on the worker thread, off the QUIC event loop, so an expensive
 /// interceptor cannot stall unrelated connections.
 pub trait Interceptor: Send + Sync {
 	fn on_request(&self, _req: &mut ProxyRequest) {}
 
+	/// Called with the whole response once its body has been buffered — which
+	/// only happens when [`wants_body`](Self::wants_body) asked for it.
 	fn on_response(&self, _req: &ProxyRequest, _resp: &mut ProxyResponse) {}
+
+	/// Called instead of [`on_response`](Self::on_response) when the body is
+	/// streaming past unbuffered. Status and headers may still be changed; the
+	/// body is not available.
+	fn on_response_head(&self, _req: &ProxyRequest, _head: &mut ResponseHead) {}
+
+	/// Whether this interceptor needs the whole body in memory. Returning false
+	/// lets the body stream straight through, which is what large media wants.
+	/// Defaults to true so an interceptor that forgets to answer still works.
+	fn wants_body(&self, _req: &ProxyRequest, _head: &ResponseHead) -> bool {
+		true
+	}
 }
 
 /// An ordered list of interceptors, applied in sequence. Requests run through
@@ -66,6 +86,17 @@ impl Interceptor for Chain {
 			link.on_response(req, resp);
 		}
 	}
+
+	fn on_response_head(&self, req: &ProxyRequest, head: &mut ResponseHead) {
+		for link in &self.links {
+			link.on_response_head(req, head);
+		}
+	}
+
+	/// Buffer only if something in the chain actually wants the body.
+	fn wants_body(&self, req: &ProxyRequest, head: &ResponseHead) -> bool {
+		self.links.iter().any(|link| link.wants_body(req, head))
+	}
 }
 
 /// Stamps every response with a marker header. Its only job is to make
@@ -75,11 +106,22 @@ pub struct Stamp;
 
 impl Interceptor for Stamp {
 	fn on_response(&self, _req: &ProxyRequest, resp: &mut ProxyResponse) {
-		resp.headers
-			.retain(|(k, _)| !k.eq_ignore_ascii_case("x-mach5"));
-		resp.headers
-			.push(("x-mach5".to_string(), "intercepted".to_string()));
+		stamp(&mut resp.headers);
 	}
+
+	fn on_response_head(&self, _req: &ProxyRequest, head: &mut ResponseHead) {
+		stamp(&mut head.headers);
+	}
+
+	/// Touches headers only, so it never forces a body to be buffered.
+	fn wants_body(&self, _req: &ProxyRequest, _head: &ResponseHead) -> bool {
+		false
+	}
+}
+
+fn stamp(headers: &mut Vec<(String, String)>) {
+	headers.retain(|(k, _)| !k.eq_ignore_ascii_case("x-mach5"));
+	headers.push(("x-mach5".to_string(), "intercepted".to_string()));
 }
 
 #[cfg(test)]

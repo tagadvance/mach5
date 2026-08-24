@@ -9,7 +9,37 @@ written in any language that can read a line and print a line.
 
 ## Protocol
 
-One JSON object per line in, one per line out. The proxy sends:
+One JSON object per line in, one per line out.
+
+### `init` — register what you want to see
+
+Sent once at startup. Reply with header constraints; the proxy then only sends
+you exchanges that match, and only buffers bodies you actually asked for.
+
+```json
+{"hook":"init"}
+```
+
+```json
+{"match":{"request":{"accept":"text/html"},"response":{"content-type":"text/html"}}}
+```
+
+- Constraints are **ANDed** — every header named must match.
+- Names compare case-insensitively; values match as a **case-insensitive
+  substring**, so `text/html` matches `text/html; charset=utf-8`.
+- Any header works, including custom `x-*` ones.
+- `request` constraints apply to both hooks; `response` constraints apply only
+  to the response hook.
+- Reply `{}` (or ignore the hook) to see everything.
+
+**This is also how you avoid buffering large media.** A response whose body no
+plugin has claimed streams straight through to the client, never held whole in
+memory. Declaring a narrow filter is therefore a performance decision, not just
+a convenience.
+
+### `request` / `response`
+
+The proxy sends:
 
 ```json
 {"hook":"request","method":"GET","url":"https://example.com/","headers":[["accept","*/*"]],"body_b64":""}
@@ -33,6 +63,12 @@ Anything you omit is left as-is, so `{}` means "no change":
 | `status` | response | Replace the status code |
 | `headers` | both | Replace the whole header list |
 | `body_b64` | both | Replace the body (base64, so binary is safe) |
+
+### Streaming responses
+
+A response hook can arrive with `"streaming": true` and **no** `body_b64`. That
+means the body is being relayed straight to the client and is not available. You
+may still change `status` and `headers`; a `body_b64` you return is ignored.
 
 ## Rules
 

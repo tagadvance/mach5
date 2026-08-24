@@ -22,6 +22,7 @@
 //! A plugin that dies, times out, or emits nonsense is abandoned — the proxy
 //! logs it and forwards traffic unmodified rather than failing the request.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -34,7 +35,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::interceptor::{Interceptor, ProxyRequest, ProxyResponse};
+use crate::interceptor::{Interceptor, ProxyRequest, ProxyResponse, ResponseHead};
 
 /// What the proxy sends to a plugin.
 #[derive(Serialize)]
@@ -45,7 +46,12 @@ struct Hook<'a> {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	status: Option<u16>,
 	headers: &'a [(String, String)],
-	body_b64: String,
+	/// Absent when the body is streaming past unbuffered.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	body_b64: Option<String>,
+	/// True when the body is not included and cannot be changed.
+	#[serde(skip_serializing_if = "std::ops::Not::not")]
+	streaming: bool,
 }
 
 /// What a plugin may send back. Every field is optional: omitted means unchanged.
@@ -59,9 +65,50 @@ struct Reply {
 	body_b64: Option<String>,
 }
 
+/// A plugin's answer to the `init` hook, declaring what it wants to see.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct InitReply {
+	#[serde(rename = "match")]
+	filter: Filter,
+}
+
+/// Header constraints deciding whether a plugin sees a given exchange. Every
+/// named header must match — they are ANDed — so a plugin can require, say,
+/// both an `accept` on the request and a `content-type` on the response. Any
+/// header works, including custom `x-*` ones. An empty filter matches
+/// everything.
+#[derive(Deserialize, Default, Debug)]
+#[serde(default)]
+struct Filter {
+	request: BTreeMap<String, String>,
+	response: BTreeMap<String, String>,
+}
+
+impl Filter {
+	fn is_empty(&self) -> bool {
+		self.request.is_empty() && self.response.is_empty()
+	}
+}
+
+/// Does every constraint find a matching header? Names compare
+/// case-insensitively and values match as a case-insensitive substring, so
+/// `text/html` matches `text/html; charset=utf-8`.
+fn headers_match(constraints: &BTreeMap<String, String>, headers: &[(String, String)]) -> bool {
+	constraints.iter().all(|(name, needle)| {
+		let needle = needle.to_ascii_lowercase();
+
+		headers.iter().any(|(header, value)| {
+			header.eq_ignore_ascii_case(name)
+				&& value.to_ascii_lowercase().contains(needle.as_str())
+		})
+	})
+}
+
 pub struct Plugin {
 	name: String,
 	timeout: Duration,
+	filter: Filter,
 	io: Mutex<Option<Io>>,
 }
 
@@ -151,22 +198,47 @@ impl Plugin {
 			.file_name()
 			.map(|n| n.to_string_lossy().into_owned())
 			.unwrap_or_else(|| path.display().to_string());
-		log::info!("started plugin {name}");
 
-		Ok(Self {
+		let mut plugin = Self {
 			name,
 			timeout,
+			filter: Filter::default(),
 			io: Mutex::new(Some(Io {
 				child,
 				stdin,
 				lines,
 			})),
-		})
+		};
+
+		// Ask what it wants to see. A plugin that ignores the init hook keeps
+		// the empty filter and therefore sees everything.
+		let filter = plugin
+			.call::<_, InitReply>(&serde_json::json!({ "hook": "init" }))
+			.map(|reply| reply.filter)
+			.unwrap_or_default();
+
+		if filter.is_empty() {
+			log::info!("started plugin {} (sees all traffic)", plugin.name);
+		} else {
+			log::info!("started plugin {} matching {filter:?}", plugin.name);
+		}
+
+		plugin.filter = filter;
+
+		Ok(plugin)
+	}
+
+	fn matches_request(&self, req: &ProxyRequest) -> bool {
+		headers_match(&self.filter.request, &req.headers)
+	}
+
+	fn matches_response(&self, req: &ProxyRequest, head: &ResponseHead) -> bool {
+		self.matches_request(req) && headers_match(&self.filter.response, &head.headers)
 	}
 
 	/// Send one hook and await the reply. Returns None when the plugin is gone
 	/// or misbehaved, in which case it has been abandoned.
-	fn call(&self, hook: &Hook) -> Option<Reply> {
+	fn call<T: Serialize, R: serde::de::DeserializeOwned>(&self, hook: &T) -> Option<R> {
 		let mut guard = self.io.lock().unwrap();
 		let io = guard.as_mut()?;
 
@@ -229,16 +301,21 @@ impl Plugin {
 
 impl Interceptor for Plugin {
 	fn on_request(&self, req: &mut ProxyRequest) {
+		if !self.matches_request(req) {
+			return;
+		}
+
 		let hook = Hook {
 			hook: "request",
 			method: &req.method,
 			url: &req.url,
 			status: None,
 			headers: &req.headers,
-			body_b64: BASE64.encode(&req.body),
+			body_b64: Some(BASE64.encode(&req.body)),
+			streaming: false,
 		};
 
-		let Some(reply) = self.call(&hook) else {
+		let Some(reply) = self.call::<_, Reply>(&hook) else {
 			return;
 		};
 
@@ -257,16 +334,28 @@ impl Interceptor for Plugin {
 	}
 
 	fn on_response(&self, req: &ProxyRequest, resp: &mut ProxyResponse) {
+		let head = ResponseHead {
+			status: resp.status,
+			headers: std::mem::take(&mut resp.headers),
+		};
+		let matched = self.matches_response(req, &head);
+		resp.headers = head.headers;
+
+		if !matched {
+			return;
+		}
+
 		let hook = Hook {
 			hook: "response",
 			method: &req.method,
 			url: &req.url,
 			status: Some(resp.status),
 			headers: &resp.headers,
-			body_b64: BASE64.encode(&resp.body),
+			body_b64: Some(BASE64.encode(&resp.body)),
+			streaming: false,
 		};
 
-		let Some(reply) = self.call(&hook) else {
+		let Some(reply) = self.call::<_, Reply>(&hook) else {
 			return;
 		};
 
@@ -279,6 +368,45 @@ impl Interceptor for Plugin {
 		if let Some(body) = decode_body(&self.name, reply.body_b64) {
 			resp.body = body;
 		}
+	}
+
+	fn on_response_head(&self, req: &ProxyRequest, head: &mut ResponseHead) {
+		if !self.matches_response(req, head) {
+			return;
+		}
+
+		let hook = Hook {
+			hook: "response",
+			method: &req.method,
+			url: &req.url,
+			status: Some(head.status),
+			headers: &head.headers,
+			body_b64: None,
+			streaming: true,
+		};
+
+		let Some(reply) = self.call::<_, Reply>(&hook) else {
+			return;
+		};
+
+		if let Some(status) = reply.status {
+			head.status = status;
+		}
+		if let Some(headers) = reply.headers {
+			head.headers = headers;
+		}
+		if reply.body_b64.is_some() {
+			log::warn!(
+				"plugin {}: ignoring body returned for a streaming response",
+				self.name
+			);
+		}
+	}
+
+	/// Only claim bodies this plugin's filter actually selects, so unmatched
+	/// responses (large media, most notably) stream straight through.
+	fn wants_body(&self, req: &ProxyRequest, head: &ResponseHead) -> bool {
+		self.matches_response(req, head)
 	}
 }
 
@@ -328,6 +456,78 @@ mod tests {
 		chain.on_request(&mut req);
 
 		assert_eq!(req.url, "https://example.com/");
+	}
+
+	fn constraints(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+		pairs
+			.iter()
+			.map(|(k, v)| (k.to_string(), v.to_string()))
+			.collect()
+	}
+
+	fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+		pairs
+			.iter()
+			.map(|(k, v)| (k.to_string(), v.to_string()))
+			.collect()
+	}
+
+	#[test]
+	fn empty_filter_matches_everything() {
+		assert!(headers_match(&BTreeMap::new(), &[]));
+		assert!(headers_match(&BTreeMap::new(), &headers(&[("a", "b")])));
+	}
+
+	#[test]
+	fn constraints_are_anded() {
+		let filter = constraints(&[("accept", "text/html"), ("x-qos", "high")]);
+
+		assert!(headers_match(
+			&filter,
+			&headers(&[("accept", "text/html"), ("x-qos", "high")])
+		));
+		// Only one of the two present: must not match.
+		assert!(!headers_match(&filter, &headers(&[("accept", "text/html")])));
+	}
+
+	#[test]
+	fn values_match_as_case_insensitive_substrings() {
+		let filter = constraints(&[("content-type", "text/html")]);
+
+		assert!(
+			headers_match(
+				&filter,
+				&headers(&[("Content-Type", "text/html; charset=utf-8")])
+			),
+			"a parameterised content-type should still match"
+		);
+		assert!(!headers_match(
+			&filter,
+			&headers(&[("content-type", "application/json")])
+		));
+	}
+
+	#[test]
+	fn filter_parses_from_an_init_reply() {
+		let reply: InitReply = serde_json::from_str(
+			r#"{"match":{"request":{"accept":"text/html"},"response":{"content-type":"text/html"}}}"#,
+		)
+		.unwrap();
+
+		assert_eq!(reply.filter.request.get("accept").unwrap(), "text/html");
+		assert_eq!(
+			reply.filter.response.get("content-type").unwrap(),
+			"text/html"
+		);
+		assert!(!reply.filter.is_empty());
+	}
+
+	#[test]
+	fn plugin_ignoring_init_sees_everything() {
+		// A plugin that replies `{}` declares no constraints.
+		let reply: InitReply = serde_json::from_str("{}").unwrap();
+
+		assert!(reply.filter.is_empty());
 	}
 
 	#[test]

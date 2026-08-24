@@ -11,7 +11,7 @@ mod config;
 mod interceptor;
 mod plugin;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::io::Read;
 use std::net::SocketAddr;
@@ -24,13 +24,16 @@ use quiche::h3::NameValue;
 
 use ca::CertAuthority;
 use config::Config;
-use interceptor::{Chain, Interceptor, ProxyRequest, ProxyResponse};
+use interceptor::{Chain, Interceptor, ProxyRequest, ProxyResponse, ResponseHead};
 
 const SOCKET: mio::Token = mio::Token(0);
 const WAKER: mio::Token = mio::Token(1);
 
 /// Prefix identifying an address-validation token as ours.
 const TOKEN_MARKER: &[u8] = b"mach5";
+
+/// How much of a streaming body to relay per chunk.
+const STREAM_CHUNK_SIZE: usize = 64 * 1024;
 
 /// A request handed off to a worker for fetching.
 struct FetchJob {
@@ -39,20 +42,47 @@ struct FetchJob {
 	request: ProxyRequest,
 }
 
-/// A fetched (and intercepted) response on its way back to a client.
+/// A fetched response on its way back to a client, in one of two shapes: a
+/// whole buffered response, or the pieces of a streaming one.
 struct FetchResult {
 	conn: quiche::ConnectionId<'static>,
 	stream_id: u64,
-	response: ProxyResponse,
+	payload: Payload,
 }
 
-/// A response being streamed out on one h3 stream, tracking how far it got so
-/// it can resume when the stream regains capacity.
+enum Payload {
+	/// The complete response, already through the interceptors.
+	Full(ProxyResponse),
+	/// Status and headers of a response whose body follows as chunks.
+	Head(ResponseHead),
+	Chunk(Vec<u8>),
+	/// No more chunks: the body ended.
+	End,
+}
+
+/// A response being written out on one h3 stream, tracking how far it got so it
+/// can resume when the stream regains capacity.
 struct Pending {
 	stream_id: u64,
-	response: ProxyResponse,
+	status: u16,
+	headers: Vec<(String, String)>,
 	headers_sent: bool,
-	body_offset: usize,
+	/// Body chunks awaiting write. A buffered response arrives as one chunk.
+	chunks: VecDeque<Vec<u8>>,
+	/// How far into the front chunk we have written.
+	offset: usize,
+	/// True once no further chunks will arrive.
+	complete: bool,
+	/// True once the stream has actually been closed. Tracked separately from
+	/// `complete` because upstream often finishes *after* the last chunk has
+	/// already been written, leaving nothing to attach the fin to.
+	fin_sent: bool,
+}
+
+impl Pending {
+	fn is_finished(&self) -> bool {
+		self.headers_sent && self.fin_sent
+	}
 }
 
 /// Per-connection state.
@@ -174,7 +204,7 @@ fn spawn_workers(
 		std::thread::spawn(move || {
 			// Each worker owns its own interceptor chain, so an external plugin
 			// process is never a lock shared across workers.
-			let interceptor = Chain::from_config(&config);
+			let interceptor: Box<dyn Interceptor> = Box::new(Chain::from_config(&config));
 
 			loop {
 				let job = {
@@ -187,19 +217,9 @@ fn spawn_workers(
 				};
 
 				interceptor.on_request(&mut job.request);
-				let mut response = fetch(&agent, &job.request);
-				interceptor.on_response(&job.request, &mut response);
-
-				let sent = res_tx.send(FetchResult {
-					conn: job.conn,
-					stream_id: job.stream_id,
-					response,
-				});
-				if sent.is_err() {
+				if handle_job(&agent, &*interceptor, job, &res_tx, &waker).is_err() {
 					break;
 				}
-
-				let _ = waker.wake();
 			}
 		});
 	}
@@ -207,9 +227,86 @@ fn spawn_workers(
 	(job_tx, res_rx)
 }
 
-/// Blocking upstream fetch. Any transport failure becomes a 502 so the client
-/// always gets a well-formed response.
-fn fetch(agent: &ureq::Agent, req: &ProxyRequest) -> ProxyResponse {
+/// Fetch upstream and send the response back, either whole or as a stream.
+///
+/// Whether the body is buffered is the interceptors' call: if nothing wants it,
+/// it is relayed in chunks and never fully held in memory, which is what large
+/// media needs. Errors are returned to the client as a 502 rather than dropped.
+fn handle_job(
+	agent: &ureq::Agent,
+	interceptor: &dyn Interceptor,
+	job: FetchJob,
+	results: &Sender<FetchResult>,
+	waker: &mio::Waker,
+) -> Result<(), ()> {
+	let send = |payload| {
+		results
+			.send(FetchResult {
+				conn: job.conn.clone(),
+				stream_id: job.stream_id,
+				payload,
+			})
+			.map_err(|_| ())?;
+		let _ = waker.wake();
+
+		Ok(())
+	};
+
+	let resp = match call_upstream(agent, &job.request) {
+		Ok(resp) => resp,
+		Err(message) => {
+			return send(Payload::Full(ProxyResponse {
+				status: 502,
+				headers: vec![("content-type".to_string(), "text/plain".to_string())],
+				body: message.into_bytes(),
+			}));
+		}
+	};
+
+	let mut head = ResponseHead {
+		status: resp.status(),
+		headers: response_headers(&resp),
+	};
+
+	if interceptor.wants_body(&job.request, &head) {
+		let mut body = Vec::new();
+		if let Err(e) = resp.into_reader().read_to_end(&mut body) {
+			log::warn!("failed reading upstream body for {}: {e}", job.request.url);
+		}
+
+		let mut response = ProxyResponse {
+			status: head.status,
+			headers: head.headers,
+			body,
+		};
+		interceptor.on_response(&job.request, &mut response);
+
+		return send(Payload::Full(response));
+	}
+
+	// Nothing wants the body: relay it as it arrives.
+	interceptor.on_response_head(&job.request, &mut head);
+	send(Payload::Head(head))?;
+
+	let mut reader = resp.into_reader();
+	let mut buf = vec![0u8; STREAM_CHUNK_SIZE];
+	loop {
+		match reader.read(&mut buf) {
+			Ok(0) => break,
+			Ok(n) => send(Payload::Chunk(buf[..n].to_vec()))?,
+			Err(e) => {
+				log::warn!("upstream read failed for {}: {e}", job.request.url);
+
+				break;
+			}
+		}
+	}
+
+	send(Payload::End)
+}
+
+/// Perform the upstream request, mapping transport failures to a message.
+fn call_upstream(agent: &ureq::Agent, req: &ProxyRequest) -> Result<ureq::Response, String> {
 	let mut request = agent.request(&req.method, &req.url);
 	for (name, value) in &req.headers {
 		request = request.set(name, value);
@@ -222,56 +319,78 @@ fn fetch(agent: &ureq::Agent, req: &ProxyRequest) -> ProxyResponse {
 		request.send_bytes(&req.body)
 	};
 
-	let resp = match result {
-		Ok(resp) => resp,
-		Err(ureq::Error::Status(_, resp)) => resp,
-		Err(ureq::Error::Transport(t)) => {
-			let body = format!("mach5: upstream fetch failed: {t}\n").into_bytes();
-
-			return ProxyResponse {
-				status: 502,
-				headers: vec![("content-type".to_string(), "text/plain".to_string())],
-				body,
-			};
-		}
-	};
-
-	let status = resp.status();
-	let mut headers = Vec::new();
-	for name in resp.headers_names() {
-		if is_hop_by_hop(&name) {
-			continue;
-		}
-		if let Some(value) = resp.header(&name) {
-			headers.push((name.clone(), value.to_string()));
-		}
+	match result {
+		Ok(resp) => Ok(resp),
+		// An HTTP error status is a perfectly good response to relay.
+		Err(ureq::Error::Status(_, resp)) => Ok(resp),
+		// TODO: distinguish TLS validation failures and render a proper
+		// interstitial with a per-host bypass instead of this plain 502.
+		Err(ureq::Error::Transport(t)) => Err(format!("mach5: upstream fetch failed: {t}\n")),
 	}
+}
 
-	let mut body = Vec::new();
-	if let Err(e) = resp.into_reader().read_to_end(&mut body) {
-		log::warn!("failed reading upstream body for {}: {e}", req.url);
-	}
-
-	ProxyResponse {
-		status,
-		headers,
-		body,
-	}
+fn response_headers(resp: &ureq::Response) -> Vec<(String, String)> {
+	resp.headers_names()
+		.into_iter()
+		.filter(|name| !is_hop_by_hop(name))
+		.filter_map(|name| {
+			resp.header(&name)
+				.map(|value| (name.clone(), value.to_string()))
+		})
+		.collect()
 }
 
 fn drain_results(results: &Receiver<FetchResult>, clients: &mut ClientMap) {
 	while let Ok(result) = results.try_recv() {
-		match clients.get_mut(&result.conn) {
-			Some(client) => client.pending.push(Pending {
-				stream_id: result.stream_id,
-				response: result.response,
-				headers_sent: false,
-				body_offset: 0,
-			}),
+		let Some(client) = clients.get_mut(&result.conn) else {
 			// Client vanished while its fetch was in flight; drop the response.
-			None => log::debug!("dropping response for closed connection"),
+			log::debug!("dropping response for closed connection");
+
+			continue;
+		};
+
+		match result.payload {
+			Payload::Full(response) => client.pending.push(Pending {
+				stream_id: result.stream_id,
+				status: response.status,
+				headers: response.headers,
+				headers_sent: false,
+				chunks: VecDeque::from([response.body]),
+				offset: 0,
+				complete: true,
+				fin_sent: false,
+			}),
+			Payload::Head(head) => client.pending.push(Pending {
+				stream_id: result.stream_id,
+				status: head.status,
+				headers: head.headers,
+				headers_sent: false,
+				chunks: VecDeque::new(),
+				offset: 0,
+				complete: false,
+				fin_sent: false,
+			}),
+			Payload::Chunk(data) => {
+				match find_pending(client, result.stream_id) {
+					Some(pending) => pending.chunks.push_back(data),
+					// Its stream already failed and was dropped.
+					None => log::debug!("chunk for unknown stream {}", result.stream_id),
+				}
+			}
+			Payload::End => {
+				if let Some(pending) = find_pending(client, result.stream_id) {
+					pending.complete = true;
+				}
+			}
 		}
 	}
+}
+
+fn find_pending(client: &mut Client, stream_id: u64) -> Option<&mut Pending> {
+	client
+		.pending
+		.iter_mut()
+		.find(|p| p.stream_id == stream_id)
 }
 
 fn build_quic_config(
@@ -577,13 +696,13 @@ fn dispatch(
 fn error_response(stream_id: u64, status: u16, message: &str) -> Pending {
 	Pending {
 		stream_id,
-		response: ProxyResponse {
-			status,
-			headers: vec![("content-type".to_string(), "text/plain".to_string())],
-			body: format!("mach5: {message}\n").into_bytes(),
-		},
+		status,
+		headers: vec![("content-type".to_string(), "text/plain".to_string())],
 		headers_sent: false,
-		body_offset: 0,
+		chunks: VecDeque::from([format!("mach5: {message}\n").into_bytes()]),
+		offset: 0,
+		complete: true,
+		fin_sent: false,
 	}
 }
 
@@ -611,20 +730,26 @@ fn send_pending(
 	p: &mut Pending,
 ) -> Result<bool, quiche::h3::Error> {
 	if !p.headers_sent {
-		let status = p.response.status.to_string();
-		let content_length = p.response.body.len().to_string();
+		let status = p.status.to_string();
 
-		let mut headers = vec![
-			quiche::h3::Header::new(b":status", status.as_bytes()),
-			quiche::h3::Header::new(b"content-length", content_length.as_bytes()),
-		];
-		for (name, value) in &p.response.headers {
+		let mut headers = vec![quiche::h3::Header::new(b":status", status.as_bytes())];
+		// A buffered response has a known length; a streaming one is delimited
+		// by the stream ending, so it carries no content-length.
+		let content_length = p.complete.then(|| body_len(p).to_string());
+		if let Some(length) = &content_length {
+			headers.push(quiche::h3::Header::new(b"content-length", length.as_bytes()));
+		}
+		for (name, value) in &p.headers {
 			headers.push(quiche::h3::Header::new(name.as_bytes(), value.as_bytes()));
 		}
 
-		let fin = p.response.body.is_empty();
+		// Only finish here if the body is known to be empty and complete.
+		let fin = p.complete && body_len(p) == 0;
 		match http3.send_response(conn, p.stream_id, &headers, fin) {
-			Ok(()) => p.headers_sent = true,
+			Ok(()) => {
+				p.headers_sent = true;
+				p.fin_sent = fin;
+			}
 			Err(quiche::h3::Error::StreamBlocked) | Err(quiche::h3::Error::Done) => {
 				return Ok(false)
 			}
@@ -636,16 +761,42 @@ fn send_pending(
 		}
 	}
 
-	while p.body_offset < p.response.body.len() {
-		match http3.send_body(conn, p.stream_id, &p.response.body[p.body_offset..], true) {
+	while let Some(chunk) = p.chunks.front() {
+		// The stream ends with the last byte of the last chunk, and only once
+		// upstream has signalled it is done.
+		let last = p.complete && p.chunks.len() == 1;
+
+		match http3.send_body(conn, p.stream_id, &chunk[p.offset..], last) {
 			Ok(0) => break,
-			Ok(n) => p.body_offset += n,
+			Ok(n) => {
+				p.offset += n;
+				if p.offset >= chunk.len() {
+					p.chunks.pop_front();
+					p.offset = 0;
+					// The fin rode along only if this really was the last byte.
+					p.fin_sent = last;
+				}
+			}
 			Err(quiche::h3::Error::Done) => break,
 			Err(e) => return Err(e),
 		}
 	}
 
-	Ok(p.headers_sent && p.body_offset >= p.response.body.len())
+	// Upstream finished after we had already drained every chunk, so close the
+	// stream explicitly. Without this the client waits forever for a fin.
+	if p.complete && p.chunks.is_empty() && !p.fin_sent {
+		match http3.send_body(conn, p.stream_id, &[], true) {
+			Ok(_) => p.fin_sent = true,
+			Err(quiche::h3::Error::Done) => {}
+			Err(e) => return Err(e),
+		}
+	}
+
+	Ok(p.is_finished())
+}
+
+fn body_len(p: &Pending) -> usize {
+	p.chunks.iter().map(Vec::len).sum()
 }
 
 fn flush(socket: &mio::net::UdpSocket, out: &mut [u8], clients: &mut ClientMap) {

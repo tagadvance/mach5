@@ -285,7 +285,14 @@ fn fetch_blocking(
 	};
 	let interceptor = borrowed.get();
 
-	interceptor.on_request(&mut request);
+	if let Some(mut response) = interceptor.on_request(&mut request) {
+		log::info!("short-circuited {} {}", request.method, request.url);
+		apply_alt_svc(&shared.config, &mut response.headers);
+		let _ = head_tx.send(Outcome::Buffered(response));
+
+		return;
+	}
+
 	log::info!(
 		"proxying tcp {} {} ({} body bytes)",
 		request.method,

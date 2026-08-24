@@ -19,6 +19,12 @@
 //! to change; anything it omits is left alone. Replying `{}` means "no change".
 //! Bodies are base64 so arbitrary binary survives the text protocol.
 //!
+//! A `status` on a reply to the *request* hook is special: it means the plugin
+//! is answering the request itself, and the origin is never contacted. The
+//! reply's `headers` and `body_b64` become the response — both default to empty
+//! — and `method`/`url` are ignored. Nothing downstream sees it: later plugins
+//! do not get the request, and no response hook runs on what is served.
+//!
 //! A plugin that dies, times out, or emits nonsense is abandoned — the proxy
 //! logs it and forwards traffic unmodified rather than failing the request.
 
@@ -300,9 +306,9 @@ impl Plugin {
 }
 
 impl Interceptor for Plugin {
-	fn on_request(&self, req: &mut ProxyRequest) {
+	fn on_request(&self, req: &mut ProxyRequest) -> Option<ProxyResponse> {
 		if !self.matches_request(req) {
-			return;
+			return None;
 		}
 
 		let hook = Hook {
@@ -315,9 +321,12 @@ impl Interceptor for Plugin {
 			streaming: false,
 		};
 
-		let Some(reply) = self.call::<_, Reply>(&hook) else {
-			return;
-		};
+		// A plugin that has gone away neither rewrites nor answers.
+		let reply = self.call::<_, Reply>(&hook)?;
+
+		if let Some(response) = short_circuit(&self.name, &reply) {
+			return Some(response);
+		}
 
 		if let Some(method) = reply.method {
 			req.method = method;
@@ -331,6 +340,8 @@ impl Interceptor for Plugin {
 		if let Some(body) = decode_body(&self.name, reply.body_b64) {
 			req.body = body;
 		}
+
+		None
 	}
 
 	fn on_response(&self, req: &ProxyRequest, resp: &mut ProxyResponse) {
@@ -417,6 +428,19 @@ impl Drop for Plugin {
 	}
 }
 
+/// A reply to the request hook that carries a `status` is the plugin answering
+/// the request itself. Everything else it may have sent about the request —
+/// `method`, `url` — is moot, since the request is never made.
+fn short_circuit(name: &str, reply: &Reply) -> Option<ProxyResponse> {
+	let status = reply.status?;
+
+	Some(ProxyResponse {
+		status,
+		headers: reply.headers.clone().unwrap_or_default(),
+		body: decode_body(name, reply.body_b64.clone()).unwrap_or_default(),
+	})
+}
+
 fn decode_body(name: &str, body_b64: Option<String>) -> Option<Vec<u8>> {
 	let encoded = body_b64?;
 
@@ -453,8 +477,7 @@ mod tests {
 			headers: Vec::new(),
 			body: Vec::new(),
 		};
-		chain.on_request(&mut req);
-
+		assert!(chain.on_request(&mut req).is_none());
 		assert_eq!(req.url, "https://example.com/");
 	}
 
@@ -528,6 +551,41 @@ mod tests {
 		let reply: InitReply = serde_json::from_str("{}").unwrap();
 
 		assert!(reply.filter.is_empty());
+	}
+
+	#[test]
+	fn a_status_on_the_request_hook_answers_the_request() {
+		let reply: Reply = serde_json::from_str(&format!(
+			r#"{{"status":403,"headers":[["content-type","text/plain"]],"body_b64":"{}"}}"#,
+			BASE64.encode(b"blocked\n")
+		))
+		.unwrap();
+
+		let response = short_circuit("t", &reply).expect("status means short-circuit");
+
+		assert_eq!(response.status, 403);
+		assert_eq!(
+			response.headers,
+			vec![("content-type".to_string(), "text/plain".to_string())]
+		);
+		assert_eq!(response.body, b"blocked\n");
+	}
+
+	#[test]
+	fn a_short_circuit_may_omit_headers_and_body() {
+		let reply: Reply = serde_json::from_str(r#"{"status":204}"#).unwrap();
+		let response = short_circuit("t", &reply).unwrap();
+
+		assert_eq!(response.status, 204);
+		assert!(response.headers.is_empty());
+		assert!(response.body.is_empty());
+	}
+
+	#[test]
+	fn a_reply_without_a_status_only_rewrites() {
+		let reply: Reply = serde_json::from_str(r#"{"url":"https://example.org/"}"#).unwrap();
+
+		assert!(short_circuit("t", &reply).is_none());
 	}
 
 	#[test]

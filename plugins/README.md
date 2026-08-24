@@ -59,10 +59,26 @@ Anything you omit is left as-is, so `{}` means "no change":
 | Field | Hook | Meaning |
 | --- | --- | --- |
 | `method` | request | Replace the HTTP method |
-| `url` | request | Replace the upstream URL — this is how you block or redirect |
+| `url` | request | Replace the upstream URL — this is how you redirect |
+| `status` | request | **Answer the request yourself** — see below |
 | `status` | response | Replace the status code |
 | `headers` | both | Replace the whole header list |
 | `body_b64` | both | Replace the body (base64, so binary is safe) |
+
+### Answering a request yourself
+
+Return a `status` on the **request** hook and the origin is never contacted:
+your reply becomes the response. This is how you block an ad, or serve an
+internal page from the proxy itself.
+
+```json
+{"status":403,"headers":[["content-type","text/plain"]],"body_b64":"YmxvY2tlZAo="}
+```
+
+`headers` and `body_b64` default to empty; `method` and `url` are ignored, since
+no request is made. Nothing downstream runs: plugins after yours never see the
+request, and no response hook — not even your own — touches what is served. A
+blocked request must not then be rewritten by an injection plugin.
 
 ### Streaming responses
 

@@ -211,12 +211,11 @@ fn spawn_workers(
 					let rx = job_rx.lock().unwrap();
 					rx.recv()
 				};
-				let mut job = match job {
+				let job = match job {
 					Ok(j) => j,
 					Err(_) => break, // senders dropped: shut down
 				};
 
-				interceptor.on_request(&mut job.request);
 				if handle_job(&agent, &*interceptor, job, &res_tx, &waker).is_err() {
 					break;
 				}
@@ -227,7 +226,8 @@ fn spawn_workers(
 	(job_tx, res_rx)
 }
 
-/// Fetch upstream and send the response back, either whole or as a stream.
+/// Run the interceptors, fetch upstream and send the response back, either
+/// whole or as a stream.
 ///
 /// Whether the body is buffered is the interceptors' call: if nothing wants it,
 /// it is relayed in chunks and never fully held in memory, which is what large
@@ -235,10 +235,13 @@ fn spawn_workers(
 fn handle_job(
 	agent: &ureq::Agent,
 	interceptor: &dyn Interceptor,
-	job: FetchJob,
+	mut job: FetchJob,
 	results: &Sender<FetchResult>,
 	waker: &mio::Waker,
 ) -> Result<(), ()> {
+	// Ahead of `send`, which borrows the job for the rest of this function.
+	let answer = interceptor.on_request(&mut job.request);
+
 	let send = |payload| {
 		results
 			.send(FetchResult {
@@ -251,6 +254,12 @@ fn handle_job(
 
 		Ok(())
 	};
+
+	if let Some(response) = answer {
+		log::info!("short-circuited {} {}", job.request.method, job.request.url);
+
+		return send(Payload::Full(response));
+	}
 
 	let resp = match upstream::call(agent, &job.request) {
 		Ok(resp) => resp,

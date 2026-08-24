@@ -29,7 +29,19 @@ pub struct ResponseHead {
 /// Hooks run on the worker thread, off the QUIC event loop, so an expensive
 /// interceptor cannot stall unrelated connections.
 pub trait Interceptor: Send + Sync {
-	fn on_request(&self, _req: &mut ProxyRequest) {}
+	/// Called before the request is forwarded. Returning `Some` short-circuits
+	/// it: that response is served and the origin is never contacted, which is
+	/// what a blocker or an internal proxy endpoint needs.
+	///
+	/// A short-circuited response is served exactly as returned. Links after the
+	/// one that answered never see the request, and no
+	/// [`on_response`](Self::on_response) or
+	/// [`on_response_head`](Self::on_response_head) hook runs on it. That is
+	/// deliberate: a blocked request should not then be rewritten by an
+	/// injection plugin.
+	fn on_request(&self, _req: &mut ProxyRequest) -> Option<ProxyResponse> {
+		None
+	}
 
 	/// Called with the whole response once its body has been buffered — which
 	/// only happens when [`wants_body`](Self::wants_body) asked for it.
@@ -49,7 +61,8 @@ pub trait Interceptor: Send + Sync {
 }
 
 /// An ordered list of interceptors, applied in sequence. Requests run through
-/// in order and responses run through in the same order.
+/// in order — until one of them answers the request itself — and responses run
+/// through in the same order.
 pub struct Chain {
 	links: Vec<Box<dyn Interceptor>>,
 }
@@ -75,10 +88,10 @@ impl Chain {
 }
 
 impl Interceptor for Chain {
-	fn on_request(&self, req: &mut ProxyRequest) {
-		for link in &self.links {
-			link.on_request(req);
-		}
+	/// Stops at the first link that answers, and hands that response straight
+	/// back untouched by the rest of the chain.
+	fn on_request(&self, req: &mut ProxyRequest) -> Option<ProxyResponse> {
+		self.links.iter().find_map(|link| link.on_request(req))
 	}
 
 	fn on_response(&self, req: &ProxyRequest, resp: &mut ProxyResponse) {
@@ -126,7 +139,48 @@ fn stamp(headers: &mut Vec<(String, String)>) {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::atomic::{AtomicBool, Ordering};
+	use std::sync::Arc;
+
 	use super::*;
+
+	/// Answers every request with the given status, so a chain can be tested
+	/// without a live plugin.
+	struct Answer(u16);
+
+	impl Interceptor for Answer {
+		fn on_request(&self, _req: &mut ProxyRequest) -> Option<ProxyResponse> {
+			Some(ProxyResponse {
+				status: self.0,
+				headers: Vec::new(),
+				body: Vec::new(),
+			})
+		}
+	}
+
+	/// Records that it ran and rewrites the URL, so both "was it reached" and
+	/// "did rewrites still apply" are observable.
+	struct Recorder {
+		called: Arc<AtomicBool>,
+	}
+
+	impl Interceptor for Recorder {
+		fn on_request(&self, req: &mut ProxyRequest) -> Option<ProxyResponse> {
+			self.called.store(true, Ordering::SeqCst);
+			req.url.push_str("?seen");
+
+			None
+		}
+	}
+
+	fn request() -> ProxyRequest {
+		ProxyRequest {
+			method: "GET".to_string(),
+			url: "https://example.com/".to_string(),
+			headers: Vec::new(),
+			body: Vec::new(),
+		}
+	}
 
 	fn response() -> ProxyResponse {
 		ProxyResponse {
@@ -157,5 +211,46 @@ mod tests {
 
 		assert_eq!(stamps.len(), 1, "marker must not accumulate on re-run");
 		assert_eq!(stamps[0].1, "intercepted");
+	}
+
+	#[test]
+	fn short_circuit_stops_the_chain() {
+		let called = Arc::new(AtomicBool::new(false));
+		let chain = Chain {
+			links: vec![
+				Box::new(Answer(403)),
+				Box::new(Recorder {
+					called: called.clone(),
+				}),
+			],
+		};
+		let mut req = request();
+
+		let response = chain.on_request(&mut req).expect("first link answers");
+
+		assert_eq!(response.status, 403);
+		assert!(
+			!called.load(Ordering::SeqCst),
+			"links after the one that answered must not run"
+		);
+		assert_eq!(req.url, "https://example.com/", "and must not rewrite it");
+	}
+
+	#[test]
+	fn a_chain_that_answers_nothing_still_rewrites() {
+		let chain = Chain {
+			links: vec![
+				Box::new(Recorder {
+					called: Arc::new(AtomicBool::new(false)),
+				}),
+				Box::new(Recorder {
+					called: Arc::new(AtomicBool::new(false)),
+				}),
+			],
+		};
+		let mut req = request();
+
+		assert!(chain.on_request(&mut req).is_none());
+		assert_eq!(req.url, "https://example.com/?seen?seen", "both links ran");
 	}
 }

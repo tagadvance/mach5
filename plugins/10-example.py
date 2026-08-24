@@ -43,9 +43,9 @@ def on_request(msg):
 
     if host in BLOCKED:
         log(f"blocking {host}")
-        # Point the fetch at something harmless. Returning a body here would be
-        # nicer, but the request hook cannot short-circuit the fetch yet.
-        return {"url": "https://example.com/"}
+        # A status on the request hook answers it here: the origin is never
+        # contacted and nothing downstream sees the request.
+        return {"status": 204}
 
     return {}
 

@@ -20,8 +20,8 @@ use time::Duration;
 pub struct Config {
 	/// Address to listen on for QUIC (UDP).
 	pub listen: Listen,
-	/// TCP address for HTTP/1.1 over TLS. Browsers connect here first — HTTP/3
-	/// is only discovered afterwards, via the Alt-Svc header below.
+	/// TCP address for HTTP/2 and HTTP/1.1 over TLS. Browsers connect here
+	/// first — HTTP/3 is only discovered afterwards, via `[http] alt_svc`.
 	pub listen_tcp: ListenTcp,
 	pub ca: Ca,
 	pub http: Http,
@@ -63,8 +63,6 @@ pub struct Http {
 	pub keep_alive: bool,
 	/// How long to wait for a request on an idle kept-alive connection.
 	pub idle_timeout_seconds: u64,
-	/// Cap on the request head (request line plus headers).
-	pub max_header_bytes: usize,
 }
 
 impl Default for Http {
@@ -73,7 +71,6 @@ impl Default for Http {
 			alt_svc: r#"h3=":4433"; ma=86400"#.to_string(),
 			keep_alive: true,
 			idle_timeout_seconds: 60,
-			max_header_bytes: 64 * 1024,
 		}
 	}
 }
@@ -217,6 +214,10 @@ pub struct Limits {
 	pub read_timeout_seconds: u64,
 	/// How long a plugin may take per hook before it is abandoned.
 	pub plugin_timeout_seconds: u64,
+	/// How much of a streaming response may sit in memory waiting for a slow
+	/// client before the upstream read pauses. This is the backpressure bound;
+	/// generous by design, since the box has RAM to spare.
+	pub stream_buffer_mb: usize,
 }
 
 impl Default for Limits {
@@ -227,6 +228,7 @@ impl Default for Limits {
 			connect_timeout_seconds: 10,
 			read_timeout_seconds: 30,
 			plugin_timeout_seconds: 10,
+			stream_buffer_mb: 32,
 		}
 	}
 }
@@ -325,6 +327,11 @@ impl Config {
 
 	pub fn worker_threads(&self) -> usize {
 		self.limits.worker_threads.resolve()
+	}
+
+	/// Streaming backpressure expressed as a number of in-flight chunks.
+	pub fn stream_buffer_chunks(&self, chunk_size: usize) -> usize {
+		((self.limits.stream_buffer_mb * 1024 * 1024) / chunk_size).max(1)
 	}
 }
 

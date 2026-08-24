@@ -21,7 +21,6 @@ listen_tcp = "0.0.0.0:4443"
 alt_svc = 'h3=":4433"; ma=86400'
 keep_alive = true
 idle_timeout_seconds = 60
-max_header_bytes = 65536
 
 [ca]
 # Root CA used to sign leaves minted per SNI host. Leave both unset to generate
@@ -65,6 +64,9 @@ connect_timeout_seconds = 10
 read_timeout_seconds = 30
 # How long a plugin may take per hook before it is abandoned.
 plugin_timeout_seconds = 10
+# Backpressure for streamed responses: how much may sit in memory waiting for a
+# slow client before the upstream read pauses. Generous on purpose.
+stream_buffer_mb = 32
 
 [quic]
 max_datagram_size = 1350

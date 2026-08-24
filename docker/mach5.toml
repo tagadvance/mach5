@@ -19,7 +19,6 @@ key = "security/mach5_root.pem"
 alt_svc = 'h3=":443"; ma=86400'
 keep_alive = true
 idle_timeout_seconds = 60
-max_header_bytes = 65536
 
 [paths]
 # A named volume, so re-encoded assets survive a container restart.
@@ -41,6 +40,9 @@ worker_threads = "1C"
 connect_timeout_seconds = 10
 read_timeout_seconds = 30
 plugin_timeout_seconds = 10
+# Backpressure for streamed responses: how much may sit in memory waiting for a
+# slow client before the upstream read pauses. Generous on purpose.
+stream_buffer_mb = 32
 
 [quic]
 max_datagram_size = 1350

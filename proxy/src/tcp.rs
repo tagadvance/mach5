@@ -1,21 +1,34 @@
-//! TCP front end: HTTP/1.1 over TLS.
+//! TCP front end: HTTP/2 and HTTP/1.1 over TLS.
 //!
 //! This exists because HTTP/3 cannot bootstrap itself. A browser opens TCP 443
 //! first and only learns that h3 is available from the `Alt-Svc` header on a
 //! response it received over TCP. Without this listener a browser pointed at
 //! the proxy simply fails to connect.
 //!
-//! Deliberately synchronous: a bounded pool of threads, each owning its own
-//! interceptor chain, mirroring how the QUIC side's workers already behave.
-//! Every request takes the same path through the interceptors as an h3 one.
+//! It matters that this speaks h2, not just h1.1: on a network where UDP is
+//! blocked, every request falls back here permanently. Serving only h1.1 would
+//! make the proxy slower than no proxy at all on exactly those networks.
+//!
+//! hyper drives the connection, so protocol negotiation, keep-alive and chunked
+//! encoding are handled for us. The rest of the proxy is blocking (ureq,
+//! plugin subprocesses), so all of that runs on `spawn_blocking` against a
+//! fixed pool of interceptor chains rather than being rewritten as async.
 
-use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::Receiver;
+use std::convert::Infallible;
+use std::io::Read;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use boring::ssl::{NameType, SslAcceptor, SslMethod, SslStream};
+use boring::ssl::{AlpnError, NameType, SslAcceptor, SslMethod};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
+use hyper::service::service_fn;
+use hyper::{Request, Response};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::server::conn::auto::Builder as ConnBuilder;
+use tokio::net::TcpListener;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::ca::CertAuthority;
 use crate::config::Config;
@@ -24,57 +37,129 @@ use crate::upstream;
 
 const STREAM_CHUNK_SIZE: usize = 64 * 1024;
 
-/// Start the listener and its worker pool. Returns once the socket is bound;
-/// the threads keep running for the life of the process.
-pub fn spawn(config: Arc<Config>, ca: Arc<CertAuthority>) -> std::io::Result<()> {
-	let listener = TcpListener::bind(config.listen_tcp.0)?;
-	let acceptor = Arc::new(build_acceptor(&ca)?);
+type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
-	let (tx, rx) = std::sync::mpsc::channel::<TcpStream>();
-	let rx = Arc::new(Mutex::new(rx));
+/// A fixed set of interceptor chains, borrowed for the duration of a request.
+///
+/// Each chain owns its own plugin subprocesses, so the pool size bounds how
+/// many copies of every plugin are running. Blocking here is fine: callers are
+/// already on a blocking thread.
+struct ChainPool {
+	give_back: Sender<Chain>,
+	take: Mutex<Receiver<Chain>>,
+}
 
-	for _ in 0..config.worker_threads() {
-		spawn_worker(config.clone(), acceptor.clone(), rx.clone());
+impl ChainPool {
+	fn new(size: usize, config: &Config) -> Self {
+		let (give_back, take) = std::sync::mpsc::channel();
+		for _ in 0..size {
+			let _ = give_back.send(Chain::from_config(config));
+		}
+
+		Self {
+			give_back,
+			take: Mutex::new(take),
+		}
 	}
 
-	log::info!("listening on {} (TCP/TLS, HTTP/1.1)", config.listen_tcp.0);
+	fn acquire(&self) -> Option<Borrowed<'_>> {
+		let chain = self.take.lock().ok()?.recv().ok()?;
 
-	std::thread::spawn(move || {
-		for stream in listener.incoming() {
-			match stream {
-				Ok(stream) => {
-					if tx.send(stream).is_err() {
-						break;
-					}
-				}
-				Err(e) => log::debug!("tcp accept failed: {e}"),
-			}
+		Some(Borrowed {
+			pool: self,
+			chain: Some(chain),
+		})
+	}
+}
+
+struct Borrowed<'a> {
+	pool: &'a ChainPool,
+	chain: Option<Chain>,
+}
+
+impl Borrowed<'_> {
+	fn get(&self) -> &Chain {
+		self.chain.as_ref().expect("chain is present until dropped")
+	}
+}
+
+impl Drop for Borrowed<'_> {
+	fn drop(&mut self) {
+		if let Some(chain) = self.chain.take() {
+			let _ = self.pool.give_back.send(chain);
 		}
+	}
+}
+
+/// Connection-level settings read before `shared` is moved into the service.
+struct HttpSettings {
+	keep_alive: bool,
+	idle_timeout_seconds: u64,
+}
+
+/// Everything a request handler needs, shared across connections.
+struct Shared {
+	config: Arc<Config>,
+	pool: ChainPool,
+	agent: ureq::Agent,
+}
+
+/// Start the listener. Returns once its runtime thread is spawned.
+pub fn spawn(config: Arc<Config>, ca: Arc<CertAuthority>) -> std::io::Result<()> {
+	let acceptor = Arc::new(build_acceptor(&ca)?);
+	let addr = config.listen_tcp.0;
+
+	let shared = Arc::new(Shared {
+		pool: ChainPool::new(config.worker_threads(), &config),
+		agent: upstream::agent(&config),
+		config,
+	});
+
+	// hyper needs a tokio runtime; the QUIC side keeps its own sync mio loop, so
+	// the runtime lives on its own thread rather than taking over main.
+	std::thread::spawn(move || {
+		let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+			Ok(runtime) => runtime,
+			Err(e) => {
+				log::error!("could not start tcp runtime: {e}");
+
+				return;
+			}
+		};
+
+		runtime.block_on(async move {
+			let listener = match TcpListener::bind(addr).await {
+				Ok(listener) => listener,
+				Err(e) => {
+					log::error!("cannot bind {addr}: {e}");
+
+					return;
+				}
+			};
+			log::info!("listening on {addr} (TCP/TLS, HTTP/2 and HTTP/1.1)");
+
+			loop {
+				let (stream, peer) = match listener.accept().await {
+					Ok(accepted) => accepted,
+					Err(e) => {
+						log::debug!("tcp accept failed: {e}");
+
+						continue;
+					}
+				};
+
+				let acceptor = acceptor.clone();
+				let shared = shared.clone();
+				tokio::spawn(async move {
+					if let Err(e) = serve(acceptor, shared, stream).await {
+						log::debug!("tcp connection from {peer} ended: {e}");
+					}
+				});
+			}
+		});
 	});
 
 	Ok(())
-}
-
-fn spawn_worker(config: Arc<Config>, acceptor: Arc<SslAcceptor>, rx: Arc<Mutex<Receiver<TcpStream>>>) {
-	std::thread::spawn(move || {
-		// Same rule as the QUIC workers: a thread owns its plugins outright.
-		let interceptor = Chain::from_config(&config);
-		let agent = upstream::agent(&config);
-
-		loop {
-			let stream = {
-				let rx = rx.lock().unwrap();
-				rx.recv()
-			};
-			let Ok(stream) = stream else {
-				break;
-			};
-
-			if let Err(e) = serve(&config, &acceptor, &interceptor, &agent, stream) {
-				log::debug!("tcp connection ended: {e}");
-			}
-		}
-	});
 }
 
 /// Build the TLS acceptor, wired to the same on-the-fly certificate authority
@@ -95,318 +180,266 @@ fn build_acceptor(ca: &Arc<CertAuthority>) -> std::io::Result<SslAcceptor> {
 		Ok(())
 	});
 
-	// Only HTTP/1.1 here. h2 would be a further win, but the point of this
-	// listener is to hand the client an Alt-Svc header and move it to h3.
-	builder.set_alpn_protos(b"\x08http/1.1")
-		.map_err(|e| std::io::Error::other(e.to_string()))?;
+	// Offer h2 first so a client that supports it takes it.
 	builder.set_alpn_select_callback(|_ssl, protos| {
-		boring::ssl::select_next_proto(b"\x08http/1.1", protos)
-			.ok_or(boring::ssl::AlpnError::NOACK)
+		boring::ssl::select_next_proto(b"\x02h2\x08http/1.1", protos).ok_or(AlpnError::NOACK)
 	});
 
 	Ok(builder.build())
 }
 
-fn serve(
-	config: &Config,
-	acceptor: &SslAcceptor,
-	interceptor: &dyn Interceptor,
-	agent: &ureq::Agent,
-	stream: TcpStream,
-) -> std::io::Result<()> {
-	let idle = Duration::from_secs(config.http.idle_timeout_seconds);
-	stream.set_read_timeout(Some(idle))?;
+async fn serve(
+	acceptor: Arc<SslAcceptor>,
+	shared: Arc<Shared>,
+	stream: tokio::net::TcpStream,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 	stream.set_nodelay(true)?;
 
-	let tls = acceptor
-		.accept(stream)
-		.map_err(|e| std::io::Error::other(e.to_string()))?;
+	let tls = tokio_boring::accept(&acceptor, stream)
+		.await
+		.map_err(|e| format!("tls handshake failed: {e}"))?;
 
-	// The SNI is the only thing telling us which origin the client wanted,
-	// since a transparent deployment gives us no other clue.
-	let sni = tls
-		.ssl()
-		.servername(NameType::HOST_NAME)
-		.map(str::to_string);
+	// The SNI is the only thing telling us which origin the client wanted: a
+	// transparent deployment gives us no other clue.
+	let sni = tls.ssl().servername(NameType::HOST_NAME).map(str::to_string);
 
-	let mut conn = Connection {
-		tls: BufReader::new(tls),
-		sni,
+	let shared_http = HttpSettings {
+		keep_alive: shared.config.http.keep_alive,
+		idle_timeout_seconds: shared.config.http.idle_timeout_seconds,
 	};
 
-	// Keep-alive: serve requests until the client goes away or asks to close.
-	while conn.serve_one(config, interceptor, agent)? {
-		if !config.http.keep_alive {
+	let service = service_fn(move |req: Request<Incoming>| {
+		let shared = shared.clone();
+		let sni = sni.clone();
+
+		async move { Ok::<_, Infallible>(handle(shared, sni, req).await) }
+	});
+
+	// Auto-negotiates h2 or h1.1 from the connection preface, and handles
+	// keep-alive and chunked framing on both.
+	let mut builder = ConnBuilder::new(TokioExecutor::new());
+	// header_read_timeout needs a timer; without one hyper cannot arm it and the
+	// HTTP/1.1 path silently drops connections while h2 keeps working.
+	builder
+		.http1()
+		.timer(TokioTimer::new())
+		.keep_alive(shared_http.keep_alive)
+		.header_read_timeout(std::time::Duration::from_secs(shared_http.idle_timeout_seconds));
+
+	builder.serve_connection(TokioIo::new(tls), service).await?;
+
+	Ok(())
+}
+
+async fn handle(shared: Arc<Shared>, sni: Option<String>, req: Request<Incoming>) -> Response<BoxBody> {
+	let request = match to_proxy_request(&shared.config, sni, req).await {
+		Ok(request) => request,
+		Err(status) => return simple(status, "mach5: malformed request\n"),
+	};
+
+	// Everything past here blocks: plugin subprocesses and the upstream fetch.
+	let (head_tx, head_rx) = tokio::sync::oneshot::channel();
+	let chunk_capacity = shared.config.stream_buffer_chunks(STREAM_CHUNK_SIZE);
+	let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(chunk_capacity);
+
+	tokio::task::spawn_blocking(move || {
+		fetch_blocking(&shared, request, head_tx, body_tx);
+	});
+
+	match head_rx.await {
+		Ok(Outcome::Buffered(response)) => build_response(response),
+		Ok(Outcome::Streaming(head)) => {
+			let body = StreamBody::new(ReceiverStream::new(body_rx));
+			let mut builder = Response::builder().status(head.status);
+			for (name, value) in &head.headers {
+				builder = builder.header(name, value);
+			}
+
+			builder
+				.body(BodyExt::boxed(body))
+				.unwrap_or_else(|_| simple(502, "mach5: malformed upstream headers\n"))
+		}
+		// The blocking task died without reporting; nothing else will answer.
+		Err(_) => simple(502, "mach5: upstream fetch failed\n"),
+	}
+}
+
+enum Outcome {
+	Buffered(ProxyResponse),
+	Streaming(ResponseHead),
+}
+
+/// Runs the interceptors and the upstream fetch on a blocking thread, reporting
+/// the head as soon as it is known so a streaming body can start flowing.
+fn fetch_blocking(
+	shared: &Shared,
+	mut request: ProxyRequest,
+	head_tx: tokio::sync::oneshot::Sender<Outcome>,
+	body_tx: tokio::sync::mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
+) {
+	let Some(borrowed) = shared.pool.acquire() else {
+		let _ = head_tx.send(Outcome::Buffered(error_body(502, "interceptor pool unavailable")));
+
+		return;
+	};
+	let interceptor = borrowed.get();
+
+	interceptor.on_request(&mut request);
+	log::info!(
+		"proxying tcp {} {} ({} body bytes)",
+		request.method,
+		request.url,
+		request.body.len()
+	);
+
+	let resp = match upstream::call(&shared.agent, &request) {
+		Ok(resp) => resp,
+		Err(message) => {
+			let _ = head_tx.send(Outcome::Buffered(error_body(502, &message)));
+
+			return;
+		}
+	};
+
+	let mut head = ResponseHead {
+		status: resp.status(),
+		headers: upstream::response_headers(&resp),
+	};
+
+	if interceptor.wants_body(&request, &head) {
+		let mut body = Vec::new();
+		if let Err(e) = resp.into_reader().read_to_end(&mut body) {
+			log::warn!("failed reading upstream body for {}: {e}", request.url);
+		}
+
+		let mut response = ProxyResponse {
+			status: head.status,
+			headers: head.headers,
+			body,
+		};
+		interceptor.on_response(&request, &mut response);
+		apply_alt_svc(&shared.config, &mut response.headers);
+		let _ = head_tx.send(Outcome::Buffered(response));
+
+		return;
+	}
+
+	interceptor.on_response_head(&request, &mut head);
+	apply_alt_svc(&shared.config, &mut head.headers);
+	if head_tx.send(Outcome::Streaming(head)).is_err() {
+		return;
+	}
+
+	// Relay the body. `blocking_send` is the backpressure: it parks this thread
+	// when the client is not draining fast enough, rather than queueing without
+	// bound.
+	let mut reader = resp.into_reader();
+	let mut buf = vec![0u8; STREAM_CHUNK_SIZE];
+	loop {
+		let read = match reader.read(&mut buf) {
+			Ok(0) => break,
+			Ok(n) => n,
+			Err(e) => {
+				log::warn!("upstream read failed mid-stream: {e}");
+
+				break;
+			}
+		};
+
+		let chunk = Bytes::copy_from_slice(&buf[..read]);
+		if body_tx.blocking_send(Ok(Frame::data(chunk))).is_err() {
+			// Client went away.
 			break;
 		}
 	}
-
-	Ok(())
 }
 
-struct Connection {
-	tls: BufReader<SslStream<TcpStream>>,
-	sni: Option<String>,
-}
-
-impl Connection {
-	/// Serve one request. Returns whether the connection may be reused.
-	fn serve_one(
-		&mut self,
-		config: &Config,
-		interceptor: &dyn Interceptor,
-		agent: &ureq::Agent,
-	) -> std::io::Result<bool> {
-		let Some(head) = self.read_head(config.http.max_header_bytes)? else {
-			// Clean EOF between requests.
-			return Ok(false);
-		};
-
-		let mut request = match self.parse(&head, config)? {
-			Some(request) => request,
-			None => {
-				self.write_simple(400, "malformed request")?;
-
-				return Ok(false);
-			}
-		};
-
-		interceptor.on_request(&mut request);
-		log::info!(
-			"proxying tcp {} {} ({} body bytes)",
-			request.method,
-			request.url,
-			request.body.len()
-		);
-
-		let resp = match upstream::call(agent, &request) {
-			Ok(resp) => resp,
-			Err(message) => {
-				self.write_simple(502, &message)?;
-
-				return Ok(true);
-			}
-		};
-
-		let mut head = ResponseHead {
-			status: resp.status(),
-			headers: upstream::response_headers(&resp),
-		};
-
-		if interceptor.wants_body(&request, &head) {
-			let mut body = Vec::new();
-			resp.into_reader().read_to_end(&mut body)?;
-
-			let mut response = ProxyResponse {
-				status: head.status,
-				headers: head.headers,
-				body,
-			};
-			interceptor.on_response(&request, &mut response);
-			self.write_buffered(config, &response)?;
-		} else {
-			interceptor.on_response_head(&request, &mut head);
-			self.write_streaming(config, &head, resp.into_reader())?;
-		}
-
-		Ok(true)
-	}
-
-	/// Read up to the end of the request head, bounded so a client cannot make
-	/// us buffer forever.
-	fn read_head(&mut self, limit: usize) -> std::io::Result<Option<Vec<u8>>> {
-		let mut head = Vec::new();
-		let mut byte = [0u8; 1];
-
-		loop {
-			match self.tls.read(&mut byte) {
-				Ok(0) => {
-					return if head.is_empty() {
-						Ok(None)
-					} else {
-						Err(std::io::Error::new(ErrorKind::UnexpectedEof, "truncated head"))
-					}
-				}
-				Ok(_) => head.push(byte[0]),
-				Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(None),
-				Err(e) => return Err(e),
-			}
-
-			if head.ends_with(b"\r\n\r\n") {
-				return Ok(Some(head));
-			}
-
-			if head.len() > limit {
-				return Err(std::io::Error::other("request head too large"));
-			}
-		}
-	}
-
-	/// Turn a raw request head into a [`ProxyRequest`], reading the body if the
-	/// request declares one.
-	fn parse(&mut self, head: &[u8], config: &Config) -> std::io::Result<Option<ProxyRequest>> {
-		let mut headers = [httparse::EMPTY_HEADER; 96];
-		let mut parsed = httparse::Request::new(&mut headers);
-
-		if parsed.parse(head).is_err() {
-			return Ok(None);
-		}
-		let (Some(method), Some(path)) = (parsed.method, parsed.path) else {
-			return Ok(None);
-		};
-
-		let mut collected = Vec::new();
-		let mut host = None;
-		let mut content_length = 0usize;
-
-		for header in parsed.headers.iter() {
-			let name = header.name.to_ascii_lowercase();
-			let value = String::from_utf8_lossy(header.value).into_owned();
-
-			match name.as_str() {
-				"host" => host = Some(value),
-				"content-length" => content_length = value.trim().parse().unwrap_or(0),
-				// ureq re-derives these; forwarding them would conflict.
-				_ if upstream::is_hop_by_hop(&name) => {}
-				_ => collected.push((name, value)),
-			}
-		}
-
-		// Prefer the SNI: in a transparent deployment it is the name the client
-		// actually asked TLS for, and it cannot be spoofed by a stray Host.
-		let authority = self.sni.clone().or(host);
-		let Some(authority) = authority else {
-			return Ok(None);
-		};
-
-		let mut body = vec![0u8; content_length.min(config.max_request_body())];
-		if !body.is_empty() {
-			self.tls.read_exact(&mut body)?;
-		}
-
-		Ok(Some(ProxyRequest {
-			method: method.to_string(),
-			url: format!("https://{}{path}", crate::authority_host(&authority)),
-			headers: collected,
-			body,
-		}))
-	}
-
-	fn write_buffered(&mut self, config: &Config, resp: &ProxyResponse) -> std::io::Result<()> {
-		let mut out = BufWriter::new(self.tls.get_mut());
-
-		write_head(
-			&mut out,
-			config,
-			resp.status,
-			&resp.headers,
-			Some(resp.body.len()),
-		)?;
-		out.write_all(&resp.body)?;
-		out.flush()
-	}
-
-	/// Relay a body we never buffered, using chunked transfer-encoding because
-	/// its length is not known up front.
-	fn write_streaming(
-		&mut self,
-		config: &Config,
-		head: &ResponseHead,
-		mut body: impl Read,
-	) -> std::io::Result<()> {
-		let mut out = BufWriter::new(self.tls.get_mut());
-
-		write_head(&mut out, config, head.status, &head.headers, None)?;
-		out.write_all(b"transfer-encoding: chunked\r\n\r\n")?;
-
-		let mut buf = vec![0u8; STREAM_CHUNK_SIZE];
-		loop {
-			let read = match body.read(&mut buf) {
-				Ok(0) => break,
-				Ok(n) => n,
-				Err(e) => {
-					log::warn!("upstream read failed mid-stream: {e}");
-
-					break;
-				}
-			};
-
-			write!(out, "{read:x}\r\n")?;
-			out.write_all(&buf[..read])?;
-			out.write_all(b"\r\n")?;
-		}
-
-		out.write_all(b"0\r\n\r\n")?;
-		out.flush()
-	}
-
-	fn write_simple(&mut self, status: u16, message: &str) -> std::io::Result<()> {
-		let body = message.as_bytes();
-		let mut out = BufWriter::new(self.tls.get_mut());
-
-		write!(
-			out,
-			"HTTP/1.1 {status} {}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-			reason(status),
-			body.len()
-		)?;
-		out.write_all(body)?;
-		out.flush()
-	}
-}
-
-fn write_head(
-	out: &mut impl Write,
+async fn to_proxy_request(
 	config: &Config,
-	status: u16,
-	headers: &[(String, String)],
-	content_length: Option<usize>,
-) -> std::io::Result<()> {
-	write!(out, "HTTP/1.1 {status} {}\r\n", reason(status))?;
+	sni: Option<String>,
+	req: Request<Incoming>,
+) -> Result<ProxyRequest, u16> {
+	let (parts, body) = req.into_parts();
 
-	for (name, value) in headers {
-		// Length and framing are ours to decide, and Alt-Svc is re-added below.
-		if upstream::is_hop_by_hop(name) || name.eq_ignore_ascii_case("alt-svc") {
+	let mut headers = Vec::new();
+	let mut host = None;
+	for (name, value) in parts.headers.iter() {
+		let name = name.as_str().to_ascii_lowercase();
+		let Ok(value) = value.to_str() else {
 			continue;
+		};
+
+		match name.as_str() {
+			"host" => host = Some(value.to_string()),
+			_ if upstream::is_hop_by_hop(&name) => {}
+			_ => headers.push((name, value.to_string())),
 		}
-		write!(out, "{name}: {value}\r\n")?;
 	}
 
-	if let Some(length) = content_length {
-		write!(out, "content-length: {length}\r\n")?;
+	// Prefer the SNI: it is the name the client actually asked TLS for and
+	// cannot be redirected by a stray Host header. h2 carries :authority, which
+	// hyper surfaces as the uri authority.
+	let authority = sni
+		.or_else(|| parts.uri.authority().map(|a| a.to_string()))
+		.or(host)
+		.ok_or(400u16)?;
+
+	// hyper has already decoded chunked encoding by the time we see this.
+	let collected = body.collect().await.map_err(|_| 400u16)?.to_bytes();
+	if collected.len() > config.max_request_body() {
+		return Err(413);
 	}
 
-	// The whole reason this listener exists: tell the client h3 is available so
-	// subsequent requests move to QUIC.
-	if !config.http.alt_svc.is_empty() {
-		write!(out, "alt-svc: {}\r\n", config.http.alt_svc)?;
-	}
+	let path = parts
+		.uri
+		.path_and_query()
+		.map(|p| p.as_str())
+		.unwrap_or("/");
 
-	if config.http.keep_alive {
-		write!(out, "connection: keep-alive\r\n")?;
-	} else {
-		write!(out, "connection: close\r\n")?;
-	}
-
-	if content_length.is_some() {
-		write!(out, "\r\n")?;
-	}
-
-	Ok(())
+	Ok(ProxyRequest {
+		method: parts.method.as_str().to_string(),
+		url: format!("https://{}{path}", crate::authority_host(&authority)),
+		headers,
+		body: collected.to_vec(),
+	})
 }
 
-fn reason(status: u16) -> &'static str {
-	match status {
-		200 => "OK",
-		204 => "No Content",
-		301 => "Moved Permanently",
-		302 => "Found",
-		304 => "Not Modified",
-		400 => "Bad Request",
-		403 => "Forbidden",
-		404 => "Not Found",
-		500 => "Internal Server Error",
-		502 => "Bad Gateway",
-		_ => "",
+fn build_response(response: ProxyResponse) -> Response<BoxBody> {
+	let mut builder = Response::builder().status(response.status);
+	for (name, value) in &response.headers {
+		builder = builder.header(name, value);
 	}
+
+	builder
+		.body(BodyExt::boxed(Full::new(Bytes::from(response.body))))
+		.unwrap_or_else(|_| simple(502, "mach5: malformed upstream headers\n"))
+}
+
+/// Replace any upstream `Alt-Svc` with our own. The origin's advertisement
+/// points at the origin's own h3 endpoint, which is not where the client should
+/// go — and ours is the whole reason this listener exists.
+fn apply_alt_svc(config: &Config, headers: &mut Vec<(String, String)>) {
+	headers.retain(|(name, _)| !name.eq_ignore_ascii_case("alt-svc"));
+
+	if !config.http.alt_svc.is_empty() {
+		headers.push(("alt-svc".to_string(), config.http.alt_svc.clone()));
+	}
+}
+
+fn error_body(status: u16, message: &str) -> ProxyResponse {
+	ProxyResponse {
+		status,
+		headers: vec![("content-type".to_string(), "text/plain".to_string())],
+		body: message.as_bytes().to_vec(),
+	}
+}
+
+fn simple(status: u16, message: &str) -> Response<BoxBody> {
+	Response::builder()
+		.status(status)
+		.header("content-type", "text/plain")
+		.body(BodyExt::boxed(Full::new(Bytes::from(
+			message.as_bytes().to_vec(),
+		))))
+		.expect("static response is well formed")
 }

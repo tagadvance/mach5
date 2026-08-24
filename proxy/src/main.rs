@@ -6,6 +6,7 @@
 //! the response back. Upstream fetches run on a worker pool so a slow origin
 //! never stalls the single-threaded QUIC event loop.
 
+mod blocklist;
 mod ca;
 mod config;
 mod interceptor;

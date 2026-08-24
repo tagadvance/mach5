@@ -27,6 +27,7 @@ pub struct Config {
 	pub http: Http,
 	pub paths: Paths,
 	pub plugins: Plugins,
+	pub blocklist: Blocklist,
 	pub tls: Tls,
 	pub limits: Limits,
 	pub quic: Quic,
@@ -116,6 +117,28 @@ impl Default for Plugins {
 			dir: default_plugin_dir(),
 			enabled: true,
 			stamp_responses: false,
+		}
+	}
+}
+
+/// Domains answered locally instead of being fetched — the first-stage ad
+/// blocker. Lists are hosts files or Adblock-style domain lists, in any mix.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Blocklist {
+	/// With no files loaded this is a no-op, so it costs nothing to leave on.
+	pub enabled: bool,
+	pub files: Vec<PathBuf>,
+	/// Domains never blocked, whatever the lists say.
+	pub allow: Vec<String>,
+}
+
+impl Default for Blocklist {
+	fn default() -> Self {
+		Self {
+			enabled: true,
+			files: Vec::new(),
+			allow: Vec::new(),
 		}
 	}
 }
@@ -307,6 +330,9 @@ impl Config {
 		self.ca.key = self.ca.key.take().map(|p| expand_tilde(&p));
 		self.paths.cache_dir = expand_tilde(&self.paths.cache_dir);
 		self.plugins.dir = expand_tilde(&self.plugins.dir);
+		for file in &mut self.blocklist.files {
+			*file = expand_tilde(file);
+		}
 	}
 
 	pub fn leaf_ttl(&self) -> Duration {
@@ -416,6 +442,14 @@ mod tests {
 	}
 
 	#[test]
+	fn blocklist_paths_expand_like_every_other_path() {
+		let config = Config::from_str("[blocklist]\nfiles = [\"~/lists/hosts\"]\n").unwrap();
+
+		assert_eq!(config.blocklist.files, vec![home().join("lists/hosts")]);
+		assert!(config.blocklist.enabled, "a list with no files is a no-op");
+	}
+
+	#[test]
 	fn threads_follow_the_maven_per_core_convention() {
 		assert_eq!(parse_threads("1C", 8), Some(8));
 		assert_eq!(parse_threads("2C", 8), Some(16));
@@ -460,3 +494,4 @@ mod tests {
 		assert_eq!(config.clock_skew(), Duration::minutes(15));
 	}
 }
+

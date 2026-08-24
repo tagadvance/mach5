@@ -29,6 +29,22 @@ dir = "plugins"
 enabled = true
 stamp_responses = false
 
+[blocklist]
+# First-stage ad blocking: a request to a listed domain is answered here and
+# never reaches the origin — or a plugin. A parent domain covers everything
+# beneath it, so `doubleclick.net` also blocks `ad.g.doubleclick.net`.
+#
+# Lists may be hosts files (StevenBlack's hosts file works as-is) or
+# Adblock-style domain lists (EasyList's `||ads.example.com^` anchors and `@@||`
+# exceptions). Anything beyond a domain match is skipped.
+#
+# The lists are read from inside the container, so mount them in — compose does
+# this the same way it mounts the plugins and the CA.
+enabled = true
+# files = ["/etc/mach5/lists/hosts"]
+# Never blocked, whatever the lists say. Covers subdomains too.
+# allow = ["example.com"]
+
 [tls]
 leaf_ttl_hours = 24
 clock_skew_minutes = 60

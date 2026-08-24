@@ -43,6 +43,25 @@ enabled = true
 # interception visible without writing a plugin.
 stamp_responses = false
 
+[blocklist]
+# First-stage ad blocking: a request to a listed domain is answered here and
+# never reaches the origin — or a plugin. Built in rather than a plugin because
+# matching a hundred thousand domains on every request should not cross a JSON
+# pipe into another process.
+#
+# A parent domain covers everything beneath it, so `doubleclick.net` also blocks
+# `ad.g.doubleclick.net`.
+#
+# Lists may be hosts files (StevenBlack's hosts file works as-is) or
+# Adblock-style domain lists — EasyList's `||ads.example.com^` anchors and its
+# `@@||` exceptions are both understood. Anything beyond a domain match —
+# cosmetic rules, URL patterns, regexes — is skipped; this is not a filter
+# engine. Nothing is bundled: point this at lists you keep updated yourself.
+enabled = true
+# files = ["~/.config/mach5/hosts", "~/.config/mach5/easylist.txt"]
+# Never blocked, whatever the lists say. Covers subdomains too.
+# allow = ["example.com"]
+
 [tls]
 # Minted certs have no revocation path, so expiry is the only bound on a leaked
 # key. Keep the window short.

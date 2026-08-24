@@ -68,10 +68,19 @@ pub struct Chain {
 }
 
 impl Chain {
-	/// Build the chain described by the configuration: the external plugins in
-	/// the plugin directory, plus the optional response stamp.
+	/// Build the chain described by the configuration: the blocklist, then the
+	/// external plugins in the plugin directory, plus the optional response
+	/// stamp.
 	pub fn from_config(config: &crate::config::Config) -> Self {
 		let mut links: Vec<Box<dyn Interceptor>> = Vec::new();
+
+		// First, so a blocked request never reaches a plugin at all.
+		if config.blocklist.enabled {
+			let blocklist = crate::blocklist::shared(config);
+			if !blocklist.is_empty() {
+				links.push(Box::new(blocklist));
+			}
+		}
 
 		if config.plugins.enabled {
 			for plugin in crate::plugin::load_all(config) {

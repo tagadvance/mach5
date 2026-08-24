@@ -1,0 +1,55 @@
+# mach5 configuration.
+#
+# Every value here is optional — anything omitted falls back to the default
+# shown in the comment. Lookup order:
+#   $MACH5_CONFIG, then ./mach5.toml, then ~/.config/mach5/mach5.toml
+
+# Address to listen on for QUIC (UDP).
+listen = "0.0.0.0:4433"
+
+[ca]
+# Root CA used to sign leaves minted per SNI host. Leave both unset to generate
+# an ephemeral in-memory CA (development only — no browser will trust it).
+# Never commit these files; *.pem/*.crt/*.p12 are gitignored.
+# cert = "security/mach5_root.crt"
+# key = "security/mach5_root.pem"
+
+[paths]
+# Scratch space for cached artifacts (re-encoded assets and the like).
+# cache_dir = "~/.cache/mach5"
+
+[plugins]
+# Directory of executable interceptor plugins, run in filename order. Each is a
+# long-running process speaking newline-delimited JSON on stdin/stdout, so it
+# can be written in any language. See plugins/README for the protocol.
+dir = "plugins"
+enabled = true
+# Adds an `x-mach5` header to every response — a debugging aid that makes
+# interception visible without writing a plugin.
+stamp_responses = false
+
+[tls]
+# Minted certs have no revocation path, so expiry is the only bound on a leaked
+# key. Keep the window short.
+leaf_ttl_hours = 24
+# Backdate notBefore so clients whose clocks run behind still accept the cert.
+clock_skew_minutes = 60
+# Re-mint a cached leaf once less than this remains.
+refresh_margin_minutes = 60
+
+[limits]
+# Cap on a buffered request body; bounds what a single stream can allocate.
+max_request_body_mb = 10
+# Upstream fetch workers. 0 means one per available core.
+worker_threads = 0
+connect_timeout_seconds = 10
+read_timeout_seconds = 30
+# How long a plugin may take per hook before it is abandoned.
+plugin_timeout_seconds = 10
+
+[quic]
+max_datagram_size = 1350
+max_idle_timeout_ms = 30000
+initial_max_data = 10000000
+initial_max_stream_data = 1000000
+initial_max_streams = 100

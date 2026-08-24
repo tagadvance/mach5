@@ -7,6 +7,7 @@
 //! never stalls the single-threaded QUIC event loop.
 
 mod ca;
+mod config;
 mod interceptor;
 
 use std::collections::HashMap;
@@ -21,15 +22,11 @@ use boring::ssl::{select_next_proto, AlpnError, SslContextBuilder, SslMethod, Ss
 use quiche::h3::NameValue;
 
 use ca::CertAuthority;
-use interceptor::{Interceptor, PassThrough, ProxyRequest, ProxyResponse, Stamp};
+use config::Config;
+use interceptor::{Chain, Interceptor, ProxyRequest, ProxyResponse};
 
-const MAX_DATAGRAM_SIZE: usize = 1350;
 const SOCKET: mio::Token = mio::Token(0);
 const WAKER: mio::Token = mio::Token(1);
-
-/// Cap on a buffered request body. Bodies are held in memory until the request
-/// is complete, so this bounds what one stream can make us allocate.
-const MAX_REQUEST_BODY: usize = 10 * 1024 * 1024;
 
 /// A request handed off to a worker for fetching.
 struct FetchJob {
@@ -69,12 +66,18 @@ type ClientMap = HashMap<quiche::ConnectionId<'static>, Client>;
 fn main() -> Result<(), Box<dyn Error>> {
 	env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-	let listen: SocketAddr = std::env::var("MACH5_LISTEN")
-		.unwrap_or_else(|_| "0.0.0.0:4433".to_string())
-		.parse()?;
+	let config = Arc::new(Config::load()?);
+	let listen = config.listen.0;
 
-	let ca = Arc::new(load_ca()?);
-	let mut config = build_config(ca)?;
+	if let Err(e) = std::fs::create_dir_all(&config.paths.cache_dir) {
+		log::warn!(
+			"could not create cache dir {}: {e}",
+			config.paths.cache_dir.display()
+		);
+	}
+
+	let ca = Arc::new(CertAuthority::from_config(&config)?);
+	let mut quic_config = build_quic_config(ca, &config)?;
 	let h3_config = quiche::h3::Config::new()?;
 
 	let mut poll = mio::Poll::new()?;
@@ -84,11 +87,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 		.register(&mut socket, SOCKET, mio::Interest::READABLE)?;
 	let waker = Arc::new(mio::Waker::new(poll.registry(), WAKER)?);
 
-	let (jobs, results) = spawn_workers(select_interceptor(), waker);
+	let (jobs, results) = spawn_workers(config.clone(), waker);
 	log::info!("listening on {listen} (UDP/QUIC)");
 
+	let max_request_body = config.max_request_body();
 	let mut buf = [0u8; 65535];
-	let mut out = [0u8; MAX_DATAGRAM_SIZE];
+	let mut out = vec![0u8; config.quic.max_datagram_size];
 	let mut clients: ClientMap = HashMap::new();
 
 	loop {
@@ -107,7 +111,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 				Err(e) => return Err(e.into()),
 			};
 
-			if let Err(e) = recv_packet(&mut buf[..len], from, listen, &mut config, &mut clients) {
+			if let Err(e) =
+				recv_packet(&mut buf[..len], from, listen, &mut quic_config, &mut clients)
+			{
 				log::debug!("recv error from {from}: {e}");
 			}
 		}
@@ -119,7 +125,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 			client.conn.on_timeout();
 		}
 
-		drive_http3(&h3_config, &mut clients, &jobs);
+		drive_http3(&h3_config, &mut clients, &jobs, max_request_body);
 		flush(&socket, &mut out, &mut clients);
 
 		clients.retain(|_, c| {
@@ -134,15 +140,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 	}
 }
 
-fn select_interceptor() -> Arc<dyn Interceptor> {
-	match std::env::var("MACH5_INTERCEPT").as_deref() {
-		Ok("passthrough") => Arc::new(PassThrough),
-		_ => Arc::new(Stamp),
-	}
-}
-
 fn spawn_workers(
-	interceptor: Arc<dyn Interceptor>,
+	config: Arc<Config>,
 	waker: Arc<mio::Waker>,
 ) -> (Sender<FetchJob>, Receiver<FetchResult>) {
 	let (job_tx, job_rx) = std::sync::mpsc::channel::<FetchJob>();
@@ -151,45 +150,47 @@ fn spawn_workers(
 
 	let agent = ureq::AgentBuilder::new()
 		.redirects(0) // pass 3xx through to the client; it re-requests and we intercept again
-		.timeout_connect(Duration::from_secs(10))
-		.timeout_read(Duration::from_secs(30))
+		.timeout_connect(Duration::from_secs(config.limits.connect_timeout_seconds))
+		.timeout_read(Duration::from_secs(config.limits.read_timeout_seconds))
 		.build();
 
-	let count = std::thread::available_parallelism()
-		.map(|n| n.get())
-		.unwrap_or(4);
-
-	for _ in 0..count {
+	for _ in 0..config.worker_threads() {
 		let job_rx = job_rx.clone();
 		let res_tx = res_tx.clone();
 		let waker = waker.clone();
 		let agent = agent.clone();
-		let interceptor = interceptor.clone();
+		let config = config.clone();
 
-		std::thread::spawn(move || loop {
-			let job = {
-				let rx = job_rx.lock().unwrap();
-				rx.recv()
-			};
-			let mut job = match job {
-				Ok(j) => j,
-				Err(_) => break, // senders dropped: shut down
-			};
+		std::thread::spawn(move || {
+			// Each worker owns its own interceptor chain, so an external plugin
+			// process is never a lock shared across workers.
+			let interceptor = Chain::from_config(&config);
 
-			interceptor.on_request(&mut job.request);
-			let mut response = fetch(&agent, &job.request);
-			interceptor.on_response(&job.request, &mut response);
+			loop {
+				let job = {
+					let rx = job_rx.lock().unwrap();
+					rx.recv()
+				};
+				let mut job = match job {
+					Ok(j) => j,
+					Err(_) => break, // senders dropped: shut down
+				};
 
-			let sent = res_tx.send(FetchResult {
-				conn: job.conn,
-				stream_id: job.stream_id,
-				response,
-			});
-			if sent.is_err() {
-				break;
+				interceptor.on_request(&mut job.request);
+				let mut response = fetch(&agent, &job.request);
+				interceptor.on_response(&job.request, &mut response);
+
+				let sent = res_tx.send(FetchResult {
+					conn: job.conn,
+					stream_id: job.stream_id,
+					response,
+				});
+				if sent.is_err() {
+					break;
+				}
+
+				let _ = waker.wake();
 			}
-
-			let _ = waker.wake();
 		});
 	}
 
@@ -263,27 +264,10 @@ fn drain_results(results: &Receiver<FetchResult>, clients: &mut ClientMap) {
 	}
 }
 
-fn load_ca() -> Result<CertAuthority, Box<dyn Error>> {
-	match (std::env::var("MACH5_CA_CERT"), std::env::var("MACH5_CA_KEY")) {
-		(Ok(cert_path), Ok(key_path)) => {
-			let cert_pem = std::fs::read_to_string(&cert_path)?;
-			let key_pem = std::fs::read_to_string(&key_path)?;
-			log::info!("loaded root CA from {cert_path}");
-
-			CertAuthority::from_pem(&cert_pem, &key_pem)
-		}
-		_ => {
-			log::warn!(
-				"MACH5_CA_CERT / MACH5_CA_KEY unset — generating an ephemeral dev CA. \
-				 Minted certs will NOT be trusted by any browser."
-			);
-
-			CertAuthority::generate_dev()
-		}
-	}
-}
-
-fn build_config(ca: Arc<CertAuthority>) -> Result<quiche::Config, Box<dyn Error>> {
+fn build_quic_config(
+	ca: Arc<CertAuthority>,
+	config: &Config,
+) -> Result<quiche::Config, Box<dyn Error>> {
 	let mut builder = SslContextBuilder::new(SslMethod::tls())?;
 	builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
 
@@ -306,20 +290,22 @@ fn build_config(ca: Arc<CertAuthority>) -> Result<quiche::Config, Box<dyn Error>
 		select_next_proto(b"\x02h3", client_protos).ok_or(AlpnError::ALERT_FATAL)
 	});
 
-	let mut config = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)?;
+	let mut quic =
+		quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)?;
 
-	config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
-	config.set_max_idle_timeout(30_000);
-	config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
-	config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-	config.set_initial_max_data(10_000_000);
-	config.set_initial_max_stream_data_bidi_local(1_000_000);
-	config.set_initial_max_stream_data_bidi_remote(1_000_000);
-	config.set_initial_max_stream_data_uni(1_000_000);
-	config.set_initial_max_streams_bidi(100);
-	config.set_initial_max_streams_uni(100);
+	let q = &config.quic;
+	quic.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
+	quic.set_max_idle_timeout(q.max_idle_timeout_ms);
+	quic.set_max_recv_udp_payload_size(q.max_datagram_size);
+	quic.set_max_send_udp_payload_size(q.max_datagram_size);
+	quic.set_initial_max_data(q.initial_max_data);
+	quic.set_initial_max_stream_data_bidi_local(q.initial_max_stream_data);
+	quic.set_initial_max_stream_data_bidi_remote(q.initial_max_stream_data);
+	quic.set_initial_max_stream_data_uni(q.initial_max_stream_data);
+	quic.set_initial_max_streams_bidi(q.initial_max_streams);
+	quic.set_initial_max_streams_uni(q.initial_max_streams);
 
-	Ok(config)
+	Ok(quic)
 }
 
 fn recv_packet(
@@ -379,6 +365,7 @@ fn drive_http3(
 	h3_config: &quiche::h3::Config,
 	clients: &mut ClientMap,
 	jobs: &Sender<FetchJob>,
+	max_request_body: usize,
 ) {
 	let keys: Vec<_> = clients.keys().cloned().collect();
 
@@ -409,6 +396,7 @@ fn drive_http3(
 			&mut client.partial,
 			&mut client.pending,
 			jobs,
+			max_request_body,
 		);
 		pump_responses(&mut client.conn, http3, &mut client.pending);
 	}
@@ -421,6 +409,7 @@ fn poll_requests(
 	partial: &mut HashMap<u64, ProxyRequest>,
 	pending: &mut Vec<Pending>,
 	jobs: &Sender<FetchJob>,
+	max_request_body: usize,
 ) {
 	let mut buf = [0u8; 16_384];
 
@@ -439,7 +428,9 @@ fn poll_requests(
 				}
 			}
 			Ok((stream_id, quiche::h3::Event::Data)) => {
-				if let Err(status) = read_body(http3, conn, stream_id, partial, &mut buf) {
+				if let Err(status) =
+					read_body(http3, conn, stream_id, partial, &mut buf, max_request_body)
+				{
 					partial.remove(&stream_id);
 					pending.push(error_response(stream_id, status, "request body too large"));
 				}
@@ -473,6 +464,7 @@ fn read_body(
 	stream_id: u64,
 	partial: &mut HashMap<u64, ProxyRequest>,
 	buf: &mut [u8],
+	max_request_body: usize,
 ) -> Result<(), u16> {
 	loop {
 		let read = match http3.recv_body(conn, stream_id, buf) {
@@ -492,8 +484,8 @@ fn read_body(
 			continue;
 		};
 
-		if !append_bounded(&mut request.body, &buf[..read], MAX_REQUEST_BODY) {
-			log::warn!("stream={stream_id} body exceeds {MAX_REQUEST_BODY} bytes; rejecting");
+		if !append_bounded(&mut request.body, &buf[..read], max_request_body) {
+			log::warn!("stream={stream_id} body exceeds {max_request_body} bytes; rejecting");
 
 			return Err(413);
 		}

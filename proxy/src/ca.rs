@@ -17,16 +17,7 @@ use rcgen::{
 };
 use time::{Duration, OffsetDateTime};
 
-/// How long a minted leaf stays valid. Minted certs have no revocation path, so
-/// expiry is the only thing bounding a leaked key's usefulness — keep it short.
-const LEAF_TTL: Duration = Duration::hours(24);
-
-/// Backdate `notBefore` to tolerate clients whose clocks run behind ours.
-const CLOCK_SKEW: Duration = Duration::hours(1);
-
-/// Re-mint a cached leaf once it has less than this left, so the cache never
-/// serves a cert that expires mid-connection.
-const REFRESH_MARGIN: Duration = Duration::hours(1);
+use crate::config::Config;
 
 /// A minted leaf, in the boring types the TLS stack consumes.
 #[derive(Clone)]
@@ -36,26 +27,53 @@ struct Leaf {
 	not_after: OffsetDateTime,
 }
 
+/// How long minted leaves stay valid, and when to re-mint them.
+struct Validity {
+	ttl: Duration,
+	clock_skew: Duration,
+	refresh_margin: Duration,
+}
+
 pub struct CertAuthority {
 	issuer: Issuer<'static, KeyPair>,
 	cache: Mutex<HashMap<String, Leaf>>,
+	validity: Validity,
 }
 
 impl CertAuthority {
+	/// Load the CA named by the configuration, or generate an ephemeral one
+	/// when no CA is configured.
+	pub fn from_config(config: &Config) -> Result<Self, Box<dyn Error>> {
+		match (&config.ca.cert, &config.ca.key) {
+			(Some(cert_path), Some(key_path)) => {
+				let cert_pem = std::fs::read_to_string(cert_path)?;
+				let key_pem = std::fs::read_to_string(key_path)?;
+				log::info!("loaded root CA from {}", cert_path.display());
+
+				Self::from_pem(&cert_pem, &key_pem, config)
+			}
+			_ => {
+				log::warn!(
+					"no [ca] cert/key configured — generating an ephemeral dev CA. \
+					 Minted certs will NOT be trusted by any browser."
+				);
+
+				Self::generate_dev(config)
+			}
+		}
+	}
+
 	/// Load a CA from PEM cert + PEM private key.
-	pub fn from_pem(cert_pem: &str, key_pem: &str) -> Result<Self, Box<dyn Error>> {
+	pub fn from_pem(cert_pem: &str, key_pem: &str, config: &Config) -> Result<Self, Box<dyn Error>> {
 		let key = KeyPair::from_pem(key_pem)?;
 		let issuer = Issuer::from_ca_cert_pem(cert_pem, key)?;
 
-		Ok(Self {
-			issuer,
-			cache: Mutex::new(HashMap::new()),
-		})
+		Ok(Self::new(issuer, config))
 	}
 
 	/// Generate a throwaway self-signed CA. Development only: nothing signed by
 	/// it is trusted by any browser, and the key lives only in memory.
-	pub fn generate_dev() -> Result<Self, Box<dyn Error>> {
+	pub fn generate_dev(config: &Config) -> Result<Self, Box<dyn Error>> {
 		let key = KeyPair::generate()?;
 
 		let mut params = CertificateParams::default();
@@ -67,10 +85,19 @@ impl CertAuthority {
 
 		let issuer = Issuer::new(params, key);
 
-		Ok(Self {
+		Ok(Self::new(issuer, config))
+	}
+
+	fn new(issuer: Issuer<'static, KeyPair>, config: &Config) -> Self {
+		Self {
 			issuer,
 			cache: Mutex::new(HashMap::new()),
-		})
+			validity: Validity {
+				ttl: config.leaf_ttl(),
+				clock_skew: config.clock_skew(),
+				refresh_margin: config.refresh_margin(),
+			},
+		}
 	}
 
 	/// Return a leaf for `sni`, minting and caching on first request and
@@ -79,7 +106,7 @@ impl CertAuthority {
 		let mut cache = self.cache.lock().unwrap();
 
 		if let Some(leaf) = cache.get(sni) {
-			if leaf.not_after - REFRESH_MARGIN > OffsetDateTime::now_utc() {
+			if leaf.not_after - self.validity.refresh_margin > OffsetDateTime::now_utc() {
 				return Ok(leaf.clone());
 			}
 		}
@@ -99,8 +126,8 @@ impl CertAuthority {
 		params.distinguished_name = dn;
 
 		let now = OffsetDateTime::now_utc();
-		let not_after = now + LEAF_TTL;
-		params.not_before = now - CLOCK_SKEW;
+		let not_after = now + self.validity.ttl;
+		params.not_before = now - self.validity.clock_skew;
 		params.not_after = not_after;
 
 		let cert = params.signed_by(&key, &self.issuer)?;
@@ -138,7 +165,7 @@ mod tests {
 
 	#[test]
 	fn mints_leaf_with_sni_in_san() {
-		let ca = CertAuthority::generate_dev().unwrap();
+		let ca = CertAuthority::generate_dev(&Config::default()).unwrap();
 		let leaf = ca.mint("example.com").unwrap();
 
 		let san = leaf
@@ -155,22 +182,37 @@ mod tests {
 
 	#[test]
 	fn leaf_validity_is_bounded() {
-		let ca = CertAuthority::generate_dev().unwrap();
+		let ca = CertAuthority::generate_dev(&Config::default()).unwrap();
 		let leaf = ca.mint("example.com").unwrap();
 
+		let config = Config::default();
 		let now = OffsetDateTime::now_utc();
-		let expected = now + LEAF_TTL;
+		let expected = now + config.leaf_ttl();
 
 		assert!(leaf.not_after > now, "leaf must be valid now");
 		assert!(
 			(leaf.not_after - expected).abs() < Duration::minutes(1),
-			"leaf should expire ~{LEAF_TTL} out, not at rcgen's default"
+			"leaf should expire at the configured TTL, not rcgen's default"
+		);
+	}
+
+	#[test]
+	fn validity_follows_configuration() {
+		let config = Config::from_str("[tls]\nleaf_ttl_hours = 2\n").unwrap();
+		let ca = CertAuthority::generate_dev(&config).unwrap();
+		let leaf = ca.mint("example.com").unwrap();
+
+		let expected = OffsetDateTime::now_utc() + Duration::hours(2);
+
+		assert!(
+			(leaf.not_after - expected).abs() < Duration::minutes(1),
+			"configured TTL should override the default"
 		);
 	}
 
 	#[test]
 	fn caches_repeated_sni() {
-		let ca = CertAuthority::generate_dev().unwrap();
+		let ca = CertAuthority::generate_dev(&Config::default()).unwrap();
 		let first = ca.leaf_for("example.com").unwrap();
 		let second = ca.leaf_for("example.com").unwrap();
 

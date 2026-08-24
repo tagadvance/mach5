@@ -28,10 +28,39 @@ pub trait Interceptor: Send + Sync {
 	fn on_response(&self, _req: &ProxyRequest, _resp: &mut ProxyResponse) {}
 }
 
-/// Forwards everything unchanged.
-pub struct PassThrough;
+/// An ordered list of interceptors, applied in sequence. Requests run through
+/// in order and responses run through in the same order.
+pub struct Chain {
+	links: Vec<Box<dyn Interceptor>>,
+}
 
-impl Interceptor for PassThrough {}
+impl Chain {
+	/// Build the chain described by the configuration: the external plugins in
+	/// the plugin directory, plus the optional response stamp.
+	pub fn from_config(config: &crate::config::Config) -> Self {
+		let mut links: Vec<Box<dyn Interceptor>> = Vec::new();
+
+		if config.plugins.stamp_responses {
+			links.push(Box::new(Stamp));
+		}
+
+		Self { links }
+	}
+}
+
+impl Interceptor for Chain {
+	fn on_request(&self, req: &mut ProxyRequest) {
+		for link in &self.links {
+			link.on_request(req);
+		}
+	}
+
+	fn on_response(&self, req: &ProxyRequest, resp: &mut ProxyResponse) {
+		for link in &self.links {
+			link.on_response(req, resp);
+		}
+	}
+}
 
 /// Stamps every response with a marker header. Its only job is to make
 /// interception observable end-to-end; it stands in for the real request/

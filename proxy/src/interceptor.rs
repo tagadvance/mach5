@@ -40,6 +40,12 @@ impl Chain {
 	pub fn from_config(config: &crate::config::Config) -> Self {
 		let mut links: Vec<Box<dyn Interceptor>> = Vec::new();
 
+		if config.plugins.enabled {
+			for plugin in crate::plugin::load_all(config) {
+				links.push(Box::new(plugin));
+			}
+		}
+
 		if config.plugins.stamp_responses {
 			links.push(Box::new(Stamp));
 		}

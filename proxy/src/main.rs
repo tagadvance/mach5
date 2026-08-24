@@ -9,6 +9,7 @@
 mod ca;
 mod config;
 mod interceptor;
+mod plugin;
 
 use std::collections::HashMap;
 use std::error::Error;

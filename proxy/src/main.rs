@@ -9,6 +9,7 @@
 mod ca;
 mod config;
 mod interceptor;
+mod interstitial;
 mod plugin;
 mod tcp;
 mod upstream;
@@ -253,12 +254,18 @@ fn handle_job(
 
 	let resp = match upstream::call(agent, &job.request) {
 		Ok(resp) => resp,
-		Err(message) => {
-			return send(Payload::Full(ProxyResponse {
-				status: 502,
-				headers: vec![("content-type".to_string(), "text/plain".to_string())],
-				body: message.into_bytes(),
-			}));
+		Err(failure) => {
+			let host = host_of(&job.request.url);
+			let page = match &failure {
+				upstream::FetchError::Tls(detail) => {
+					log::warn!("certificate validation failed for {host}: {detail}");
+
+					interstitial::certificate_error(host, detail)
+				}
+				upstream::FetchError::Other(detail) => interstitial::upstream_error(host, detail),
+			};
+
+			return send(Payload::Full(page));
 		}
 	};
 
@@ -832,6 +839,14 @@ fn build_request(list: &[quiche::h3::Header]) -> Option<ProxyRequest> {
 
 /// Host portion of an `:authority`, dropping any `:port` and keeping an IPv6
 /// literal's brackets.
+/// Host portion of an absolute URL, for reporting which origin failed.
+pub(crate) fn host_of(url: &str) -> &str {
+	let rest = url.split_once("://").map_or(url, |(_scheme, rest)| rest);
+	let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+
+	authority_host(host)
+}
+
 pub(crate) fn authority_host(authority: &str) -> &str {
 	if authority.starts_with('[') {
 		return authority.find(']').map_or(authority, |i| &authority[..=i]);

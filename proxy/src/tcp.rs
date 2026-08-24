@@ -33,6 +33,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::ca::CertAuthority;
 use crate::config::Config;
 use crate::interceptor::{Chain, Interceptor, ProxyRequest, ProxyResponse, ResponseHead};
+use crate::interstitial;
 use crate::upstream;
 
 const STREAM_CHUNK_SIZE: usize = 64 * 1024;
@@ -294,8 +295,8 @@ fn fetch_blocking(
 
 	let resp = match upstream::call(&shared.agent, &request) {
 		Ok(resp) => resp,
-		Err(message) => {
-			let _ = head_tx.send(Outcome::Buffered(error_body(502, &message)));
+		Err(failure) => {
+			let _ = head_tx.send(Outcome::Buffered(failure_page(&request, &failure)));
 
 			return;
 		}
@@ -423,6 +424,20 @@ fn apply_alt_svc(config: &Config, headers: &mut Vec<(String, String)>) {
 
 	if !config.http.alt_svc.is_empty() {
 		headers.push(("alt-svc".to_string(), config.http.alt_svc.clone()));
+	}
+}
+
+/// Render an upstream failure as a page the person can actually read.
+fn failure_page(request: &ProxyRequest, failure: &upstream::FetchError) -> ProxyResponse {
+	let host = crate::host_of(&request.url);
+
+	match failure {
+		upstream::FetchError::Tls(detail) => {
+			log::warn!("certificate validation failed for {host}: {detail}");
+
+			interstitial::certificate_error(host, detail)
+		}
+		upstream::FetchError::Other(detail) => interstitial::upstream_error(host, detail),
 	}
 }
 

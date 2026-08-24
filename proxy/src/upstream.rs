@@ -20,8 +20,32 @@ pub fn agent(config: &Config) -> ureq::Agent {
 		.build()
 }
 
+/// Why an upstream fetch failed.
+pub enum FetchError {
+	/// The origin's certificate did not validate. Distinguished from other
+	/// failures because it is the one the user must be shown and must decide
+	/// about, rather than a transient network problem.
+	Tls(String),
+	Other(String),
+}
+
+/// Does this transport failure look like certificate validation rejecting the
+/// origin? ureq collapses TLS errors into a generic transport error, so the
+/// message is all there is to go on.
+fn is_tls_failure(message: &str) -> bool {
+	let message = message.to_ascii_lowercase();
+
+	message.contains("invalid peer certificate")
+		|| message.contains("certificate expired")
+		|| message.contains("unknownissuer")
+		|| message.contains("notvalidforname")
+		|| message.contains("certificate not valid")
+		|| message.contains("tls connection init failed")
+		|| message.contains("certificate verify failed")
+}
+
 /// Perform the upstream request, mapping transport failures to a message.
-pub fn call(agent: &ureq::Agent, req: &ProxyRequest) -> Result<ureq::Response, String> {
+pub fn call(agent: &ureq::Agent, req: &ProxyRequest) -> Result<ureq::Response, FetchError> {
 	let mut request = agent.request(&req.method, &req.url);
 	for (name, value) in &req.headers {
 		request = request.set(name, value);
@@ -38,9 +62,15 @@ pub fn call(agent: &ureq::Agent, req: &ProxyRequest) -> Result<ureq::Response, S
 		Ok(resp) => Ok(resp),
 		// An HTTP error status is a perfectly good response to relay.
 		Err(ureq::Error::Status(_, resp)) => Ok(resp),
-		// TODO: distinguish TLS validation failures and render a proper
-		// interstitial with a per-host bypass instead of a plain 502.
-		Err(ureq::Error::Transport(t)) => Err(format!("mach5: upstream fetch failed: {t}\n")),
+		Err(ureq::Error::Transport(t)) => {
+			let message = t.to_string();
+
+			Err(if is_tls_failure(&message) {
+				FetchError::Tls(message)
+			} else {
+				FetchError::Other(message)
+			})
+		}
 	}
 }
 

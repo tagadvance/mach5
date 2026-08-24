@@ -1,0 +1,236 @@
+//! The bad-certificate interstitial.
+//!
+//! When an origin's certificate fails validation the client cannot be told the
+//! truth by the usual means: it has already completed a perfectly good TLS
+//! handshake with *us*, using a certificate we minted, so its own warning UI
+//! will never fire. Once a device installs our root CA we are the only thing
+//! still checking, which makes showing this page part of the security model
+//! rather than a nicety.
+
+use crate::interceptor::ProxyResponse;
+
+/// Cloudflare's de-facto status for "the origin's certificate is invalid".
+/// Browsers render our body regardless; this just makes logs honest.
+const STATUS_INVALID_CERT: u16 = 526;
+
+/// Build the interstitial shown in place of a page whose origin failed
+/// certificate validation.
+pub fn certificate_error(host: &str, detail: &str) -> ProxyResponse {
+	let body = page(host, detail);
+
+	ProxyResponse {
+		status: STATUS_INVALID_CERT,
+		headers: vec![
+			(
+				"content-type".to_string(),
+				"text/html; charset=utf-8".to_string(),
+			),
+			// Never let a warning page be cached in place of the real site.
+			("cache-control".to_string(), "no-store".to_string()),
+		],
+		body: body.into_bytes(),
+	}
+}
+
+/// A plain-text failure, for everything that is not a certificate problem.
+pub fn upstream_error(host: &str, detail: &str) -> ProxyResponse {
+	ProxyResponse {
+		status: 502,
+		headers: vec![
+			(
+				"content-type".to_string(),
+				"text/html; charset=utf-8".to_string(),
+			),
+			("cache-control".to_string(), "no-store".to_string()),
+		],
+		body: unreachable_page(host, detail).into_bytes(),
+	}
+}
+
+fn page(host: &str, detail: &str) -> String {
+	let host = escape(host);
+	let detail = escape(detail);
+	let explanation = explain(&detail);
+
+	format!(
+		r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Your connection is not private</title>
+{STYLE}
+</head>
+<body>
+<main>
+  <div class="mark" aria-hidden="true">&#9888;</div>
+  <h1>Your connection is not private</h1>
+  <p class="lede">
+    <strong>{host}</strong> presented a certificate that mach5 could not verify,
+    so the connection was refused before any data was sent.
+  </p>
+  <p>{explanation}</p>
+  <details>
+    <summary>Technical details</summary>
+    <p class="detail">{detail}</p>
+    <p class="note">
+      mach5 is intercepting this connection, so your browser cannot check this
+      certificate itself &mdash; it trusts mach5&rsquo;s own certificate
+      authority. That makes mach5 the only thing still validating the origin,
+      which is why it stopped here rather than letting the page load.
+    </p>
+  </details>
+  <p class="actions"><button onclick="location.reload()">Try again</button></p>
+</main>
+</body>
+</html>
+"#
+	)
+}
+
+fn unreachable_page(host: &str, detail: &str) -> String {
+	let host = escape(host);
+	let detail = escape(detail);
+
+	format!(
+		r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>This site can't be reached</title>
+{STYLE}
+</head>
+<body>
+<main>
+  <div class="mark" aria-hidden="true">&#8709;</div>
+  <h1>This site can&rsquo;t be reached</h1>
+  <p class="lede">mach5 could not fetch <strong>{host}</strong>.</p>
+  <details>
+    <summary>Technical details</summary>
+    <p class="detail">{detail}</p>
+  </details>
+  <p class="actions"><button onclick="location.reload()">Try again</button></p>
+</main>
+</body>
+</html>
+"#
+	)
+}
+
+/// Turn the underlying library message into something a person can act on.
+fn explain(detail: &str) -> &'static str {
+	let detail = detail.to_ascii_lowercase();
+
+	if detail.contains("expired") {
+		"The certificate has expired. That usually means the site let it lapse, \
+		 but it can also mean your device's clock is wrong."
+	} else if detail.contains("unknownissuer") || detail.contains("unknown issuer") {
+		"The certificate was not issued by an authority mach5 trusts. It may be \
+		 self-signed, or something may be intercepting the connection between \
+		 mach5 and the site."
+	} else if detail.contains("notvalidforname") || detail.contains("not valid for") {
+		"The certificate is valid, but it was issued for a different hostname. \
+		 The request may have been redirected somewhere unintended."
+	} else {
+		"The certificate could not be validated, so mach5 refused to continue."
+	}
+}
+
+const STYLE: &str = r#"<style>
+:root { color-scheme: light dark; }
+body {
+  margin: 0; min-height: 100vh; display: flex; align-items: center;
+  justify-content: center; padding: 2rem;
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: #fff; color: #202124;
+}
+main { max-width: 42rem; }
+.mark { font-size: 3.5rem; line-height: 1; color: #b0b3b8; margin-bottom: 1rem; }
+h1 { font-size: 1.65rem; font-weight: 500; margin: 0 0 1rem; }
+.lede { font-size: 1.05rem; }
+p { margin: 0 0 1rem; }
+details { margin: 1.5rem 0; }
+summary { cursor: pointer; color: #1a73e8; }
+.detail { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .85rem; word-break: break-word; margin-top: .75rem; }
+.note { font-size: .9rem; color: #5f6368; }
+.actions { margin-top: 2rem; }
+button {
+  font: inherit; font-size: .95rem; padding: .55rem 1.1rem; border: 0;
+  border-radius: 4px; background: #1a73e8; color: #fff; cursor: pointer;
+}
+button:hover { background: #1867cf; }
+@media (prefers-color-scheme: dark) {
+  body { background: #202124; color: #e8eaed; }
+  .note { color: #9aa0a6; }
+  summary { color: #8ab4f8; }
+  button { background: #8ab4f8; color: #202124; }
+  button:hover { background: #aecbfa; }
+}
+</style>"#;
+
+/// Minimal HTML escaping. The host and the library's message both reach this
+/// page from outside, so neither is trusted markup.
+fn escape(raw: &str) -> String {
+	let mut out = String::with_capacity(raw.len());
+	for c in raw.chars() {
+		match c {
+			'&' => out.push_str("&amp;"),
+			'<' => out.push_str("&lt;"),
+			'>' => out.push_str("&gt;"),
+			'"' => out.push_str("&quot;"),
+			'\'' => out.push_str("&#39;"),
+			_ => out.push(c),
+		}
+	}
+
+	out
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn host_and_detail_are_escaped() {
+		let resp = certificate_error("<script>alert(1)</script>", "\"quoted\"");
+		let body = String::from_utf8(resp.body).unwrap();
+
+		assert!(!body.contains("<script>alert(1)</script>"));
+		assert!(body.contains("&lt;script&gt;"));
+		assert!(body.contains("&quot;quoted&quot;"));
+	}
+
+	#[test]
+	fn expiry_gets_its_own_explanation() {
+		let resp = certificate_error("example.com", "certificate expired");
+		let body = String::from_utf8(resp.body).unwrap();
+
+		assert!(body.contains("has expired"));
+		assert!(body.contains("clock is wrong"), "clock skew is worth naming");
+	}
+
+	#[test]
+	fn wrong_host_and_unknown_issuer_differ() {
+		let issuer = certificate_error("example.com", "invalid peer certificate: UnknownIssuer");
+		let name = certificate_error("example.com", "certificate not valid for name");
+
+		let issuer = String::from_utf8(issuer.body).unwrap();
+		let name = String::from_utf8(name.body).unwrap();
+
+		assert!(issuer.contains("not issued by an authority"));
+		assert!(name.contains("issued for a different hostname"));
+	}
+
+	#[test]
+	fn interstitial_is_never_cached() {
+		let resp = certificate_error("example.com", "whatever");
+
+		assert_eq!(resp.status, 526);
+		assert!(resp
+			.headers
+			.iter()
+			.any(|(k, v)| k == "cache-control" && v == "no-store"));
+	}
+}

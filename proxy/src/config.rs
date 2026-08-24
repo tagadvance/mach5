@@ -20,7 +20,11 @@ use time::Duration;
 pub struct Config {
 	/// Address to listen on for QUIC (UDP).
 	pub listen: Listen,
+	/// TCP address for HTTP/1.1 over TLS. Browsers connect here first — HTTP/3
+	/// is only discovered afterwards, via the Alt-Svc header below.
+	pub listen_tcp: ListenTcp,
 	pub ca: Ca,
+	pub http: Http,
 	pub paths: Paths,
 	pub plugins: Plugins,
 	pub tls: Tls,
@@ -35,6 +39,42 @@ pub struct Listen(pub SocketAddr);
 impl Default for Listen {
 	fn default() -> Self {
 		Self("0.0.0.0:4433".parse().expect("valid default listen addr"))
+	}
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(transparent)]
+pub struct ListenTcp(pub SocketAddr);
+
+impl Default for ListenTcp {
+	fn default() -> Self {
+		Self("0.0.0.0:4443".parse().expect("valid default tcp addr"))
+	}
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Http {
+	/// Value of the `Alt-Svc` header advertising HTTP/3, added to every
+	/// response served over TCP. This is how a browser learns to switch to
+	/// QUIC at all. Empty disables the advertisement.
+	pub alt_svc: String,
+	/// Keep TCP connections open for reuse between requests.
+	pub keep_alive: bool,
+	/// How long to wait for a request on an idle kept-alive connection.
+	pub idle_timeout_seconds: u64,
+	/// Cap on the request head (request line plus headers).
+	pub max_header_bytes: usize,
+}
+
+impl Default for Http {
+	fn default() -> Self {
+		Self {
+			alt_svc: r#"h3=":4433"; ma=86400"#.to_string(),
+			keep_alive: true,
+			idle_timeout_seconds: 60,
+			max_header_bytes: 64 * 1024,
+		}
 	}
 }
 

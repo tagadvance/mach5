@@ -7,6 +7,22 @@
 # Address to listen on for QUIC (UDP).
 listen = "0.0.0.0:4433"
 
+# Address to listen on for TLS over TCP, serving HTTP/1.1.
+#
+# This is not optional in practice: HTTP/3 cannot bootstrap itself. A browser
+# opens TCP 443 first and only discovers h3 from the Alt-Svc header on a
+# response it got over TCP. In a real deployment both of these are port 443.
+listen_tcp = "0.0.0.0:4443"
+
+[http]
+# Advertises HTTP/3 on every response served over TCP — this is what moves a
+# client onto QUIC. Set to "" to keep clients on TCP. In a real deployment the
+# port here is 443.
+alt_svc = 'h3=":4433"; ma=86400'
+keep_alive = true
+idle_timeout_seconds = 60
+max_header_bytes = 65536
+
 [ca]
 # Root CA used to sign leaves minted per SNI host. Leave both unset to generate
 # an ephemeral in-memory CA (development only — no browser will trust it).

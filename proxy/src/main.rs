@@ -1,30 +1,60 @@
 //! mach5 — QUIC/HTTP-3 intercepting proxy (skeleton).
 //!
-//! This proves the load-bearing feature: terminate an HTTP/3 connection from a
-//! client using a certificate minted on the fly for the requested SNI host and
-//! signed by our root CA. It currently answers every request with a small
-//! diagnostic page. Proxying the request upstream and running it through a
-//! pluggable interception layer is the next layer of work — see the TODOs in
-//! `handle_h3`.
+//! Terminates an HTTP/3 connection from a client with a certificate minted on
+//! the fly for the requested SNI host (signed by our root CA), forwards each
+//! request to the real origin through a pluggable [`Interceptor`], and streams
+//! the response back. Upstream fetches run on a worker pool so a slow origin
+//! never stalls the single-threaded QUIC event loop.
 
 mod ca;
+mod interceptor;
 
 use std::collections::HashMap;
 use std::error::Error;
+use std::io::Read;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use boring::ssl::{select_next_proto, AlpnError, SslContextBuilder, SslMethod, SslVersion};
 use quiche::h3::NameValue;
 
 use ca::CertAuthority;
+use interceptor::{Interceptor, PassThrough, ProxyRequest, ProxyResponse, Stamp};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
+const SOCKET: mio::Token = mio::Token(0);
+const WAKER: mio::Token = mio::Token(1);
+
+/// A request handed off to a worker for fetching.
+struct FetchJob {
+	conn: quiche::ConnectionId<'static>,
+	stream_id: u64,
+	request: ProxyRequest,
+}
+
+/// A fetched (and intercepted) response on its way back to a client.
+struct FetchResult {
+	conn: quiche::ConnectionId<'static>,
+	stream_id: u64,
+	response: ProxyResponse,
+}
+
+/// A response being streamed out on one h3 stream, tracking how far it got so
+/// it can resume when the stream regains capacity.
+struct Pending {
+	stream_id: u64,
+	response: ProxyResponse,
+	headers_sent: bool,
+	body_offset: usize,
+}
 
 /// Per-connection state.
 struct Client {
 	conn: quiche::Connection,
 	http3: Option<quiche::h3::Connection>,
+	pending: Vec<Pending>,
 }
 
 type ClientMap = HashMap<quiche::ConnectionId<'static>, Client>;
@@ -44,7 +74,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 	let mut events = mio::Events::with_capacity(1024);
 	let mut socket = mio::net::UdpSocket::bind(listen)?;
 	poll.registry()
-		.register(&mut socket, mio::Token(0), mio::Interest::READABLE)?;
+		.register(&mut socket, SOCKET, mio::Interest::READABLE)?;
+	let waker = Arc::new(mio::Waker::new(poll.registry(), WAKER)?);
+
+	let (jobs, results) = spawn_workers(select_interceptor(), waker);
 	log::info!("listening on {listen} (UDP/QUIC)");
 
 	let mut buf = [0u8; 65535];
@@ -55,7 +88,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 		let timeout = clients.values().filter_map(|c| c.conn.timeout()).min();
 		poll.poll(&mut events, timeout)?;
 
-		// Read every datagram currently queued on the socket.
+		// Drain the socket.
 		'read: loop {
 			if events.is_empty() {
 				break 'read;
@@ -67,24 +100,19 @@ fn main() -> Result<(), Box<dyn Error>> {
 				Err(e) => return Err(e.into()),
 			};
 
-			if let Err(e) = recv_packet(
-				&mut buf[..len],
-				from,
-				listen,
-				&socket,
-				&mut config,
-				&mut clients,
-			) {
+			if let Err(e) = recv_packet(&mut buf[..len], from, listen, &mut config, &mut clients) {
 				log::debug!("recv error from {from}: {e}");
 			}
 		}
 
-		// Fire idle/loss timers.
+		// Attach any fetched responses to their connections.
+		drain_results(&results, &mut clients);
+
 		for client in clients.values_mut() {
 			client.conn.on_timeout();
 		}
 
-		drive_http3(&h3_config, &mut clients);
+		drive_http3(&h3_config, &mut clients, &jobs);
 		flush(&socket, &mut out, &mut clients);
 
 		clients.retain(|_, c| {
@@ -96,6 +124,128 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 			true
 		});
+	}
+}
+
+fn select_interceptor() -> Arc<dyn Interceptor> {
+	match std::env::var("MACH5_INTERCEPT").as_deref() {
+		Ok("passthrough") => Arc::new(PassThrough),
+		_ => Arc::new(Stamp),
+	}
+}
+
+fn spawn_workers(
+	interceptor: Arc<dyn Interceptor>,
+	waker: Arc<mio::Waker>,
+) -> (Sender<FetchJob>, Receiver<FetchResult>) {
+	let (job_tx, job_rx) = std::sync::mpsc::channel::<FetchJob>();
+	let (res_tx, res_rx) = std::sync::mpsc::channel::<FetchResult>();
+	let job_rx = Arc::new(Mutex::new(job_rx));
+
+	let agent = ureq::AgentBuilder::new()
+		.redirects(0) // pass 3xx through to the client; it re-requests and we intercept again
+		.timeout_connect(Duration::from_secs(10))
+		.timeout_read(Duration::from_secs(30))
+		.build();
+
+	let count = std::thread::available_parallelism()
+		.map(|n| n.get())
+		.unwrap_or(4);
+
+	for _ in 0..count {
+		let job_rx = job_rx.clone();
+		let res_tx = res_tx.clone();
+		let waker = waker.clone();
+		let agent = agent.clone();
+		let interceptor = interceptor.clone();
+
+		std::thread::spawn(move || loop {
+			let job = {
+				let rx = job_rx.lock().unwrap();
+				rx.recv()
+			};
+			let mut job = match job {
+				Ok(j) => j,
+				Err(_) => break, // senders dropped: shut down
+			};
+
+			interceptor.on_request(&mut job.request);
+			let mut response = fetch(&agent, &job.request);
+			interceptor.on_response(&job.request, &mut response);
+
+			let sent = res_tx.send(FetchResult {
+				conn: job.conn,
+				stream_id: job.stream_id,
+				response,
+			});
+			if sent.is_err() {
+				break;
+			}
+
+			let _ = waker.wake();
+		});
+	}
+
+	(job_tx, res_rx)
+}
+
+/// Blocking upstream fetch. Any transport failure becomes a 502 so the client
+/// always gets a well-formed response.
+fn fetch(agent: &ureq::Agent, req: &ProxyRequest) -> ProxyResponse {
+	let mut request = agent.request(&req.method, &req.url);
+	for (name, value) in &req.headers {
+		request = request.set(name, value);
+	}
+
+	let resp = match request.call() {
+		Ok(resp) => resp,
+		Err(ureq::Error::Status(_, resp)) => resp,
+		Err(ureq::Error::Transport(t)) => {
+			let body = format!("mach5: upstream fetch failed: {t}\n").into_bytes();
+
+			return ProxyResponse {
+				status: 502,
+				headers: vec![("content-type".to_string(), "text/plain".to_string())],
+				body,
+			};
+		}
+	};
+
+	let status = resp.status();
+	let mut headers = Vec::new();
+	for name in resp.headers_names() {
+		if is_hop_by_hop(&name) {
+			continue;
+		}
+		if let Some(value) = resp.header(&name) {
+			headers.push((name.clone(), value.to_string()));
+		}
+	}
+
+	let mut body = Vec::new();
+	if let Err(e) = resp.into_reader().read_to_end(&mut body) {
+		log::warn!("failed reading upstream body for {}: {e}", req.url);
+	}
+
+	ProxyResponse {
+		status,
+		headers,
+		body,
+	}
+}
+
+fn drain_results(results: &Receiver<FetchResult>, clients: &mut ClientMap) {
+	while let Ok(result) = results.try_recv() {
+		match clients.get_mut(&result.conn) {
+			Some(client) => client.pending.push(Pending {
+				stream_id: result.stream_id,
+				response: result.response,
+				headers_sent: false,
+				body_offset: 0,
+			}),
+			// Client vanished while its fetch was in flight; drop the response.
+			None => log::debug!("dropping response for closed connection"),
+		}
 	}
 }
 
@@ -162,7 +312,6 @@ fn recv_packet(
 	pkt: &mut [u8],
 	from: SocketAddr,
 	local: SocketAddr,
-	socket: &mio::net::UdpSocket,
 	config: &mut quiche::Config,
 	clients: &mut ClientMap,
 ) -> Result<(), Box<dyn Error>> {
@@ -194,6 +343,7 @@ fn recv_packet(
 				Client {
 					conn,
 					http3: None,
+					pending: Vec::new(),
 				},
 			);
 
@@ -207,13 +357,19 @@ fn recv_packet(
 	};
 	clients.get_mut(&key).unwrap().conn.recv(pkt, info)?;
 
-	let _ = socket;
-
 	Ok(())
 }
 
-fn drive_http3(h3_config: &quiche::h3::Config, clients: &mut ClientMap) {
-	for client in clients.values_mut() {
+fn drive_http3(
+	h3_config: &quiche::h3::Config,
+	clients: &mut ClientMap,
+	jobs: &Sender<FetchJob>,
+) {
+	let keys: Vec<_> = clients.keys().cloned().collect();
+
+	for key in keys {
+		let client = clients.get_mut(&key).unwrap();
+
 		if (client.conn.is_in_early_data() || client.conn.is_established())
 			&& client.http3.is_none()
 		{
@@ -227,28 +383,45 @@ fn drive_http3(h3_config: &quiche::h3::Config, clients: &mut ClientMap) {
 			}
 		}
 
-		if let Some(http3) = client.http3.as_mut() {
-			handle_h3(&mut client.conn, http3);
-		}
+		let Some(http3) = client.http3.as_mut() else {
+			continue;
+		};
+
+		poll_requests(&key, &mut client.conn, http3, jobs);
+		pump_responses(&mut client.conn, http3, &mut client.pending);
 	}
 }
 
-fn handle_h3(conn: &mut quiche::Connection, http3: &mut quiche::h3::Connection) {
+fn poll_requests(
+	key: &quiche::ConnectionId<'static>,
+	conn: &mut quiche::Connection,
+	http3: &mut quiche::h3::Connection,
+	jobs: &Sender<FetchJob>,
+) {
 	loop {
 		match http3.poll(conn) {
 			Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
-				let host = header_value(&list, b":authority");
-				let path = header_value(&list, b":path");
-				log::info!("h3 request stream={stream_id} authority={host} path={path}");
+				match build_request(&list) {
+					Some(request) => {
+						log::info!("proxying stream={stream_id} {} {}", request.method, request.url);
 
-				// TODO: instead of answering here, forward this request upstream
-				// (h2/h1.1 to origins that don't speak h3), run request/response
-				// through the pluggable interception layer, then stream it back.
-				respond(conn, http3, stream_id, &host, &path);
+						// TODO: forward request bodies (POST/PUT) — read them from
+						// the stream's Data events before dispatching.
+						let job = FetchJob {
+							conn: key.clone(),
+							stream_id,
+							request,
+						};
+						if jobs.send(job).is_err() {
+							log::error!("worker pool is gone; cannot dispatch request");
+						}
+					}
+					None => log::warn!("stream={stream_id} missing pseudo-headers; ignoring"),
+				}
 			}
-			Ok((_stream_id, quiche::h3::Event::Data)) => {}
-			Ok((_stream_id, quiche::h3::Event::Finished)) => {}
-			Ok((_stream_id, quiche::h3::Event::Reset(_))) => {}
+			Ok((_, quiche::h3::Event::Data)) => {}
+			Ok((_, quiche::h3::Event::Finished)) => {}
+			Ok((_, quiche::h3::Event::Reset(_))) => {}
 			Ok((_, quiche::h3::Event::PriorityUpdate)) => {}
 			Ok((_, quiche::h3::Event::GoAway)) => {}
 			Err(quiche::h3::Error::Done) => break,
@@ -261,33 +434,65 @@ fn handle_h3(conn: &mut quiche::Connection, http3: &mut quiche::h3::Connection) 
 	}
 }
 
-fn respond(
+/// Send as much of each pending response as the streams will currently accept,
+/// keeping whatever is left for the next pass.
+fn pump_responses(
 	conn: &mut quiche::Connection,
 	http3: &mut quiche::h3::Connection,
-	stream_id: u64,
-	host: &str,
-	path: &str,
+	pending: &mut Vec<Pending>,
 ) {
-	let body = format!(
-		"mach5 proxy skeleton\nintercepted {host}{path}\nTLS terminated with a minted certificate.\n"
-	);
+	pending.retain_mut(|p| match send_pending(conn, http3, p) {
+		Ok(done) => !done,
+		Err(e) => {
+			log::error!("failed sending response on stream={}: {e}", p.stream_id);
 
-	let headers = [
-		quiche::h3::Header::new(b":status", b"200"),
-		quiche::h3::Header::new(b"content-type", b"text/plain"),
-		quiche::h3::Header::new(b"content-length", body.len().to_string().as_bytes()),
-		quiche::h3::Header::new(b"server", b"mach5"),
-	];
+			false
+		}
+	});
+}
 
-	if let Err(e) = http3.send_response(conn, stream_id, &headers, false) {
-		log::error!("send_response failed: {e}");
+/// Returns Ok(true) once the whole response has been handed to quiche.
+fn send_pending(
+	conn: &mut quiche::Connection,
+	http3: &mut quiche::h3::Connection,
+	p: &mut Pending,
+) -> Result<bool, quiche::h3::Error> {
+	if !p.headers_sent {
+		let status = p.response.status.to_string();
+		let content_length = p.response.body.len().to_string();
 
-		return;
+		let mut headers = vec![
+			quiche::h3::Header::new(b":status", status.as_bytes()),
+			quiche::h3::Header::new(b"content-length", content_length.as_bytes()),
+		];
+		for (name, value) in &p.response.headers {
+			headers.push(quiche::h3::Header::new(name.as_bytes(), value.as_bytes()));
+		}
+
+		let fin = p.response.body.is_empty();
+		match http3.send_response(conn, p.stream_id, &headers, fin) {
+			Ok(()) => p.headers_sent = true,
+			Err(quiche::h3::Error::StreamBlocked) | Err(quiche::h3::Error::Done) => {
+				return Ok(false)
+			}
+			Err(e) => return Err(e),
+		}
+
+		if fin {
+			return Ok(true);
+		}
 	}
 
-	if let Err(e) = http3.send_body(conn, stream_id, body.as_bytes(), true) {
-		log::error!("send_body failed: {e}");
+	while p.body_offset < p.response.body.len() {
+		match http3.send_body(conn, p.stream_id, &p.response.body[p.body_offset..], true) {
+			Ok(0) => break,
+			Ok(n) => p.body_offset += n,
+			Err(quiche::h3::Error::Done) => break,
+			Err(e) => return Err(e),
+		}
 	}
+
+	Ok(p.headers_sent && p.body_offset >= p.response.body.len())
 }
 
 fn flush(socket: &mio::net::UdpSocket, out: &mut [u8], clients: &mut ClientMap) {
@@ -315,6 +520,73 @@ fn flush(socket: &mio::net::UdpSocket, out: &mut [u8], clients: &mut ClientMap) 
 			}
 		}
 	}
+}
+
+/// Build the upstream request from a request's pseudo-headers. Returns None if
+/// the mandatory pseudo-headers are absent.
+fn build_request(list: &[quiche::h3::Header]) -> Option<ProxyRequest> {
+	let mut method = None;
+	let mut authority = None;
+	let mut path = None;
+	let mut scheme = None;
+	let mut headers = Vec::new();
+
+	for h in list {
+		let value = String::from_utf8_lossy(h.value()).into_owned();
+		match h.name() {
+			b":method" => method = Some(value),
+			b":authority" => authority = Some(value),
+			b":path" => path = Some(value),
+			b":scheme" => scheme = Some(value),
+			name if name.starts_with(b":") => {}
+			name if is_hop_by_hop(&String::from_utf8_lossy(name)) => {}
+			// ureq derives Host from the URL; a second one would conflict.
+			b"host" => {}
+			name => headers.push((String::from_utf8_lossy(name).into_owned(), value)),
+		}
+	}
+
+	let scheme = scheme.unwrap_or_else(|| "https".to_string());
+	// TODO: this drops any port in :authority and lets the scheme's default
+	// apply (443 for https). Correct for the common case; a transparent
+	// deployment should instead recover the real origin address via
+	// SO_ORIGINAL_DST to preserve nonstandard ports.
+	let url = format!("{scheme}://{}{}", authority_host(&authority?), path?);
+
+	Some(ProxyRequest {
+		method: method?,
+		url,
+		headers,
+	})
+}
+
+/// Host portion of an `:authority`, dropping any `:port` and keeping an IPv6
+/// literal's brackets.
+fn authority_host(authority: &str) -> &str {
+	if authority.starts_with('[') {
+		return authority.find(']').map_or(authority, |i| &authority[..=i]);
+	}
+
+	authority
+		.split_once(':')
+		.map_or(authority, |(host, _port)| host)
+}
+
+/// Hop-by-hop headers are meaningful only on a single connection and must not be
+/// forwarded across the proxy (RFC 9110 §7.6.1), plus framing headers we set
+/// ourselves.
+fn is_hop_by_hop(name: &str) -> bool {
+	matches!(
+		name.to_ascii_lowercase().as_str(),
+		"connection"
+			| "keep-alive"
+			| "proxy-authenticate"
+			| "proxy-authorization"
+			| "te" | "trailer"
+			| "transfer-encoding"
+			| "upgrade"
+			| "content-length"
+	)
 }
 
 /// Find the map key whose bytes equal `cid`, working across the borrowed and
@@ -352,9 +624,42 @@ fn derive_scid(dcid: &quiche::ConnectionId) -> quiche::ConnectionId<'static> {
 	quiche::ConnectionId::from_ref(&id).into_owned()
 }
 
-fn header_value(list: &[quiche::h3::Header], name: &[u8]) -> String {
-	list.iter()
-		.find(|h| h.name() == name)
-		.map(|h| String::from_utf8_lossy(h.value()).into_owned())
-		.unwrap_or_default()
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn authority_host_strips_port() {
+		assert_eq!(authority_host("example.com:4435"), "example.com");
+		assert_eq!(authority_host("example.com"), "example.com");
+		assert_eq!(authority_host("[::1]:8443"), "[::1]");
+		assert_eq!(authority_host("[2001:db8::1]"), "[2001:db8::1]");
+	}
+
+	#[test]
+	fn build_request_from_pseudo_headers() {
+		let list = vec![
+			quiche::h3::Header::new(b":method", b"GET"),
+			quiche::h3::Header::new(b":scheme", b"https"),
+			quiche::h3::Header::new(b":authority", b"example.com:4435"),
+			quiche::h3::Header::new(b":path", b"/index.html"),
+			quiche::h3::Header::new(b"user-agent", b"curl"),
+			quiche::h3::Header::new(b"host", b"example.com:4435"),
+			quiche::h3::Header::new(b"connection", b"keep-alive"),
+		];
+
+		let req = build_request(&list).expect("should parse");
+
+		assert_eq!(req.method, "GET");
+		assert_eq!(req.url, "https://example.com/index.html");
+		// host (ureq sets it) and hop-by-hop headers are dropped; user-agent kept.
+		assert_eq!(req.headers, vec![("user-agent".to_string(), "curl".to_string())]);
+	}
+
+	#[test]
+	fn build_request_needs_authority_and_path() {
+		let list = vec![quiche::h3::Header::new(b":method", b"GET")];
+
+		assert!(build_request(&list).is_none());
+	}
 }

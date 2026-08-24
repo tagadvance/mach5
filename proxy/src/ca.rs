@@ -15,12 +15,25 @@ use rcgen::{
 	BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
 	KeyUsagePurpose,
 };
+use time::{Duration, OffsetDateTime};
+
+/// How long a minted leaf stays valid. Minted certs have no revocation path, so
+/// expiry is the only thing bounding a leaked key's usefulness — keep it short.
+const LEAF_TTL: Duration = Duration::hours(24);
+
+/// Backdate `notBefore` to tolerate clients whose clocks run behind ours.
+const CLOCK_SKEW: Duration = Duration::hours(1);
+
+/// Re-mint a cached leaf once it has less than this left, so the cache never
+/// serves a cert that expires mid-connection.
+const REFRESH_MARGIN: Duration = Duration::hours(1);
 
 /// A minted leaf, in the boring types the TLS stack consumes.
 #[derive(Clone)]
 struct Leaf {
 	cert: X509,
 	key: PKey<Private>,
+	not_after: OffsetDateTime,
 }
 
 pub struct CertAuthority {
@@ -60,17 +73,19 @@ impl CertAuthority {
 		})
 	}
 
-	/// Return a leaf for `sni`, minting and caching on first request.
+	/// Return a leaf for `sni`, minting and caching on first request and
+	/// re-minting once a cached leaf nears expiry.
 	fn leaf_for(&self, sni: &str) -> Result<Leaf, Box<dyn Error>> {
-		if let Some(leaf) = self.cache.lock().unwrap().get(sni) {
-			return Ok(leaf.clone());
+		let mut cache = self.cache.lock().unwrap();
+
+		if let Some(leaf) = cache.get(sni) {
+			if leaf.not_after - REFRESH_MARGIN > OffsetDateTime::now_utc() {
+				return Ok(leaf.clone());
+			}
 		}
 
 		let leaf = self.mint(sni)?;
-		self.cache
-			.lock()
-			.unwrap()
-			.insert(sni.to_string(), leaf.clone());
+		cache.insert(sni.to_string(), leaf.clone());
 
 		Ok(leaf)
 	}
@@ -83,6 +98,11 @@ impl CertAuthority {
 		dn.push(DnType::CommonName, sni);
 		params.distinguished_name = dn;
 
+		let now = OffsetDateTime::now_utc();
+		let not_after = now + LEAF_TTL;
+		params.not_before = now - CLOCK_SKEW;
+		params.not_after = not_after;
+
 		let cert = params.signed_by(&key, &self.issuer)?;
 
 		let x509 = X509::from_pem(cert.pem().as_bytes())?;
@@ -91,6 +111,7 @@ impl CertAuthority {
 		Ok(Leaf {
 			cert: x509,
 			key: pkey,
+			not_after,
 		})
 	}
 
@@ -130,6 +151,21 @@ mod tests {
 			.any(|n| n == "example.com");
 
 		assert!(has_host, "SAN should contain the requested SNI host");
+	}
+
+	#[test]
+	fn leaf_validity_is_bounded() {
+		let ca = CertAuthority::generate_dev().unwrap();
+		let leaf = ca.mint("example.com").unwrap();
+
+		let now = OffsetDateTime::now_utc();
+		let expected = now + LEAF_TTL;
+
+		assert!(leaf.not_after > now, "leaf must be valid now");
+		assert!(
+			(leaf.not_after - expected).abs() < Duration::minutes(1),
+			"leaf should expire ~{LEAF_TTL} out, not at rcgen's default"
+		);
 	}
 
 	#[test]

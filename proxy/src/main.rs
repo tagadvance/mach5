@@ -29,6 +29,9 @@ use interceptor::{Chain, Interceptor, ProxyRequest, ProxyResponse};
 const SOCKET: mio::Token = mio::Token(0);
 const WAKER: mio::Token = mio::Token(1);
 
+/// Prefix identifying an address-validation token as ours.
+const TOKEN_MARKER: &[u8] = b"mach5";
+
 /// A request handed off to a worker for fetching.
 struct FetchJob {
 	conn: quiche::ConnectionId<'static>,
@@ -112,9 +115,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 				Err(e) => return Err(e.into()),
 			};
 
-			if let Err(e) =
-				recv_packet(&mut buf[..len], from, listen, &mut quic_config, &mut clients)
-			{
+			if let Err(e) = recv_packet(
+				&mut buf[..len],
+				from,
+				listen,
+				&socket,
+				&mut out,
+				&mut quic_config,
+				&mut clients,
+			) {
 				log::debug!("recv error from {from}: {e}");
 			}
 		}
@@ -313,6 +322,8 @@ fn recv_packet(
 	pkt: &mut [u8],
 	from: SocketAddr,
 	local: SocketAddr,
+	socket: &mio::net::UdpSocket,
+	out: &mut [u8],
 	config: &mut quiche::Config,
 	clients: &mut ClientMap,
 ) -> Result<(), Box<dyn Error>> {
@@ -334,13 +345,48 @@ fn recv_packet(
 				return Ok(());
 			}
 
-			// TODO: stateless Retry + version negotiation before accepting, to
-			// harden against spoofed-source amplification.
-			let conn = quiche::accept(&derived, None, local, from, config)?;
-			log::info!("new connection {derived:?} from {from}");
+			if !quiche::version_is_supported(hdr.version) {
+				let len = quiche::negotiate_version(&hdr.scid, &hdr.dcid, out)?;
+				socket.send_to(&out[..len], from)?;
+
+				return Ok(());
+			}
+
+			// Address validation. An Initial with no token gets a Retry
+			// carrying one; only a client that actually received it can
+			// answer, which stops an off-path attacker from pointing our
+			// handshake bytes at a spoofed victim.
+			let token = hdr.token.as_deref().unwrap_or_default();
+			if token.is_empty() {
+				let new_token = mint_token(&hdr, &from);
+				let len = quiche::retry(
+					&hdr.scid,
+					&hdr.dcid,
+					&derived,
+					&new_token,
+					hdr.version,
+					out,
+				)?;
+				socket.send_to(&out[..len], from)?;
+				log::debug!("sent retry to {from}");
+
+				return Ok(());
+			}
+
+			let Some(odcid) = validate_token(&from, token) else {
+				log::debug!("invalid address-validation token from {from}");
+
+				return Ok(());
+			};
+
+			// Post-retry the client addresses us by the connection id we handed
+			// it, so adopt that as our own rather than deriving a fresh one.
+			let scid = hdr.dcid.clone().into_owned();
+			let conn = quiche::accept(&scid, Some(&odcid), local, from, config)?;
+			log::info!("new connection {scid:?} from {from}");
 
 			clients.insert(
-				derived.clone(),
+				scid.clone(),
 				Client {
 					conn,
 					http3: None,
@@ -349,7 +395,7 @@ fn recv_packet(
 				},
 			);
 
-			derived
+			scid
 		}
 	};
 
@@ -697,6 +743,45 @@ fn is_hop_by_hop(name: &str) -> bool {
 	)
 }
 
+/// Build an address-validation token: a marker, the client's address, and the
+/// connection id it originally chose (which we must echo back at handshake).
+///
+/// The token is not authenticated, so it proves only that the bearer received
+/// our Retry at this address — which is exactly the amplification defence we
+/// want. It is not a substitute for a signed token if this ever faces a
+/// hostile network.
+fn mint_token(hdr: &quiche::Header, from: &SocketAddr) -> Vec<u8> {
+	let mut token = Vec::from(TOKEN_MARKER);
+	token.extend_from_slice(&address_bytes(from));
+	token.extend_from_slice(&hdr.dcid);
+
+	token
+}
+
+/// Recover the original connection id from a token, rejecting anything that did
+/// not come from us or arrived from a different address.
+fn validate_token(from: &SocketAddr, token: &[u8]) -> Option<quiche::ConnectionId<'static>> {
+	let rest = token.strip_prefix(TOKEN_MARKER)?;
+
+	let addr = address_bytes(from);
+	let rest = rest.strip_prefix(addr.as_slice())?;
+	if rest.is_empty() {
+		return None;
+	}
+
+	Some(quiche::ConnectionId::from_ref(rest).into_owned())
+}
+
+fn address_bytes(addr: &SocketAddr) -> Vec<u8> {
+	let mut bytes = match addr.ip() {
+		std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+		std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
+	};
+	bytes.extend_from_slice(&addr.port().to_be_bytes());
+
+	bytes
+}
+
 /// Find the map key whose bytes equal `cid`, working across the borrowed and
 /// 'static connection-id lifetimes.
 fn find_key(
@@ -780,6 +865,58 @@ mod tests {
 
 		assert!(!append_bounded(&mut body, b"xy", 6));
 		assert_eq!(body, b"abcde", "rejected chunk must not be appended");
+	}
+
+	#[test]
+	fn token_round_trips_the_original_connection_id() {
+		let from: SocketAddr = "192.0.2.10:5555".parse().unwrap();
+		let odcid = quiche::ConnectionId::from_ref(b"originalcid");
+
+		let mut token = Vec::from(TOKEN_MARKER);
+		token.extend_from_slice(&address_bytes(&from));
+		token.extend_from_slice(&odcid);
+
+		let recovered = validate_token(&from, &token).expect("our own token must validate");
+
+		assert_eq!(recovered.as_ref(), odcid.as_ref());
+	}
+
+	#[test]
+	fn token_is_rejected_from_another_address() {
+		let minted_for: SocketAddr = "192.0.2.10:5555".parse().unwrap();
+		let attacker: SocketAddr = "198.51.100.7:5555".parse().unwrap();
+
+		let mut token = Vec::from(TOKEN_MARKER);
+		token.extend_from_slice(&address_bytes(&minted_for));
+		token.extend_from_slice(b"originalcid");
+
+		assert!(
+			validate_token(&attacker, &token).is_none(),
+			"a token replayed from a different address must not validate"
+		);
+	}
+
+	#[test]
+	fn token_without_our_marker_is_rejected() {
+		let from: SocketAddr = "192.0.2.10:5555".parse().unwrap();
+		let mut token = Vec::from(b"other".as_slice());
+		token.extend_from_slice(&address_bytes(&from));
+		token.extend_from_slice(b"originalcid");
+
+		assert!(validate_token(&from, &token).is_none());
+		assert!(validate_token(&from, b"").is_none(), "empty token is invalid");
+	}
+
+	#[test]
+	fn token_with_no_connection_id_is_rejected() {
+		let from: SocketAddr = "192.0.2.10:5555".parse().unwrap();
+		let mut token = Vec::from(TOKEN_MARKER);
+		token.extend_from_slice(&address_bytes(&from));
+
+		assert!(
+			validate_token(&from, &token).is_none(),
+			"a token carrying no original id is unusable"
+		);
 	}
 
 	#[test]

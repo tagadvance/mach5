@@ -1,4 +1,7 @@
-//! The bad-certificate interstitial.
+//! The interstitials.
+//!
+//! Pages the proxy serves in place of one it could not or would not fetch. The
+//! first of them, and the reason the module exists:
 //!
 //! When an origin's certificate fails validation the client cannot be told the
 //! truth by the usual means: it has already completed a perfectly good TLS
@@ -12,6 +15,10 @@ use crate::interceptor::ProxyResponse;
 /// Cloudflare's de-facto status for "the origin's certificate is invalid".
 /// Browsers render our body regardless; this just makes logs honest.
 const STATUS_INVALID_CERT: u16 = 526;
+
+/// RFC 5842's "the server terminated an operation because it encountered an
+/// infinite loop".
+const STATUS_LOOP_DETECTED: u16 = 508;
 
 /// Build the interstitial shown in place of a page whose origin failed
 /// certificate validation.
@@ -44,6 +51,22 @@ pub fn upstream_error(host: &str, detail: &str) -> ProxyResponse {
 			("cache-control".to_string(), "no-store".to_string()),
 		],
 		body: unreachable_page(host, detail).into_bytes(),
+	}
+}
+
+/// Build the interstitial shown when the proxy's own request came back to it,
+/// which means the origin's name resolved to the proxy itself.
+pub fn fetch_loop(host: &str) -> ProxyResponse {
+	ProxyResponse {
+		status: STATUS_LOOP_DETECTED,
+		headers: vec![
+			(
+				"content-type".to_string(),
+				"text/html; charset=utf-8".to_string(),
+			),
+			("cache-control".to_string(), "no-store".to_string()),
+		],
+		body: loop_page(host).into_bytes(),
 	}
 }
 
@@ -111,6 +134,51 @@ fn unreachable_page(host: &str, detail: &str) -> String {
     <p class="detail">{detail}</p>
   </details>
   <p class="actions"><button onclick="location.reload()">Try again</button></p>
+</main>
+</body>
+</html>
+"#
+	)
+}
+
+/// No "try again" here, unlike the other two: this one never clears up on a
+/// reload, and a retry only costs another lap.
+fn loop_page(host: &str) -> String {
+	let host = escape(host);
+
+	format!(
+		r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mach5 reached itself</title>
+{STYLE}
+</head>
+<body>
+<main>
+  <div class="mark" aria-hidden="true">&#8634;</div>
+  <h1>mach5 reached itself</h1>
+  <p class="lede">
+    Fetching <strong>{host}</strong> came back to mach5 instead of the real
+    site, so the request was stopped rather than repeated until the machine
+    ran out.
+  </p>
+  <p>
+    That means mach5 resolved this name to its own address. Almost always it is
+    resolving through the DNS server that answers every query with mach5 &mdash;
+    the one the clients use &mdash; instead of a resolver that returns the real
+    address of the origin.
+  </p>
+  <details>
+    <summary>What to check</summary>
+    <p class="detail">dns: &mdash; the proxy container&rsquo;s resolver in compose.yaml</p>
+    <p class="detail">/etc/resolv.conf &mdash; if the proxy is not in a container</p>
+    <p class="note">
+      Whichever applies must point at a resolver with real answers, never at the
+      wildcard server that points every name at mach5.
+    </p>
+  </details>
 </main>
 </body>
 </html>
@@ -221,6 +289,32 @@ mod tests {
 
 		assert!(issuer.contains("not issued by an authority"));
 		assert!(name.contains("issued for a different hostname"));
+	}
+
+	#[test]
+	fn the_loop_page_names_the_host_and_the_thing_to_check() {
+		let resp = fetch_loop("example.com");
+
+		assert_eq!(resp.status, 508);
+		assert!(resp
+			.headers
+			.iter()
+			.any(|(k, v)| k == "cache-control" && v == "no-store"));
+
+		let body = String::from_utf8(resp.body).unwrap();
+
+		assert!(body.contains("example.com"));
+		assert!(body.contains("DNS"), "the cause is worth naming");
+		assert!(body.contains("resolv.conf"));
+	}
+
+	#[test]
+	fn the_loop_page_escapes_its_host() {
+		let resp = fetch_loop("<script>alert(1)</script>");
+		let body = String::from_utf8(resp.body).unwrap();
+
+		assert!(!body.contains("<script>alert(1)</script>"));
+		assert!(body.contains("&lt;script&gt;"));
 	}
 
 	#[test]

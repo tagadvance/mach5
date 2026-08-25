@@ -68,11 +68,17 @@ pub struct Chain {
 }
 
 impl Chain {
-	/// Build the chain described by the configuration: the blocklist, the
-	/// proxy's own endpoints, the page injection, then the external plugins in
-	/// the plugin directory, plus the optional response stamp.
+	/// Build the chain described by the configuration: the loop guard, the
+	/// blocklist, the proxy's own endpoints, the page injection, then the
+	/// external plugins in the plugin directory, plus the optional response
+	/// stamp.
 	pub fn from_config(config: &crate::config::Config) -> Self {
 		let mut links: Vec<Box<dyn Interceptor>> = Vec::new();
+
+		// Ahead of everything, and not configurable: a request carrying our own
+		// marker is this proxy fetching itself, and fetching it again is how the
+		// box falls over.
+		links.push(Box::new(crate::upstream::LoopGuard));
 
 		// First, so a blocked request never reaches a plugin at all.
 		if config.blocklist.enabled {

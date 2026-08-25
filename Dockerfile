@@ -41,8 +41,15 @@ RUN useradd --system --create-home --uid 10001 mach5
 # Owned up front so the unprivileged user can write here even when no volume is
 # mounted over it. The state dir is separate from the cache on purpose: it holds
 # what someone typed, and a cache is something you throw away.
+#
+# Sticky-and-writable rather than owned by one uid, because the CA's private key
+# is mounted from the host and readable only by whoever generated it: compose
+# runs the container as that user, and a named volume inherits its ownership
+# from these directories. This is the usual arrangement for an image that has to
+# run as an arbitrary uid.
 RUN mkdir -p /var/cache/mach5 /var/lib/mach5 \
-	&& chown mach5:mach5 /var/cache/mach5 /var/lib/mach5
+	&& chown mach5:mach5 /var/cache/mach5 /var/lib/mach5 \
+	&& chmod 1777 /var/cache/mach5 /var/lib/mach5
 
 COPY --from=builder /build/target/release/mach5-proxy /usr/local/bin/mach5-proxy
 

@@ -14,6 +14,10 @@ services:
       - "443:443/tcp"
       - "443:443/udp"
 
+    # Run as whoever owns the CA private key on the host — it is mode 600, and
+    # rightly so. Override with MACH5_UID/MACH5_GID if yours are not 1000.
+    user: "${MACH5_UID:-1000}:${MACH5_GID:-1000}"
+
     # The process runs as an unprivileged user, so it needs this one capability
     # to bind 443 rather than running as root.
     cap_add:

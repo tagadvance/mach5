@@ -317,6 +317,9 @@ fn handle_job(
 
 	// Nothing wants the body: relay it as it arrives.
 	interceptor.on_response_head(&job.request, &mut head);
+	// Asked once, before the head is handed off: the answer holds for the whole
+	// stream, and re-asking per chunk would cost a plugin round trip each time.
+	let wants_chunks = interceptor.wants_chunks(&job.request, &head);
 	send(Payload::Head(head))?;
 
 	let mut reader = resp.into_reader();
@@ -324,12 +327,30 @@ fn handle_job(
 	loop {
 		match reader.read(&mut buf) {
 			Ok(0) => break,
-			Ok(n) => send(Payload::Chunk(buf[..n].to_vec()))?,
+			Ok(n) => {
+				let mut chunk = buf[..n].to_vec();
+				if wants_chunks {
+					interceptor.on_response_chunk(&job.request, &mut chunk);
+					// Emptied on purpose: an interceptor accumulating across
+					// chunks flushes what it kept at the end instead.
+					if chunk.is_empty() {
+						continue;
+					}
+				}
+
+				send(Payload::Chunk(chunk))?;
+			}
 			Err(e) => {
 				log::warn!("upstream read failed for {}: {e}", job.request.url);
 
 				break;
 			}
+		}
+	}
+
+	if wants_chunks {
+		if let Some(tail) = interceptor.on_response_end(&job.request) {
+			send(Payload::Chunk(tail))?;
 		}
 	}
 

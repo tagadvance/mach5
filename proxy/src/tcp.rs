@@ -339,6 +339,9 @@ fn fetch_blocking(
 
 	interceptor.on_response_head(&request, &mut head);
 	apply_alt_svc(&shared.config, &mut head.headers);
+	// Asked once, before the head is handed off: the answer holds for the whole
+	// stream, and re-asking per chunk would cost a plugin round trip each time.
+	let wants_chunks = interceptor.wants_chunks(&request, &head);
 	if head_tx.send(Outcome::Streaming(head)).is_err() {
 		return;
 	}
@@ -359,10 +362,25 @@ fn fetch_blocking(
 			}
 		};
 
-		let chunk = Bytes::copy_from_slice(&buf[..read]);
-		if body_tx.blocking_send(Ok(Frame::data(chunk))).is_err() {
+		let mut chunk = buf[..read].to_vec();
+		if wants_chunks {
+			interceptor.on_response_chunk(&request, &mut chunk);
+			// Emptied on purpose: an interceptor accumulating across chunks
+			// flushes what it kept at the end instead.
+			if chunk.is_empty() {
+				continue;
+			}
+		}
+
+		if body_tx.blocking_send(Ok(Frame::data(Bytes::from(chunk)))).is_err() {
 			// Client went away.
 			break;
+		}
+	}
+
+	if wants_chunks {
+		if let Some(tail) = interceptor.on_response_end(&request) {
+			let _ = body_tx.blocking_send(Ok(Frame::data(Bytes::from(tail))));
 		}
 	}
 }

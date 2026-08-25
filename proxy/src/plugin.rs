@@ -25,6 +25,33 @@
 //! — and `method`/`url` are ignored. Nothing downstream sees it: later plugins
 //! do not get the request, and no response hook runs on what is served.
 //!
+//! Chunk hook, sent only to a plugin whose `init` reply set `"chunks": true`,
+//! once per chunk of a body streaming past unbuffered:
+//! ```json
+//! {"hook":"chunk","method":"GET","url":"https://…","body_b64":"…"}
+//! ```
+//! The reply's `body_b64` replaces that chunk; `{}` leaves it alone; an empty
+//! `body_b64` drops it, which is how a plugin accumulating across chunks says
+//! "not yet". The stream ends with one more:
+//! ```json
+//! {"hook":"chunk","method":"GET","url":"https://…","final":true}
+//! ```
+//! carrying no `body_b64`. A `body_b64` in *that* reply is appended after the
+//! last chunk, which is how the accumulated state gets flushed.
+//!
+//! Chunks and buffering are exclusive: a plugin that asks for chunks never
+//! claims the body, since buffering it whole is what the chunk hook exists to
+//! avoid. A plugin that declares both gets chunks.
+//!
+//! **A streaming body still carries the origin's `content-encoding`.** Only
+//! buffered bodies are decoded and re-encoded (see `encoding.rs`), so a
+//! chunk hook sees the bytes exactly as the origin sent them — usually brotli
+//! or gzip, and split at arbitrary byte boundaries. A plugin that wants plain
+//! text should claim the body instead.
+//!
+//! Chunks are not free: they cost a base64 round trip per 64KB chunk per
+//! plugin. Ask for them only when seeing the body progressively is the point.
+//!
 //! A plugin that dies, times out, or emits nonsense is abandoned — the proxy
 //! logs it and forwards traffic unmodified rather than failing the request.
 
@@ -32,6 +59,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -51,13 +79,18 @@ struct Hook<'a> {
 	url: &'a str,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	status: Option<u16>,
-	headers: &'a [(String, String)],
+	/// Absent on the chunk hook, which is about bytes rather than metadata.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	headers: Option<&'a [(String, String)]>,
 	/// Absent when the body is streaming past unbuffered.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	body_b64: Option<String>,
 	/// True when the body is not included and cannot be changed.
 	#[serde(skip_serializing_if = "std::ops::Not::not")]
 	streaming: bool,
+	/// True on the one chunk hook that marks the end of a streaming body.
+	#[serde(rename = "final", skip_serializing_if = "std::ops::Not::not")]
+	is_final: bool,
 }
 
 /// What a plugin may send back. Every field is optional: omitted means unchanged.
@@ -77,6 +110,9 @@ struct Reply {
 struct InitReply {
 	#[serde(rename = "match")]
 	filter: Filter,
+	/// Ask for the body a chunk at a time instead of whole. Exclusive with
+	/// claiming the body: see [`Plugin::wants_body`].
+	chunks: bool,
 }
 
 /// Header constraints deciding whether a plugin sees a given exchange. Every
@@ -115,6 +151,15 @@ pub struct Plugin {
 	name: String,
 	timeout: Duration,
 	filter: Filter,
+	/// Declared once at `init`: this plugin takes streaming bodies a chunk at a
+	/// time.
+	chunks: bool,
+	/// Whether the response currently streaming past is one this plugin asked
+	/// for chunks of. The chunk hooks carry no [`ResponseHead`] to re-test the
+	/// filter against, so the answer is recorded when `wants_chunks` is asked.
+	/// A chain is owned by one worker and relays one response at a time, so a
+	/// single flag is enough.
+	chunking: AtomicBool,
 	io: Mutex<Option<Io>>,
 }
 
@@ -209,6 +254,8 @@ impl Plugin {
 			name,
 			timeout,
 			filter: Filter::default(),
+			chunks: false,
+			chunking: AtomicBool::new(false),
 			io: Mutex::new(Some(Io {
 				child,
 				stdin,
@@ -218,18 +265,22 @@ impl Plugin {
 
 		// Ask what it wants to see. A plugin that ignores the init hook keeps
 		// the empty filter and therefore sees everything.
-		let filter = plugin
+		let init = plugin
 			.call::<_, InitReply>(&serde_json::json!({ "hook": "init" }))
-			.map(|reply| reply.filter)
 			.unwrap_or_default();
+		let filter = init.filter;
 
 		if filter.is_empty() {
 			log::info!("started plugin {} (sees all traffic)", plugin.name);
 		} else {
 			log::info!("started plugin {} matching {filter:?}", plugin.name);
 		}
+		if init.chunks {
+			log::info!("plugin {} takes streaming bodies a chunk at a time", plugin.name);
+		}
 
 		plugin.filter = filter;
+		plugin.chunks = init.chunks;
 
 		Ok(plugin)
 	}
@@ -316,9 +367,10 @@ impl Interceptor for Plugin {
 			method: &req.method,
 			url: &req.url,
 			status: None,
-			headers: &req.headers,
+			headers: Some(&req.headers),
 			body_b64: Some(BASE64.encode(&req.body)),
 			streaming: false,
+			is_final: false,
 		};
 
 		// A plugin that has gone away neither rewrites nor answers.
@@ -361,9 +413,10 @@ impl Interceptor for Plugin {
 			method: &req.method,
 			url: &req.url,
 			status: Some(resp.status),
-			headers: &resp.headers,
+			headers: Some(&resp.headers),
 			body_b64: Some(BASE64.encode(&resp.body)),
 			streaming: false,
+			is_final: false,
 		};
 
 		let Some(reply) = self.call::<_, Reply>(&hook) else {
@@ -391,9 +444,10 @@ impl Interceptor for Plugin {
 			method: &req.method,
 			url: &req.url,
 			status: Some(head.status),
-			headers: &head.headers,
+			headers: Some(&head.headers),
 			body_b64: None,
 			streaming: true,
+			is_final: false,
 		};
 
 		let Some(reply) = self.call::<_, Reply>(&hook) else {
@@ -416,8 +470,70 @@ impl Interceptor for Plugin {
 
 	/// Only claim bodies this plugin's filter actually selects, so unmatched
 	/// responses (large media, most notably) stream straight through.
+	///
+	/// A plugin that asked for chunks never claims the body: buffering it whole
+	/// is precisely what the chunk hook exists to avoid, so if a plugin somehow
+	/// declares both, chunks win.
 	fn wants_body(&self, req: &ProxyRequest, head: &ResponseHead) -> bool {
-		self.matches_response(req, head)
+		!self.chunks && self.matches_response(req, head)
+	}
+
+	fn wants_chunks(&self, req: &ProxyRequest, head: &ResponseHead) -> bool {
+		let wanted = self.chunks && self.matches_response(req, head);
+		// Remembered for the chunk hooks, which never see the head again.
+		self.chunking.store(wanted, Ordering::Relaxed);
+
+		wanted
+	}
+
+	fn on_response_chunk(&self, req: &ProxyRequest, chunk: &mut Vec<u8>) {
+		if !self.chunking.load(Ordering::Relaxed) {
+			return;
+		}
+
+		let hook = Hook {
+			hook: "chunk",
+			method: &req.method,
+			url: &req.url,
+			status: None,
+			headers: None,
+			body_b64: Some(BASE64.encode(&chunk)),
+			streaming: false,
+			is_final: false,
+		};
+
+		let Some(reply) = self.call::<_, Reply>(&hook) else {
+			return;
+		};
+
+		// An empty `body_b64` decodes to no bytes, which drops the chunk. That
+		// is how a plugin accumulating across the stream says "not yet".
+		if let Some(body) = decode_body(&self.name, reply.body_b64) {
+			*chunk = body;
+		}
+	}
+
+	fn on_response_end(&self, req: &ProxyRequest) -> Option<Vec<u8>> {
+		// Cleared as it is read, so a stream that ends cannot leak its answer
+		// into the next response this plugin is asked about.
+		if !self.chunking.swap(false, Ordering::Relaxed) {
+			return None;
+		}
+
+		let hook = Hook {
+			hook: "chunk",
+			method: &req.method,
+			url: &req.url,
+			status: None,
+			headers: None,
+			body_b64: None,
+			streaming: false,
+			is_final: true,
+		};
+
+		let reply = self.call::<_, Reply>(&hook)?;
+
+		decode_body(&self.name, reply.body_b64).filter(|tail| !tail.is_empty())
 	}
 }
 
@@ -543,6 +659,77 @@ mod tests {
 			"text/html"
 		);
 		assert!(!reply.filter.is_empty());
+	}
+
+	#[test]
+	fn an_init_reply_may_ask_for_chunks() {
+		let reply: InitReply =
+			serde_json::from_str(r#"{"chunks":true,"match":{"response":{"content-type":"text/"}}}"#)
+				.unwrap();
+
+		assert!(reply.chunks);
+		assert_eq!(reply.filter.response.get("content-type").unwrap(), "text/");
+	}
+
+	#[test]
+	fn the_chunk_hooks_go_out_in_the_documented_shape() {
+		let chunk = Hook {
+			hook: "chunk",
+			method: "GET",
+			url: "https://example.com/big",
+			status: None,
+			headers: None,
+			body_b64: Some(BASE64.encode(b"hello")),
+			streaming: false,
+			is_final: false,
+		};
+		let end = Hook {
+			body_b64: None,
+			is_final: true,
+			..chunk
+		};
+
+		assert_eq!(
+			serde_json::to_string(&chunk).unwrap(),
+			r#"{"hook":"chunk","method":"GET","url":"https://example.com/big","body_b64":"aGVsbG8="}"#
+		);
+		assert_eq!(
+			serde_json::to_string(&end).unwrap(),
+			r#"{"hook":"chunk","method":"GET","url":"https://example.com/big","final":true}"#
+		);
+	}
+
+	#[test]
+	fn a_chunk_reply_replaces_the_chunk() {
+		let reply: Reply = serde_json::from_str(&format!(
+			r#"{{"body_b64":"{}"}}"#,
+			BASE64.encode(b"rewritten")
+		))
+		.unwrap();
+
+		assert_eq!(
+			decode_body("t", reply.body_b64),
+			Some(b"rewritten".to_vec())
+		);
+	}
+
+	#[test]
+	fn an_empty_chunk_reply_drops_the_chunk() {
+		let reply: Reply = serde_json::from_str(r#"{"body_b64":""}"#).unwrap();
+
+		assert_eq!(
+			decode_body("t", reply.body_b64),
+			Some(Vec::new()),
+			"an empty body is a decision, not an omission"
+		);
+	}
+
+	#[test]
+	fn an_empty_chunk_reply_object_leaves_it_alone() {
+		let reply: Reply = serde_json::from_str("{}").unwrap();
+
+		assert!(reply.body_b64.is_none());
+		assert!(decode_body("t", reply.body_b64).is_none(), "unchanged");
 	}
 
 	#[test]

@@ -31,6 +31,8 @@ you exchanges that match, and only buffers bodies you actually asked for.
 - `request` constraints apply to both hooks; `response` constraints apply only
   to the response hook.
 - Reply `{}` (or ignore the hook) to see everything.
+- Add `"chunks": true` to take streaming bodies a chunk at a time instead of
+  whole — see [Chunk hooks](#chunk-hooks).
 
 **This is also how you avoid buffering large media.** A response whose body no
 plugin has claimed streams straight through to the client, never held whole in
@@ -85,6 +87,47 @@ blocked request must not then be rewritten by an injection plugin.
 A response hook can arrive with `"streaming": true` and **no** `body_b64`. That
 means the body is being relayed straight to the client and is not available. You
 may still change `status` and `headers`; a `body_b64` you return is ignored.
+
+To see that body anyway, without it ever being held whole in memory, ask for
+chunks.
+
+### Chunk hooks
+
+Set `"chunks": true` on your `init` reply and you get a `chunk` hook for every
+chunk of a **streaming** body whose response matches your filter, instead of one
+`response` hook with the whole thing:
+
+```json
+{"hook":"chunk","method":"GET","url":"https://example.com/big.txt","body_b64":"aGVsbG8="}
+```
+
+Reply with a `body_b64` to replace that chunk, `{}` to leave it alone, or an
+empty `body_b64` to **drop** it — which is how a plugin that is accumulating
+across chunks says "not yet". When the body ends you get one final hook, with no
+`body_b64`:
+
+```json
+{"hook":"chunk","method":"GET","url":"https://example.com/big.txt","final":true}
+```
+
+A `body_b64` you return on *that* one is appended after the last chunk, which is
+how you flush whatever you were holding.
+
+> **The bytes are still `content-encoding`d.** Only *buffered* bodies are
+> decoded and re-encoded by the proxy. A chunk hook sees exactly what the origin
+> put on the wire — usually brotli or gzip, split at arbitrary byte boundaries
+> that fall wherever the socket happened to fill. If you want plain text, do not
+> ask for chunks: claim the body instead and use the `response` hook. This is
+> the single easiest thing to get wrong here.
+
+Asking for chunks means you never get the body buffered — the two are exclusive,
+and chunks win if you somehow declare both. Buffering the whole body is exactly
+what a chunk hook exists to avoid.
+
+Chunks are not free: every 64KB chunk is a base64 round trip through your
+process, per plugin. Ask for them only when watching the body go past is
+genuinely the point — progressive rewriting, re-encoding, scanning a body too
+large to hold.
 
 ## Rules
 

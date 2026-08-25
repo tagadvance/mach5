@@ -58,6 +58,25 @@ pub trait Interceptor: Send + Sync {
 	fn wants_body(&self, _req: &ProxyRequest, _head: &ResponseHead) -> bool {
 		true
 	}
+
+	/// Whether this interceptor wants to see the body a chunk at a time as it
+	/// streams past. Defaults to false — unlike `wants_body`, an interceptor that
+	/// does not answer costs nothing.
+	fn wants_chunks(&self, _req: &ProxyRequest, _head: &ResponseHead) -> bool {
+		false
+	}
+
+	/// One chunk of a streaming body, in flight. Rewrite it in place; leaving it
+	/// empty drops it, which is legitimate for an interceptor that is accumulating
+	/// across chunks.
+	fn on_response_chunk(&self, _req: &ProxyRequest, _chunk: &mut Vec<u8>) {}
+
+	/// The stream has ended. Anything returned here is written after the last
+	/// chunk, which is what an interceptor holding buffered state needs in order
+	/// to flush it.
+	fn on_response_end(&self, _req: &ProxyRequest) -> Option<Vec<u8>> {
+		None
+	}
 }
 
 /// An ordered list of interceptors, applied in sequence. Requests run through
@@ -137,6 +156,39 @@ impl Interceptor for Chain {
 	fn wants_body(&self, req: &ProxyRequest, head: &ResponseHead) -> bool {
 		self.links.iter().any(|link| link.wants_body(req, head))
 	}
+
+	/// Run the chunk hooks at all only if something in the chain wants them.
+	fn wants_chunks(&self, req: &ProxyRequest, head: &ResponseHead) -> bool {
+		self.links.iter().any(|link| link.wants_chunks(req, head))
+	}
+
+	/// Offers every chunk to every link, in order, each seeing what the previous
+	/// one produced.
+	///
+	/// Only the links that asked for chunks should act, but this hook carries no
+	/// [`ResponseHead`] to re-test their interest against, and remembering the
+	/// answer from `wants_chunks` would mean interior mutability on a chain that
+	/// outlives the response. So the chain stays stateless and each link
+	/// re-checks itself — cheap, since an uninterested link inherits an empty
+	/// default hook.
+	fn on_response_chunk(&self, req: &ProxyRequest, chunk: &mut Vec<u8>) {
+		for link in &self.links {
+			link.on_response_chunk(req, chunk);
+		}
+	}
+
+	/// Concatenates what each link flushes, in chain order, so a link's tail
+	/// lands after the tail of everything ahead of it.
+	fn on_response_end(&self, req: &ProxyRequest) -> Option<Vec<u8>> {
+		let mut tail = Vec::new();
+		for link in &self.links {
+			if let Some(bytes) = link.on_response_end(req) {
+				tail.extend_from_slice(&bytes);
+			}
+		}
+
+		(!tail.is_empty()).then_some(tail)
+	}
 }
 
 /// Stamps every response with a marker header. Its only job is to make
@@ -197,6 +249,38 @@ mod tests {
 			req.url.push_str("?seen");
 
 			None
+		}
+	}
+
+	/// Wants chunks, appends its own mark to each one and flushes a tail at the
+	/// end — enough to observe both ordering and what each link was handed.
+	struct Tag(&'static str);
+
+	impl Interceptor for Tag {
+		fn wants_chunks(&self, _req: &ProxyRequest, _head: &ResponseHead) -> bool {
+			true
+		}
+
+		fn on_response_chunk(&self, _req: &ProxyRequest, chunk: &mut Vec<u8>) {
+			chunk.extend_from_slice(self.0.as_bytes());
+		}
+
+		fn on_response_end(&self, _req: &ProxyRequest) -> Option<Vec<u8>> {
+			Some(self.0.as_bytes().to_vec())
+		}
+	}
+
+	/// Swallows every chunk, the way an interceptor accumulating across a whole
+	/// stream would.
+	struct Swallow;
+
+	impl Interceptor for Swallow {
+		fn wants_chunks(&self, _req: &ProxyRequest, _head: &ResponseHead) -> bool {
+			true
+		}
+
+		fn on_response_chunk(&self, _req: &ProxyRequest, chunk: &mut Vec<u8>) {
+			chunk.clear();
 		}
 	}
 
@@ -300,5 +384,84 @@ mod tests {
 
 		assert!(chain.on_request(&mut req).is_none());
 		assert_eq!(req.url, "https://example.com/?seen?seen", "both links ran");
+	}
+
+	fn head() -> ResponseHead {
+		ResponseHead {
+			status: 200,
+			headers: vec![("content-type".to_string(), "text/html".to_string())],
+		}
+	}
+
+	#[test]
+	fn a_chunk_passes_through_every_link_in_order() {
+		let chain = Chain {
+			links: vec![Box::new(Tag("-first")), Box::new(Tag("-second"))],
+		};
+		let mut chunk = b"body".to_vec();
+
+		assert!(chain.wants_chunks(&request(), &head()));
+		chain.on_response_chunk(&request(), &mut chunk);
+
+		assert_eq!(
+			chunk, b"body-first-second",
+			"each link must see what the previous one produced"
+		);
+	}
+
+	#[test]
+	fn a_link_that_empties_a_chunk_drops_it() {
+		let chain = Chain {
+			links: vec![Box::new(Tag("-first")), Box::new(Swallow)],
+		};
+		let mut chunk = b"body".to_vec();
+
+		chain.on_response_chunk(&request(), &mut chunk);
+
+		// The front ends skip writing an empty chunk, so this is the drop.
+		assert!(chunk.is_empty());
+	}
+
+	#[test]
+	fn the_end_hook_concatenates_in_order() {
+		let chain = Chain {
+			links: vec![
+				Box::new(Tag("first")),
+				Box::new(Swallow),
+				Box::new(Tag("second")),
+			],
+		};
+
+		assert_eq!(
+			chain.on_response_end(&request()),
+			Some(b"firstsecond".to_vec()),
+			"a link with nothing to flush must not leave a gap"
+		);
+	}
+
+	#[test]
+	fn the_end_hook_is_none_when_nothing_flushes() {
+		let chain = Chain {
+			links: vec![Box::new(Swallow), Box::new(Stamp)],
+		};
+
+		assert!(chain.on_response_end(&request()).is_none());
+	}
+
+	#[test]
+	fn a_chain_wanting_no_chunks_says_so() {
+		let chain = Chain {
+			links: vec![
+				Box::new(Stamp),
+				Box::new(Recorder {
+					called: Arc::new(AtomicBool::new(false)),
+				}),
+			],
+		};
+
+		assert!(
+			!chain.wants_chunks(&request(), &head()),
+			"chunk hooks cost a round trip; nobody asked for them"
+		);
 	}
 }

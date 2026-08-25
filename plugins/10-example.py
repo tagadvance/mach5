@@ -4,7 +4,8 @@
 Demonstrates both hooks: blocking a host on the request side, and rewriting the
 body on the response side. Copy this as a starting point.
 
-See README.md for the protocol.
+`on_chunk` below sketches the third option — seeing a streaming body a piece at
+a time — but this plugin does not ask for it. See README.md for the protocol.
 """
 
 import base64
@@ -33,6 +34,10 @@ def on_init(_msg):
     name any header including custom `x-*` ones. Declaring a response
     content-type means images and video are never buffered for us — they stream
     straight through to the client.
+
+    Adding `"chunks": True` here would swap the buffered `response` hook for the
+    per-chunk one below. We do not, because this plugin rewrites HTML and a
+    chunk arrives still `content-encoding`d.
     """
     return {"match": {"response": {"content-type": "text/html"}}}
 
@@ -71,6 +76,32 @@ def on_response(msg):
     return {"body_b64": base64.b64encode(patched).decode()}
 
 
+def on_chunk(msg):
+    """One chunk of a streaming body — only sent if `init` asked for chunks.
+
+    NOT WIRED UP: `on_init` above does not request chunks, so this never runs.
+    It is here to show the shape.
+
+    The bytes are exactly what the origin sent, still compressed (brotli or
+    gzip) and split at arbitrary boundaries — so a chunk is not text and not a
+    whole anything. Claim the body instead if you want plain text.
+
+    Return `{"body_b64": ...}` to replace this chunk, `{}` to pass it through,
+    or an empty `body_b64` to drop it while you accumulate. On the final hook
+    there is no body to read, and whatever you return is appended after the
+    last chunk.
+    """
+    if msg.get("final"):
+        log(f"stream ended for {msg.get('url')}")
+        # Nothing held back, so nothing to flush.
+        return {}
+
+    chunk = base64.b64decode(msg.get("body_b64", ""))
+    log(f"{len(chunk)} bytes from {msg.get('url')}")
+
+    return {}
+
+
 def main():
     for line in sys.stdin:
         line = line.strip()
@@ -83,6 +114,7 @@ def main():
                 "init": on_init,
                 "request": on_request,
                 "response": on_response,
+                "chunk": on_chunk,
             }.get(msg.get("hook"), lambda _msg: {})
             reply = handler(msg)
         except Exception as e:  # never die: a broken plugin should not break browsing

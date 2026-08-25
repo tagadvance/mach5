@@ -61,8 +61,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -70,6 +70,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::interceptor::{Interceptor, ProxyRequest, ProxyResponse, ResponseHead};
+use crate::metrics::Metrics;
 
 /// What the proxy sends to a plugin.
 #[derive(Serialize)]
@@ -161,6 +162,9 @@ pub struct Plugin {
 	/// single flag is enough.
 	chunking: AtomicBool,
 	io: Mutex<Option<Io>>,
+	/// Where each hook call's cost is recorded, so the status page can say
+	/// which plugin is the expensive one.
+	metrics: Arc<Metrics>,
 }
 
 /// The live channels to a running plugin. Replaced with `None` once the plugin
@@ -261,6 +265,7 @@ impl Plugin {
 				stdin,
 				lines,
 			})),
+			metrics: crate::metrics::shared(),
 		};
 
 		// Ask what it wants to see. A plugin that ignores the init hook keeps
@@ -309,6 +314,10 @@ impl Plugin {
 		};
 		line.push('\n');
 
+		// Started here, after the lock and the encoding, so that what is
+		// measured is the plugin's own round trip rather than our bookkeeping.
+		let started = Instant::now();
+
 		if let Err(e) = io.stdin.write_all(line.as_bytes()).and_then(|()| io.stdin.flush()) {
 			log::error!("plugin {} stdin closed: {e}", self.name);
 			self.abandon(&mut guard);
@@ -317,8 +326,15 @@ impl Plugin {
 		}
 
 		let reply = match io.lines.recv_timeout(self.timeout) {
-			Ok(reply) => reply,
+			Ok(reply) => {
+				self.metrics.record_plugin_call(&self.name, started.elapsed());
+
+				reply
+			}
 			Err(RecvTimeoutError::Timeout) => {
+				// A plugin that hangs is precisely the one worth seeing on the
+				// status page, so the whole wait counts as time it cost.
+				self.metrics.record_plugin_call(&self.name, started.elapsed());
 				log::error!(
 					"plugin {} did not reply within {:?}; abandoning it",
 					self.name,

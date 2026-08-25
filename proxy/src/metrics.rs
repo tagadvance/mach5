@@ -9,8 +9,9 @@
 //! its own [`crate::interceptor::Chain`], so per-chain counters would answer
 //! "what did this worker do", which is a question nobody is asking.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -42,6 +43,13 @@ impl Counter {
 	}
 }
 
+/// What one plugin has cost so far.
+#[derive(Default)]
+pub struct PluginTime {
+	pub calls: u64,
+	pub total: Duration,
+}
+
 /// Every counter the proxy keeps, plus the moment it started.
 pub struct Metrics {
 	/// Taken when the metrics are first asked for, which is during startup.
@@ -69,6 +77,15 @@ pub struct Metrics {
 	/// the origin left in the clear: what the client would have had to read
 	/// otherwise.
 	pub bytes_saved_by_compression: Counter,
+	/// Time spent waiting on each plugin, by plugin name.
+	///
+	/// A locked map rather than the atomics above, because the keys are plugin
+	/// names discovered at startup rather than fields known at compile time —
+	/// and `BTreeMap` because the status page's rows should not reorder
+	/// themselves between two refreshes. The lock costs nothing in context: it
+	/// is held for a few nanoseconds either side of a subprocess round trip
+	/// that already costs milliseconds.
+	plugins: Mutex<BTreeMap<String, PluginTime>>,
 }
 
 /// `Instant::now` is why this is written out rather than derived.
@@ -86,6 +103,7 @@ impl Default for Metrics {
 			bytes_from_origin: Counter::default(),
 			bytes_to_client: Counter::default(),
 			bytes_saved_by_compression: Counter::default(),
+			plugins: Mutex::new(BTreeMap::new()),
 		}
 	}
 }
@@ -93,6 +111,15 @@ impl Default for Metrics {
 impl Metrics {
 	pub fn uptime(&self) -> Duration {
 		self.started.elapsed()
+	}
+
+	/// Record one hook call and what waiting for it cost.
+	pub fn record_plugin_call(&self, name: &str, elapsed: Duration) {
+		let mut plugins = self.plugins.lock().expect("plugin timing lock");
+		let time = plugins.entry(name.to_string()).or_default();
+
+		time.calls += 1;
+		time.total += elapsed;
 	}
 
 	/// Read every counter once.
@@ -113,6 +140,40 @@ impl Metrics {
 			bytes_from_origin: self.bytes_from_origin.get(),
 			bytes_to_client: self.bytes_to_client.get(),
 			bytes_saved_by_compression: self.bytes_saved_by_compression.get(),
+			plugins: self
+				.plugins
+				.lock()
+				.expect("plugin timing lock")
+				.iter()
+				.map(|(name, time)| (name.clone(), PluginStats::of(time)))
+				.collect(),
+		}
+	}
+}
+
+/// What one plugin cost, at one moment.
+///
+/// Microseconds rather than a [`Duration`], which serialises as a struct of
+/// seconds and nanoseconds that nothing wants to graph. The mean is carried
+/// rather than left to the reader: it is the number that says whether a plugin
+/// is worth its place, and a total only ever grows with traffic.
+#[derive(Serialize)]
+pub struct PluginStats {
+	pub calls: u64,
+	pub total_micros: u64,
+	pub mean_micros: u64,
+}
+
+impl PluginStats {
+	fn of(time: &PluginTime) -> Self {
+		let total_micros = time.total.as_micros() as u64;
+
+		Self {
+			calls: time.calls,
+			total_micros,
+			// A recorded plugin has been called at least once, so the guard is
+			// only here to keep a division from depending on that.
+			mean_micros: total_micros / time.calls.max(1),
 		}
 	}
 }
@@ -132,6 +193,9 @@ pub struct Snapshot {
 	pub bytes_from_origin: u64,
 	pub bytes_to_client: u64,
 	pub bytes_saved_by_compression: u64,
+	/// Keyed by plugin name — the one part of the JSON that is not flat,
+	/// because the set of plugins is not known until they are loaded.
+	pub plugins: BTreeMap<String, PluginStats>,
 }
 
 /// One set per process, exactly as [`crate::blocklist::shared`] does it. Both
@@ -169,6 +233,19 @@ pub fn bytes(n: u64) -> String {
 	}
 
 	format!("{} B", thousands(n))
+}
+
+/// How long a plugin took, in the unit that leaves a number worth reading:
+/// microseconds below a millisecond, milliseconds above. One decimal place,
+/// since the difference between 0.4ms and 0.9ms per call is the whole point.
+pub fn duration(elapsed: Duration) -> String {
+	let micros = elapsed.as_micros() as f64;
+
+	if micros < 1000.0 {
+		format!("{micros:.1} µs")
+	} else {
+		format!("{:.1} ms", micros / 1000.0)
+	}
 }
 
 /// How long the process has been up, largest unit first.
@@ -246,6 +323,7 @@ mod tests {
 		assert_eq!(json["bytes_to_client"], 1200);
 		assert_eq!(json["bytes_saved_by_compression"], 800);
 		assert!(json["uptime_seconds"].is_u64());
+		assert!(json["plugins"].is_object(), "no plugins is an empty object");
 	}
 
 	#[test]
@@ -297,6 +375,45 @@ mod tests {
 		assert_eq!(thousands(999), "999");
 		assert_eq!(thousands(1000), "1,000");
 		assert_eq!(thousands(1234567), "1,234,567");
+	}
+
+	#[test]
+	fn a_plugin_s_calls_are_summed_and_averaged() {
+		let metrics = Metrics::default();
+
+		metrics.record_plugin_call("slow.py", Duration::from_millis(30));
+		metrics.record_plugin_call("slow.py", Duration::from_millis(10));
+
+		let snapshot = metrics.snapshot();
+		let slow = &snapshot.plugins["slow.py"];
+
+		assert_eq!(slow.calls, 2);
+		assert_eq!(slow.total_micros, 40_000);
+		assert_eq!(slow.mean_micros, 20_000, "the mean is per call, not per hook");
+	}
+
+	#[test]
+	fn plugins_are_kept_apart_and_come_back_in_name_order() {
+		let metrics = Metrics::default();
+
+		metrics.record_plugin_call("zebra.py", Duration::from_millis(5));
+		metrics.record_plugin_call("alpha.sh", Duration::from_millis(1));
+
+		let snapshot = metrics.snapshot();
+		let names: Vec<&str> = snapshot.plugins.keys().map(String::as_str).collect();
+
+		assert_eq!(names, ["alpha.sh", "zebra.py"], "stable rows on the page");
+		assert_eq!(snapshot.plugins["alpha.sh"].total_micros, 1_000);
+		assert_eq!(snapshot.plugins["zebra.py"].total_micros, 5_000);
+	}
+
+	#[test]
+	fn plugin_times_are_shown_in_the_unit_that_fits() {
+		assert_eq!(duration(Duration::ZERO), "0.0 µs");
+		assert_eq!(duration(Duration::from_micros(250)), "250.0 µs");
+		assert_eq!(duration(Duration::from_micros(999)), "999.0 µs");
+		assert_eq!(duration(Duration::from_millis(1)), "1.0 ms");
+		assert_eq!(duration(Duration::from_micros(40_500)), "40.5 ms");
 	}
 
 	#[test]

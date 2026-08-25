@@ -33,7 +33,7 @@ use crate::ca::CertAuthority;
 use crate::config::Config;
 use crate::interceptor::{Interceptor, ProxyRequest, ProxyResponse, ResponseHead};
 use crate::interstitial::{escape, STYLE};
-use crate::metrics::{self, Metrics, Snapshot};
+use crate::metrics::{self, Metrics, PluginStats, Snapshot};
 
 /// Everything below this is ours. A leading dot keeps it out of the way of any
 /// real path a site might already serve.
@@ -649,6 +649,7 @@ fn status_page(
 	let from_origin = metrics::bytes(counted.bytes_from_origin);
 	let to_client = metrics::bytes(counted.bytes_to_client);
 	let saved = metrics::bytes(counted.bytes_saved_by_compression);
+	let plugins = plugin_table(&counted.plugins);
 	let certificates = if bypassed {
 		"<p>Certificate validation is <strong>bypassed</strong> for this site until \
 		 the bypass expires.</p>"
@@ -698,6 +699,7 @@ fn status_page(
     <tr><th>Body bytes to clients</th><td>{to_client}</td></tr>
     <tr><th>Bytes saved compressing</th><td>{saved}</td></tr>
   </table>
+  {plugins}
   <h2>{host}</h2>
   {certificates}
   {hidden}
@@ -707,6 +709,36 @@ fn status_page(
 </html>
 "#
 	)
+}
+
+/// What each plugin has cost, and nothing at all when none has been called: a
+/// heading over an empty table answers a question nobody asked.
+///
+/// The mean is what the row is for. A total only grows with traffic, so it says
+/// nothing about whether a plugin is worth its place; a mean of 40ms says the
+/// plugin is on every page load and everybody is paying for it.
+///
+/// A plugin is named after the file it was started from, and a filename can
+/// hold very nearly anything, so the name reaches the markup through
+/// [`escape`].
+fn plugin_table(plugins: &BTreeMap<String, PluginStats>) -> String {
+	if plugins.is_empty() {
+		return String::new();
+	}
+
+	let rows: String = plugins
+		.iter()
+		.map(|(name, stats)| {
+			format!(
+				r#"<tr><th>{}</th><td>{} <span class="note">calls, {} each</span></td></tr>"#,
+				escape(name),
+				metrics::thousands(stats.calls),
+				metrics::duration(std::time::Duration::from_micros(stats.mean_micros))
+			)
+		})
+		.collect();
+
+	format!("<h2>Plugins</h2>\n  <table>{rows}</table>")
 }
 
 /// This host's hidden elements, each with the control that stops hiding it.
@@ -1600,6 +1632,47 @@ mod tests {
 		assert!(!loaded.contains("no cosmetic lists loaded"));
 	}
 
+	/// A plugin nobody has called has nothing to say, and a heading over an
+	/// empty table is worse than no heading.
+	#[test]
+	fn the_page_shows_plugins_only_once_one_has_been_called() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		let quiet = body_of(&call(&internal, "GET", "https://example.com/.mach5/", ""));
+
+		assert!(!quiet.contains("Plugins"), "{quiet}");
+
+		internal
+			.metrics
+			.record_plugin_call("rewrite.py", std::time::Duration::from_micros(40_500));
+		internal
+			.metrics
+			.record_plugin_call("rewrite.py", std::time::Duration::from_micros(39_500));
+
+		let page = body_of(&call(&internal, "GET", "https://example.com/.mach5/", ""));
+
+		assert!(page.contains("<h2>Plugins</h2>"), "{page}");
+		assert!(page.contains("rewrite.py"), "{page}");
+		assert!(page.contains("40.0 ms each"), "the mean, not the total: {page}");
+	}
+
+	/// A plugin is named after the file it was started from, and a filename can
+	/// hold very nearly anything — including markup.
+	#[test]
+	fn a_hostile_plugin_name_cannot_write_markup_into_the_status_page() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+		internal
+			.metrics
+			.record_plugin_call("<script>alert(1)</script>", std::time::Duration::ZERO);
+
+		let page = body_of(&call(&internal, "GET", "https://example.com/.mach5/", ""));
+
+		assert!(!page.contains("<script>alert(1)"), "{page}");
+		assert!(page.contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "{page}");
+	}
+
 	#[test]
 	fn the_counters_are_also_json() {
 		let dir = TempDir::new().unwrap();
@@ -1607,6 +1680,12 @@ mod tests {
 		internal.metrics.blocked.add(3);
 		internal.metrics.bytes_to_client.add(2048);
 		internal.metrics.bytes_saved_by_compression.add(6144);
+		internal
+			.metrics
+			.record_plugin_call("rewrite.py", std::time::Duration::from_millis(2));
+		internal
+			.metrics
+			.record_plugin_call("rewrite.py", std::time::Duration::from_millis(1));
 
 		let response = call(
 			&internal,
@@ -1632,6 +1711,13 @@ mod tests {
 		assert_eq!(stats["bytes_saved_by_compression"], 6144);
 		assert_eq!(stats["internal"], 1, "this very request");
 		assert!(stats["uptime_seconds"].is_u64());
+		assert_eq!(
+			stats["plugins"],
+			serde_json::json!({
+				"rewrite.py": { "calls": 2, "total_micros": 3000, "mean_micros": 1500 }
+			}),
+			"what each plugin cost, keyed by name"
+		);
 	}
 
 	#[test]

@@ -30,9 +30,11 @@ compress = true
 [ca]
 # Root CA used to sign leaves minted per SNI host. Leave both unset to generate
 # an ephemeral in-memory CA (development only — no browser will trust it).
-# Never commit these files; *.pem/*.crt/*.p12 are gitignored.
-# cert = "security/mach5_root.crt"
-# key = "security/mach5_root.pem"
+# Run security/init.sh once to write both; never commit them (*.pem, *.crt and
+# *.p12 are gitignored). The cert is PEM and the key is PEM — pointing either at
+# the wrong file is the one mistake mach5 will now tell you about by name.
+# cert = "security/mach5_root_cert.pem"
+# key = "security/mach5_root_key.pem"
 
 [paths]
 # Scratch space for cached artifacts (re-encoded assets and the like).

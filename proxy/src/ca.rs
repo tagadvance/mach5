@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::error::Error;
+use std::path::Path;
 use std::sync::Mutex;
 
 use boring::pkey::{PKey, Private};
@@ -47,17 +48,64 @@ pub struct CertAuthority {
 }
 
 impl CertAuthority {
+	/// Read one of the `[ca]` files, saying what is actually wrong with it.
+	///
+	/// Both mistakes here are ones a person makes once and then spends an hour
+	/// on, because the underlying errors describe bytes rather than intent:
+	/// pointing at a DER file surfaces as "invalid UTF-8", and pointing at the
+	/// wrong PEM surfaces much later as a parse failure.
+	fn read_pem(path: &Path, what: &str) -> Result<String, Box<dyn Error>> {
+		// Name the file: "No such file or directory" with no path is a
+		// miserable thing to debug inside a container.
+		let bytes = std::fs::read(path)
+			.map_err(|e| format!("cannot read [ca] {what} {}: {e}", path.display()))?;
+
+		// A DER file starts with the SEQUENCE tag; PEM starts with '-'.
+		if bytes.first() == Some(&0x30) {
+			return Err(format!(
+				"[ca] {what} {} is DER, and PEM is what is wanted. Convert it: \
+				 openssl x509 -inform DER -in {0} -out {0}.pem",
+				path.display()
+			)
+			.into());
+		}
+
+		let text = String::from_utf8(bytes)
+			.map_err(|_| format!("[ca] {what} {} is not text, so not PEM", path.display()))?;
+
+		// openssl writes a "Bag Attributes" preamble ahead of the PEM block when
+		// it exports from a keystore, and rcgen refuses the file outright rather
+		// than skipping to the block. Anyone converting a p12 hits this, so take
+		// the PEM from wherever it starts.
+		let Some(start) = text.find("-----BEGIN") else {
+			return Err(format!("[ca] {what} {} contains no PEM block", path.display()).into());
+		};
+
+		Ok(text[start..].to_string())
+	}
+
 	/// Load the CA named by the configuration, or generate an ephemeral one
 	/// when no CA is configured.
 	pub fn from_config(config: &Config) -> Result<Self, Box<dyn Error>> {
 		match (&config.ca.cert, &config.ca.key) {
 			(Some(cert_path), Some(key_path)) => {
-				// Name the file in the error: "No such file or directory" with
-				// no path is a miserable thing to debug inside a container.
-				let cert_pem = std::fs::read_to_string(cert_path)
-					.map_err(|e| format!("cannot read [ca] cert {}: {e}", cert_path.display()))?;
-				let key_pem = std::fs::read_to_string(key_path)
-					.map_err(|e| format!("cannot read [ca] key {}: {e}", key_path.display()))?;
+				let cert_pem = Self::read_pem(cert_path, "cert")?;
+				let key_pem = Self::read_pem(key_path, "key")?;
+
+				if !key_pem.contains("PRIVATE KEY") {
+					return Err(format!(
+						"[ca] key {} holds no private key{}",
+						key_path.display(),
+						if key_pem.contains("BEGIN CERTIFICATE") {
+							" — it is a certificate. The key is a separate file; \
+							 security/init.sh writes both."
+						} else {
+							""
+						}
+					)
+					.into());
+				}
+
 				log::info!("loaded root CA from {}", cert_path.display());
 
 				Self::from_pem(&cert_pem, &key_pem, config)
@@ -75,7 +123,17 @@ impl CertAuthority {
 
 	/// Load a CA from PEM cert + PEM private key.
 	pub fn from_pem(cert_pem: &str, key_pem: &str, config: &Config) -> Result<Self, Box<dyn Error>> {
-		let key = KeyPair::from_pem(key_pem)?;
+		// rcgen says only "CouldNotParseKeyPair", and by far the likeliest cause
+		// is a PKCS#8 EC key with no public-key point in it — which is exactly
+		// what `keytool` exports and what `openssl pkey` preserves. security/
+		// init.sh round-trips through SEC1 to put the point back.
+		let key = KeyPair::from_pem(key_pem).map_err(|e| {
+			format!(
+				"[ca] key could not be parsed ({e}). If it came out of a Java \
+				 keystore, re-export it with security/init.sh: an EC key with no \
+				 public-key point in it is rejected."
+			)
+		})?;
 		// Through boring rather than rcgen: this is the same PEM the issuer is
 		// built from, and boring is already here to hand it back as DER.
 		let root = X509::from_pem(cert_pem.as_bytes())?.to_der()?;
@@ -204,6 +262,50 @@ impl CertAuthority {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// The two ways of pointing `[ca]` at the wrong file, both of which used to
+	/// surface as something about bytes rather than about the mistake.
+	#[test]
+	fn a_der_file_is_named_as_der() {
+		let dir = std::env::temp_dir().join("mach5-ca-der-test");
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("root.crt");
+		std::fs::write(&path, [0x30u8, 0x82, 0x01, 0x02]).unwrap();
+
+		let err = CertAuthority::read_pem(&path, "cert").unwrap_err().to_string();
+
+		assert!(err.contains("is DER"), "{err}");
+		assert!(err.contains("openssl x509 -inform DER"), "it must say how to fix it: {err}");
+	}
+
+	#[test]
+	fn a_bag_attributes_preamble_is_skipped() {
+		let dir = std::env::temp_dir().join("mach5-ca-preamble-test");
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("root.pem");
+		std::fs::write(
+			&path,
+			"Bag Attributes\n    friendlyName: mach5_root\n-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----\n",
+		)
+		.unwrap();
+
+		let pem = CertAuthority::read_pem(&path, "key").unwrap();
+
+		assert!(
+			pem.starts_with("-----BEGIN PRIVATE KEY-----"),
+			"openssl writes this preamble when exporting from a keystore: {pem}"
+		);
+	}
+
+	#[test]
+	fn a_file_with_no_pem_block_is_rejected() {
+		let dir = std::env::temp_dir().join("mach5-ca-nopem-test");
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("notes.txt");
+		std::fs::write(&path, "just some words\n").unwrap();
+
+		assert!(CertAuthority::read_pem(&path, "key").is_err());
+	}
 
 	#[test]
 	fn mints_leaf_with_sni_in_san() {

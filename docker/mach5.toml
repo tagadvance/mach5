@@ -10,9 +10,11 @@ listen = "0.0.0.0:443"
 listen_tcp = "0.0.0.0:443"
 
 [ca]
-# Mounted read-only by compose. Generate these once and keep them off the repo.
-cert = "security/mach5_root.crt"
-key = "security/mach5_root.pem"
+# Mounted read-only by compose. Run security/init.sh once to produce these; it
+# writes a PEM certificate and a PEM private key, which is what these two want.
+# Never commit them — *.pem and *.crt are gitignored for that reason.
+cert = "security/mach5_root_cert.pem"
+key = "security/mach5_root_key.pem"
 
 [http]
 # Advertise HTTP/3 on the port clients reach us on.

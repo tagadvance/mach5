@@ -70,14 +70,63 @@ fn is_own_request(headers: &[(String, String)]) -> bool {
 		.any(|(name, value)| name.eq_ignore_ascii_case(VIA) && value == via_id())
 }
 
-/// Builds the shared upstream HTTP agent.
-pub fn agent(config: &Config) -> ureq::Agent {
-	ureq::AgentBuilder::new()
-		// Pass 3xx through to the client; it re-requests and we intercept again.
-		.redirects(0)
-		.timeout_connect(Duration::from_secs(config.limits.connect_timeout_seconds))
-		.timeout_read(Duration::from_secs(config.limits.read_timeout_seconds))
-		.build()
+/// The two upstream HTTP agents, identical but for what they make of a
+/// certificate.
+///
+/// They are a pair rather than one agent with a switch because ureq decides its
+/// TLS configuration when the agent is built. Keeping the strict one as the
+/// only thing [`call`] reaches for by default means the permissive one cannot
+/// be selected by forgetting something.
+pub struct Agents {
+	strict: ureq::Agent,
+	/// Used only for a host in [`crate::insecure::bypasses`]. See that module.
+	permissive: ureq::Agent,
+	bypasses: std::sync::Arc<crate::insecure::Bypasses>,
+}
+
+/// Builds the shared upstream HTTP agents.
+pub fn agents(config: &Config) -> Agents {
+	let builder = || {
+		ureq::AgentBuilder::new()
+			// Pass 3xx through to the client; it re-requests and we intercept again.
+			.redirects(0)
+			.timeout_connect(Duration::from_secs(config.limits.connect_timeout_seconds))
+			.timeout_read(Duration::from_secs(config.limits.read_timeout_seconds))
+	};
+
+	// A failure to build the permissive one is not fatal: falling back to a
+	// second strict agent means a bypass simply does not work, which is the
+	// safe direction to fail in.
+	let permissive = match crate::insecure::Unverified::new() {
+		Ok(connector) => builder().tls_connector(std::sync::Arc::new(connector)).build(),
+		Err(e) => {
+			log::error!("cannot build the bypass TLS client, so bypasses will not work: {e}");
+
+			builder().build()
+		}
+	};
+
+	Agents {
+		strict: builder().build(),
+		permissive,
+		bypasses: crate::insecure::bypasses(),
+	}
+}
+
+impl Agents {
+	/// The agent to fetch this host with. Anything not explicitly waved through
+	/// gets the one that validates.
+	fn for_host(&self, host: &str) -> &ureq::Agent {
+		if !self.bypasses.allows(host) {
+			return &self.strict;
+		}
+
+		// Once per request, not once per bypass: a bypass that has been left on
+		// should be impossible to miss in the log.
+		log::warn!("fetching {host} WITHOUT certificate validation (bypassed)");
+
+		&self.permissive
+	}
 }
 
 /// Why an upstream fetch failed.
@@ -105,7 +154,8 @@ fn is_tls_failure(message: &str) -> bool {
 }
 
 /// Perform the upstream request, mapping transport failures to a message.
-pub fn call(agent: &ureq::Agent, req: &ProxyRequest) -> Result<ureq::Response, FetchError> {
+pub fn call(agents: &Agents, req: &ProxyRequest) -> Result<ureq::Response, FetchError> {
+	let agent = agents.for_host(crate::host_of(&req.url));
 	let mut request = agent.request(&req.method, &req.url);
 	for (name, value) in &req.headers {
 		// Negotiated below instead: relaying the client's value verbatim invites

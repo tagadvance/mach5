@@ -114,6 +114,24 @@ clock_skew_minutes = 60
 # Re-mint a cached leaf once less than this remains.
 refresh_margin_minutes = 60
 
+# Typing this phrase on the certificate warning page lets you through to the
+# origin anyway — for that one host, for bypass_ttl_minutes. Chrome's mechanism
+# and Chrome's phrase: a warning with a button on it is one people click through
+# without reading, where something you have to already know and type does not
+# happen by accident. The page deliberately says nothing about it.
+#
+# It exists for staging work: self-signed certs, expired certs, a cert issued to
+# a name you are reaching by IP. It is also the only thing in mach5 that turns
+# off a check no client can do for itself any more, so it is per-host, it
+# expires, it is held in memory only (a restart forgets every bypass), and every
+# request that takes it is a warning in the log.
+#
+# false removes the mechanism rather than hiding it: the page carries no
+# listener and /.mach5/bypass answers 404 like any other unknown path.
+allow_bypass = true
+bypass_ttl_minutes = 60
+# bypass_phrase = "thisisunsafe"
+
 [limits]
 # Cap on a buffered request body; bounds what a single stream can allocate.
 max_request_body_mb = 10

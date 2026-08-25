@@ -195,6 +195,16 @@ pub struct Tls {
 	/// Re-mint a cached leaf once less than this remains, so the cache never
 	/// serves a cert that expires mid-connection.
 	pub refresh_margin_minutes: u32,
+	/// Whether the certificate warning page can be typed past at all. Turning
+	/// this off removes the mechanism entirely: the page says nothing about it
+	/// and `/.mach5/bypass` stops existing.
+	pub allow_bypass: bool,
+	/// How long one host stays waved through. Bypasses are in memory only, so
+	/// this is a ceiling on top of "until the proxy restarts".
+	pub bypass_ttl_minutes: u32,
+	/// What has to be typed on the warning page. Chrome's phrase by default,
+	/// because it is the one muscle memory already has.
+	pub bypass_phrase: String,
 }
 
 impl Default for Tls {
@@ -203,6 +213,9 @@ impl Default for Tls {
 			leaf_ttl_hours: 24,
 			clock_skew_minutes: 60,
 			refresh_margin_minutes: 60,
+			allow_bypass: true,
+			bypass_ttl_minutes: 60,
+			bypass_phrase: "thisisunsafe".to_string(),
 		}
 	}
 }
@@ -387,6 +400,20 @@ impl Config {
 
 	pub fn refresh_margin(&self) -> Duration {
 		Duration::minutes(self.tls.refresh_margin_minutes as i64)
+	}
+
+	/// How long a typed bypass lasts.
+	pub fn bypass_ttl(&self) -> std::time::Duration {
+		std::time::Duration::from_secs(self.tls.bypass_ttl_minutes as u64 * 60)
+	}
+
+	/// The phrase to type past a certificate warning, or `None` when the
+	/// mechanism is switched off. An empty phrase switches it off too — an
+	/// interstitial that any keystroke walks past is not a warning.
+	pub fn bypass_phrase(&self) -> Option<&str> {
+		let phrase = self.tls.bypass_phrase.trim();
+
+		(self.tls.allow_bypass && !phrase.is_empty()).then_some(phrase)
 	}
 
 	pub fn max_request_body(&self) -> usize {

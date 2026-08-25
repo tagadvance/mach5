@@ -31,6 +31,9 @@ use crate::interceptor::{Interceptor, ProxyRequest, ProxyResponse, ResponseHead}
 /// real path a site might already serve.
 const PREFIX: &str = "/.mach5/";
 
+/// Where the certificate warning page sends someone who typed the phrase.
+const BYPASS: &str = "/.mach5/bypass";
+
 /// Bounds on what one page can store. A selector is a handful of characters in
 /// practice; these exist so a buggy — or hostile — page cannot grow the file
 /// without limit.
@@ -172,16 +175,61 @@ pub fn shared(config: &Config) -> Arc<Store> {
 /// Serves the endpoints under `/.mach5/`.
 pub struct Internal {
 	store: Arc<Store>,
+	bypasses: Arc<crate::insecure::Bypasses>,
+	/// How long a typed bypass lasts, or `None` when the mechanism is off.
+	bypass_ttl: Option<std::time::Duration>,
 }
 
 impl Internal {
 	pub fn new(config: &Config) -> Self {
 		Self {
 			store: shared(config),
+			bypasses: crate::insecure::bypasses(),
+			// `None` is the whole switch: no TTL, no endpoint.
+			bypass_ttl: config.bypass_phrase().map(|_| config.bypass_ttl()),
 		}
 	}
 
-	fn route(&self, host: &str, method: &str, path: &str, body: &[u8]) -> ProxyResponse {
+	/// Record that whoever is at this host has asked to be let through its
+	/// certificate failure, and send them back where they were going.
+	///
+	/// Nothing here checks that a failure actually happened. It does not need
+	/// to: the phrase is only on the warning page, and a bypass changes nothing
+	/// for a host whose certificate validates.
+	fn bypass(&self, host: &str, query: &str, ttl: std::time::Duration) -> ProxyResponse {
+		self.bypasses.allow(host, ttl);
+		log::warn!(
+			"certificate validation bypassed for {host} for the next {} minutes",
+			ttl.as_secs() / 60
+		);
+
+		let mut response = empty(303);
+		response
+			.headers
+			.push(("location".to_string(), next_path(query)));
+
+		response
+	}
+
+	fn route(
+		&self,
+		host: &str,
+		method: &str,
+		path: &str,
+		query: &str,
+		body: &[u8],
+	) -> ProxyResponse {
+		// Handled ahead of the table so that, switched off, it is not in the
+		// table at all: the warning page and this endpoint have to agree about
+		// whether the mechanism exists, and a 405 would answer that question.
+		if path == BYPASS {
+			return match (self.bypass_ttl, method) {
+				(Some(ttl), "GET") => self.bypass(host, query, ttl),
+				(Some(_), _) => empty(405),
+				(None, _) => empty(404),
+			};
+		}
+
 		match (path, method) {
 			("/.mach5/hidden", "GET") => self.hidden(host),
 			("/.mach5/hidden", "POST") => self.hide(host, body),
@@ -276,7 +324,7 @@ impl Interceptor for Internal {
 		// name, so a page can only ever reach its own site's list.
 		let host = crate::host_of(&req.url);
 
-		Some(self.route(host, &req.method, path, &req.body))
+		Some(self.route(host, &req.method, path, query_of(&req.url), &req.body))
 	}
 
 	/// Answers its own paths and ignores every other response, so it must never
@@ -332,6 +380,72 @@ fn empty(status: u16) -> ProxyResponse {
 	}
 }
 
+/// Where to send someone after a bypass: back to the page they were refused,
+/// and nowhere else.
+///
+/// This is the one place a value from the URL turns into a `location` header,
+/// so it is where an open redirect would live. Decoding comes first — a
+/// scheme-relative `//evil.com` written as `%2f%2fevil.com` has to be rejected
+/// as the same thing — and then only a path is allowed through. A backslash is
+/// treated as a slash by enough browsers to count as one here.
+fn next_path(query: &str) -> String {
+	const HOME: &str = "/";
+
+	let Some(raw) = query
+		.split('&')
+		.find_map(|pair| pair.strip_prefix("next="))
+	else {
+		return HOME.to_string();
+	};
+
+	let next = percent_decode(raw);
+	let mut characters = next.chars();
+
+	match (characters.next(), characters.next()) {
+		(Some('/'), Some('/' | '\\')) => HOME.to_string(),
+		(Some('/'), _) => next,
+		_ => HOME.to_string(),
+	}
+}
+
+/// Enough percent-decoding for a path that `encodeURIComponent` produced.
+/// Anything malformed is left as the literal characters it is, which cannot
+/// turn a rejected value into an accepted one.
+fn percent_decode(raw: &str) -> String {
+	let bytes = raw.as_bytes();
+	let mut out = Vec::with_capacity(bytes.len());
+	let mut i = 0;
+
+	while i < bytes.len() {
+		let decoded = (bytes[i] == b'%' && i + 2 < bytes.len())
+			.then(|| std::str::from_utf8(&bytes[i + 1..i + 3]).ok())
+			.flatten()
+			.and_then(|hex| u8::from_str_radix(hex, 16).ok());
+
+		match decoded {
+			Some(byte) => {
+				out.push(byte);
+				i += 3;
+			}
+			None => {
+				out.push(bytes[i]);
+				i += 1;
+			}
+		}
+	}
+
+	String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Query portion of an absolute URL, without the leading `?` or any fragment.
+fn query_of(url: &str) -> &str {
+	let Some((_before, rest)) = url.split_once('?') else {
+		return "";
+	};
+
+	rest.split('#').next().unwrap_or("")
+}
+
 /// Path portion of an absolute URL, without the query or fragment.
 fn path_of(url: &str) -> &str {
 	let rest = url.split_once("://").map_or(url, |(_scheme, rest)| rest);
@@ -353,6 +467,8 @@ mod tests {
 	fn internal(dir: &TempDir) -> Internal {
 		Internal {
 			store: Arc::new(Store::load(dir.path().join("hidden.json"))),
+			bypasses: Arc::new(crate::insecure::Bypasses::default()),
+			bypass_ttl: Some(std::time::Duration::from_secs(60)),
 		}
 	}
 
@@ -375,6 +491,66 @@ mod tests {
 
 	fn body_of(response: &ProxyResponse) -> String {
 		String::from_utf8(response.body.clone()).expect("responses are utf-8")
+	}
+
+	#[test]
+	fn typing_the_phrase_records_a_bypass_and_goes_back() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		let response = call(
+			&internal,
+			"GET",
+			"https://staging.example.com/.mach5/bypass?next=%2Fapp%3Fid%3D7",
+			"",
+		);
+
+		assert_eq!(response.status, 303);
+		assert_eq!(
+			response
+				.headers
+				.iter()
+				.find(|(name, _)| name == "location")
+				.map(|(_, value)| value.as_str()),
+			Some("/app?id=7")
+		);
+		assert!(internal.bypasses.allows("staging.example.com"));
+		assert!(
+			!internal.bypasses.allows("other.example.com"),
+			"only the host that was warned about"
+		);
+	}
+
+	#[test]
+	fn the_bypass_endpoint_does_not_exist_when_it_is_switched_off() {
+		let dir = TempDir::new().unwrap();
+		let mut internal = internal(&dir);
+		internal.bypass_ttl = None;
+
+		let response = call(&internal, "GET", "https://example.com/.mach5/bypass", "");
+
+		assert_eq!(
+			response.status, 404,
+			"a 405 would tell someone the endpoint is there"
+		);
+		assert!(!internal.bypasses.allows("example.com"));
+	}
+
+	/// The one place a value out of the URL becomes a `location` header.
+	#[test]
+	fn only_a_path_survives_the_next_parameter() {
+		assert_eq!(next_path("next=%2Fpath%3Fq%3D1"), "/path?q=1");
+		assert_eq!(next_path("next=/path?q=1"), "/path?q=1");
+		assert_eq!(next_path(""), "/");
+		assert_eq!(next_path("next="), "/");
+		assert_eq!(next_path("other=1"), "/");
+
+		// Every shape of "somewhere that is not this site".
+		assert_eq!(next_path("next=%2F%2Fevil.example"), "/");
+		assert_eq!(next_path("next=//evil.example"), "/");
+		assert_eq!(next_path("next=/\\evil.example"), "/");
+		assert_eq!(next_path("next=https%3A%2F%2Fevil.example"), "/");
+		assert_eq!(next_path("next=javascript%3Aalert(1)"), "/");
 	}
 
 	#[test]

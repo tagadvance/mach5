@@ -94,6 +94,18 @@ leaf_ttl_hours = 24
 clock_skew_minutes = 60
 refresh_margin_minutes = 60
 
+# Typing the phrase on the certificate warning page lets you through to that one
+# host for bypass_ttl_minutes, the way Chrome's `thisisunsafe` does. Meant for
+# staging origins with self-signed or expired certificates.
+#
+# Worth a thought before leaving this on for a deployment carrying everybody's
+# traffic rather than your own: it is the only thing here that switches off a
+# check no client can still do for itself. Bypasses are per-host, they expire,
+# they never touch disk, and each request that uses one is a warning in the log.
+allow_bypass = true
+bypass_ttl_minutes = 60
+# bypass_phrase = "thisisunsafe"
+
 [limits]
 max_request_body_mb = 10
 worker_threads = "1C"

@@ -11,6 +11,7 @@ mod ca;
 mod config;
 mod encoding;
 mod inject;
+mod insecure;
 mod interceptor;
 mod internal;
 mod interstitial;
@@ -203,13 +204,13 @@ fn spawn_workers(
 	let (res_tx, res_rx) = std::sync::mpsc::channel::<FetchResult>();
 	let job_rx = Arc::new(Mutex::new(job_rx));
 
-	let agent = upstream::agent(&config);
+	let agents = std::sync::Arc::new(upstream::agents(&config));
 
 	for _ in 0..config.worker_threads() {
 		let job_rx = job_rx.clone();
 		let res_tx = res_tx.clone();
 		let waker = waker.clone();
-		let agent = agent.clone();
+		let agents = agents.clone();
 		let config = config.clone();
 
 		std::thread::spawn(move || {
@@ -227,7 +228,7 @@ fn spawn_workers(
 					Err(_) => break, // senders dropped: shut down
 				};
 
-				if handle_job(&agent, &*interceptor, job, &res_tx, &waker).is_err() {
+				if handle_job(&agents, &config, &*interceptor, job, &res_tx, &waker).is_err() {
 					break;
 				}
 			}
@@ -244,7 +245,8 @@ fn spawn_workers(
 /// it is relayed in chunks and never fully held in memory, which is what large
 /// media needs. Errors are returned to the client as a 502 rather than dropped.
 fn handle_job(
-	agent: &ureq::Agent,
+	agents: &upstream::Agents,
+	config: &Config,
 	interceptor: &dyn Interceptor,
 	mut job: FetchJob,
 	results: &Sender<FetchResult>,
@@ -272,7 +274,7 @@ fn handle_job(
 		return send(Payload::Full(response));
 	}
 
-	let resp = match upstream::call(agent, &job.request) {
+	let resp = match upstream::call(agents, &job.request) {
 		Ok(resp) => resp,
 		Err(failure) => {
 			let host = host_of(&job.request.url);
@@ -280,7 +282,7 @@ fn handle_job(
 				upstream::FetchError::Tls(detail) => {
 					log::warn!("certificate validation failed for {host}: {detail}");
 
-					interstitial::certificate_error(host, detail)
+					interstitial::certificate_error(host, detail, config.bypass_phrase())
 				}
 				upstream::FetchError::Other(detail) => interstitial::upstream_error(host, detail),
 			};

@@ -103,7 +103,7 @@ struct HttpSettings {
 struct Shared {
 	config: Arc<Config>,
 	pool: ChainPool,
-	agent: ureq::Agent,
+	agents: upstream::Agents,
 }
 
 /// Start the listener. Returns once its runtime thread is spawned.
@@ -113,7 +113,7 @@ pub fn spawn(config: Arc<Config>, ca: Arc<CertAuthority>) -> std::io::Result<()>
 
 	let shared = Arc::new(Shared {
 		pool: ChainPool::new(config.worker_threads(), &config),
-		agent: upstream::agent(&config),
+		agents: upstream::agents(&config),
 		config,
 	});
 
@@ -301,10 +301,11 @@ fn fetch_blocking(
 		request.body.len()
 	);
 
-	let resp = match upstream::call(&shared.agent, &request) {
+	let resp = match upstream::call(&shared.agents, &request) {
 		Ok(resp) => resp,
 		Err(failure) => {
-			let _ = head_tx.send(Outcome::Buffered(failure_page(&request, &failure)));
+			let page = failure_page(&shared.config, &request, &failure);
+			let _ = head_tx.send(Outcome::Buffered(page));
 
 			return;
 		}
@@ -439,14 +440,18 @@ fn apply_alt_svc(config: &Config, headers: &mut Vec<(String, String)>) {
 }
 
 /// Render an upstream failure as a page the person can actually read.
-fn failure_page(request: &ProxyRequest, failure: &upstream::FetchError) -> ProxyResponse {
+fn failure_page(
+	config: &Config,
+	request: &ProxyRequest,
+	failure: &upstream::FetchError,
+) -> ProxyResponse {
 	let host = crate::host_of(&request.url);
 
 	match failure {
 		upstream::FetchError::Tls(detail) => {
 			log::warn!("certificate validation failed for {host}: {detail}");
 
-			interstitial::certificate_error(host, detail)
+			interstitial::certificate_error(host, detail, config.bypass_phrase())
 		}
 		upstream::FetchError::Other(detail) => interstitial::upstream_error(host, detail),
 	}

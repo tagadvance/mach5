@@ -22,8 +22,12 @@ const STATUS_LOOP_DETECTED: u16 = 508;
 
 /// Build the interstitial shown in place of a page whose origin failed
 /// certificate validation.
-pub fn certificate_error(host: &str, detail: &str) -> ProxyResponse {
-	let body = page(host, detail);
+///
+/// `bypass_phrase` is what someone may type on this page to be let through
+/// anyway, or `None` when that is switched off — in which case the page carries
+/// no trace of the mechanism at all.
+pub fn certificate_error(host: &str, detail: &str, bypass_phrase: Option<&str>) -> ProxyResponse {
+	let body = page(host, detail, bypass_phrase);
 
 	ProxyResponse {
 		status: STATUS_INVALID_CERT,
@@ -70,10 +74,11 @@ pub fn fetch_loop(host: &str) -> ProxyResponse {
 	}
 }
 
-fn page(host: &str, detail: &str) -> String {
+fn page(host: &str, detail: &str, bypass_phrase: Option<&str>) -> String {
 	let host = escape(host);
 	let detail = escape(detail);
 	let explanation = explain(&detail);
+	let bypass = bypass_phrase.map(listener).unwrap_or_default();
 
 	format!(
 		r#"<!doctype html>
@@ -105,9 +110,41 @@ fn page(host: &str, detail: &str) -> String {
   </details>
   <p class="actions"><button onclick="location.reload()">Try again</button></p>
 </main>
+{bypass}
 </body>
 </html>
 "#
+	)
+}
+
+/// The way past this page: type the phrase.
+///
+/// Chrome's `thisisunsafe`, and Chrome's reasoning with it — a warning with a
+/// button on it is a warning people click through without reading, where
+/// something you have to already know and type is not something anyone does by
+/// accident. It is also why the markup above says nothing about it: the page
+/// has to remain a refusal, and this is the whole of the mechanism.
+fn listener(phrase: &str) -> String {
+	// Through a JSON string, so a phrase carrying a quote or a backslash cannot
+	// end the literal and become code.
+	let phrase = serde_json::to_string(phrase).unwrap_or_else(|_| "\"\"".to_string());
+
+	format!(
+		r#"<script>
+(() => {{
+	const want = {phrase};
+	let typed = '';
+	addEventListener('keypress', (e) => {{
+		typed = (typed + String.fromCharCode(e.charCode || e.keyCode)).slice(-want.length);
+		if (typed !== want) {{
+			return;
+		}}
+
+		const next = encodeURIComponent(location.pathname + location.search);
+		location.href = '/.mach5/bypass?next=' + next;
+	}});
+}})();
+</script>"#
 	)
 }
 
@@ -260,9 +297,42 @@ fn escape(raw: &str) -> String {
 mod tests {
 	use super::*;
 
+	/// The mechanism has to be invisible when it is on and absent when it is
+	/// off. A page that hinted at it would be a page people click through.
+	#[test]
+	fn the_bypass_is_invisible_on_the_page_and_absent_when_off() {
+		let with = certificate_error("example.com", "expired", Some("thisisunsafe"));
+		let body = String::from_utf8(with.body).unwrap();
+
+		assert!(body.contains("/.mach5/bypass"), "the listener has to be there");
+		assert!(
+			!body.contains("thisisunsafe</") && !body.contains("Proceed") && !body.contains("Advanced"),
+			"but nothing readable may announce it"
+		);
+
+		let without = certificate_error("example.com", "expired", None);
+		let body = String::from_utf8(without.body).unwrap();
+
+		assert!(
+			!body.contains("mach5/bypass") && !body.contains("<script>"),
+			"switched off, the page carries no trace of the mechanism"
+		);
+	}
+
+	/// A phrase is configurable, so it reaches the page as data rather than as
+	/// code — a quote in it must not be able to close the literal.
+	#[test]
+	fn a_phrase_cannot_break_out_of_the_script() {
+		let resp = certificate_error("example.com", "expired", Some("a\"; alert(1); //"));
+		let body = String::from_utf8(resp.body).unwrap();
+
+		assert!(body.contains(r#"const want = "a\"; alert(1); //";"#), "{body}");
+	}
+
+
 	#[test]
 	fn host_and_detail_are_escaped() {
-		let resp = certificate_error("<script>alert(1)</script>", "\"quoted\"");
+		let resp = certificate_error("<script>alert(1)</script>", "\"quoted\"", None);
 		let body = String::from_utf8(resp.body).unwrap();
 
 		assert!(!body.contains("<script>alert(1)</script>"));
@@ -272,7 +342,7 @@ mod tests {
 
 	#[test]
 	fn expiry_gets_its_own_explanation() {
-		let resp = certificate_error("example.com", "certificate expired");
+		let resp = certificate_error("example.com", "certificate expired", None);
 		let body = String::from_utf8(resp.body).unwrap();
 
 		assert!(body.contains("has expired"));
@@ -281,8 +351,8 @@ mod tests {
 
 	#[test]
 	fn wrong_host_and_unknown_issuer_differ() {
-		let issuer = certificate_error("example.com", "invalid peer certificate: UnknownIssuer");
-		let name = certificate_error("example.com", "certificate not valid for name");
+		let issuer = certificate_error("example.com", "invalid peer certificate: UnknownIssuer", None);
+		let name = certificate_error("example.com", "certificate not valid for name", None);
 
 		let issuer = String::from_utf8(issuer.body).unwrap();
 		let name = String::from_utf8(name.body).unwrap();
@@ -319,7 +389,7 @@ mod tests {
 
 	#[test]
 	fn interstitial_is_never_cached() {
-		let resp = certificate_error("example.com", "whatever");
+		let resp = certificate_error("example.com", "whatever", None);
 
 		assert_eq!(resp.status, 526);
 		assert!(resp

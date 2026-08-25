@@ -28,6 +28,7 @@ pub struct Config {
 	pub paths: Paths,
 	pub plugins: Plugins,
 	pub blocklist: Blocklist,
+	pub cosmetic: Cosmetic,
 	pub internal: Internal,
 	pub inject: Inject,
 	pub tls: Tls,
@@ -159,6 +160,43 @@ impl Default for Blocklist {
 			urls: Vec::new(),
 			allow: Vec::new(),
 			refresh_hours: 24,
+		}
+	}
+}
+
+/// Cosmetic filter lists — the second stage, where the blocklist stops. Rules
+/// are `example.com##.selector` lines, merged into the per-host stylesheet
+/// alongside whatever the picker was used to hide by hand.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Cosmetic {
+	/// With no lists loaded this is a no-op, so it costs nothing to leave on.
+	pub enabled: bool,
+	pub files: Vec<PathBuf>,
+	/// Lists to fetch rather than read. Each is cached under `cache_dir`, so a
+	/// restart without a network still starts with yesterday's copy.
+	pub urls: Vec<String>,
+	/// How often to re-read the files and re-fetch the URLs. Zero switches
+	/// refreshing off, which leaves every list as stale as the last restart.
+	pub refresh_hours: u32,
+	/// Whether to apply the rules that name no domain.
+	///
+	/// Off, because a generic rule fires on every site in the world. When one is
+	/// wrong it breaks a page that has nothing to do with the list it came from,
+	/// and nothing on the broken page connects it back to a file nobody read —
+	/// which is a bad trade for a class of rule the domain-specific ones already
+	/// cover on the sites that matter.
+	pub generic: bool,
+}
+
+impl Default for Cosmetic {
+	fn default() -> Self {
+		Self {
+			enabled: true,
+			files: Vec::new(),
+			urls: Vec::new(),
+			refresh_hours: 24,
+			generic: false,
 		}
 	}
 }
@@ -400,6 +438,9 @@ impl Config {
 		for file in &mut self.blocklist.files {
 			*file = expand_tilde(file);
 		}
+		for file in &mut self.cosmetic.files {
+			*file = expand_tilde(file);
+		}
 	}
 
 	pub fn leaf_ttl(&self) -> Duration {
@@ -558,6 +599,34 @@ mod tests {
 		);
 		assert_eq!(config.blocklist.refresh_hours, 6);
 		assert!(config.blocklist.files.is_empty(), "files stay optional");
+	}
+
+	#[test]
+	fn cosmetic_lists_are_off_the_shelf_but_generic_rules_are_not() {
+		let config = Config::from_str(
+			r#"
+			[cosmetic]
+			files = ["~/lists/easylist.txt"]
+			urls = ["https://example.com/annoyances.txt"]
+			"#,
+		)
+		.unwrap();
+
+		assert_eq!(config.cosmetic.files, vec![home().join("lists/easylist.txt")]);
+		assert_eq!(
+			config.cosmetic.urls,
+			vec!["https://example.com/annoyances.txt".to_string()]
+		);
+		assert!(config.cosmetic.enabled, "a list with no files is a no-op");
+		assert_eq!(config.cosmetic.refresh_hours, 24, "daily by default");
+		assert!(
+			!config.cosmetic.generic,
+			"a rule that fires everywhere has to be asked for"
+		);
+		assert!(Config::from_str("[cosmetic]\ngeneric = true\n")
+			.unwrap()
+			.cosmetic
+			.generic);
 	}
 
 	#[test]

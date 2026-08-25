@@ -74,6 +74,54 @@ refresh_hours = 24
 # Never blocked, whatever the lists say. Covers subdomains too.
 # allow = ["example.com"]
 
+[cosmetic]
+# Second-stage blocking: the rules the blocklist skips. A blocked domain never
+# answers at all, which does nothing about a cookie banner served by the site
+# you actually wanted — that is what a cosmetic rule is for.
+#
+# `example.com##.cookie-banner` hides `.cookie-banner` on example.com and its
+# subdomains; domains may be comma-separated; a `~sub.example.com` prefix carves
+# one back out; `example.com#@#.selector` is an exception that beats a hide.
+# `##.selector` with no domain is a generic rule — see `generic` below. Network
+# rules, scriptlets and procedural pseudo-classes are skipped: this is not a
+# filter engine. What survives is merged into `/.mach5/hidden.css`.
+#
+# Be honest about what this is: hiding a consent dialog is not answering it. The
+# site still believes it is waiting, and some will not scroll, play or log in
+# until one is dealt with properly. When a site stops working, switch this off
+# first.
+#
+# The lists in `files` are read from inside the container, so mount them in, as
+# with the blocklist's. The ones in `urls` need no mount at all.
+enabled = true
+# files = ["/etc/mach5/lists/easylist.txt"]
+
+# Lists to fetch rather than read. EasyList is the general one; uBlock Origin's
+# annoyances lists are the ones that matter here, since the cookie notices are
+# most of the point:
+# urls = [
+#   "https://easylist.to/easylist/easylist.txt",
+#   "https://ublockorigin.github.io/uAssets/filters/annoyances-cookies.txt",
+#   "https://ublockorigin.github.io/uAssets/filters/annoyances-others.txt",
+# ]
+#
+# Each is cached under cache_dir as cosmetic/<hash-of-url>.txt, so the cache_dir
+# volume above is again what makes a restart come up hiding things immediately
+# instead of refetching the lot. Revalidated with an etag or last-modified, and
+# fetched with the origin certificate validated, exactly as the blocklist is.
+
+# How often the files are re-read and the URLs re-fetched. 0 switches refreshing
+# off. A cosmetic list goes stale faster than a hosts file: sites move their
+# banners, and a rule that no longer matches anything fails silently.
+refresh_hours = 24
+
+# Whether to apply the rules that name no domain — `##.ad-slot` and the like.
+#
+# Off, and worth leaving off. A generic rule fires on every site in the world, so
+# a bad one breaks a page that has nothing to do with the list it came from, and
+# nothing on the broken page connects it back to a file you never read.
+generic = false
+
 [internal]
 # The proxy's own endpoints, under `/.mach5/` on every origin at once. Because
 # the deployment answers every DNS query with the proxy's address, a relative

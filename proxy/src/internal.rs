@@ -7,13 +7,15 @@
 //! reach them.
 //!
 //! Everything under `/.mach5/` is answered here and never forwarded upstream.
-//! The endpoints are the per-site list of CSS selectors to hide — a self-hosted
-//! cosmetic filter, where the blocklist deliberately stops at domain matching —
-//! plus the two files [`crate::inject`] points every page at: the stylesheet
-//! that applies the list, and the picker that adds to it. The bare prefix is a
-//! status page: what the proxy has counted, and what is hidden on the site you
-//! are reading it from. And there is the root certificate itself — the one file
-//! a device has to have before any of the rest of this works.
+//! The endpoints are the per-site list of CSS selectors to hide — where the
+//! blocklist deliberately stops at domain matching — plus the two files
+//! [`crate::inject`] points every page at: the stylesheet that applies the
+//! list, and the picker that adds to it. The stylesheet is the union of that
+//! list and whatever [`crate::cosmetic`]'s filter lists say about the same
+//! host; everything else here is only ever about what somebody picked. The bare
+//! prefix is a status page: what the proxy has counted, and what is hidden on
+//! the site you are reading it from. And there is the root certificate itself —
+//! the one file a device has to have before any of the rest of this works.
 //!
 //! Which list a request touches is decided by [`crate::host_of`] on the URL the
 //! client asked for, never by anything in the request itself. Same-origin is
@@ -56,16 +58,31 @@ const MAX_SELECTORS_PER_HOST: usize = 500;
 /// for a deployment to serve a script that does not match the proxy running it.
 const SCRIPT: &str = include_str!("mach5.js");
 
-/// Characters that would let a stored selector break out of the rule it is
-/// written into: closing the block, starting an at-rule, ending the declaration,
-/// escaping a character, or closing the `<style>`-shaped context a browser might
-/// parse the response in if it were ever served as something other than CSS.
+/// Characters that would let a selector break out of the rule it is written
+/// into: closing the block, starting an at-rule, ending the declaration, or
+/// escaping a character. `<` is here for a different reason — it is what keeps
+/// a `</style>` out of the body. The stylesheet is served as `text/css` from an
+/// endpoint of its own and is never inlined into a page, so that one character
+/// is the whole of the markup-shaped risk.
 ///
-/// A selector containing one is dropped from the stylesheet rather than escaped.
-/// Selectors are typed into the store by a page, so this is the boundary where a
-/// hostile one has to stop; and nothing the picker generates contains any of
-/// these, so there is no legitimate selector to preserve by escaping it.
-const CSS_FORBIDDEN: [char; 7] = ['<', '>', '{', '}', '@', ';', '\\'];
+/// `>` is deliberately *not* here. It is the child combinator, which the
+/// cosmetic lists use in every other rule, and on its own it can no more escape
+/// a selector than a letter can.
+///
+/// A selector containing one of these is dropped from the stylesheet rather
+/// than escaped. Selectors are typed into the store by a page and read out of
+/// lists nobody here wrote, so this is the boundary where a hostile one has to
+/// stop; and nothing legitimate contains any of them, so there is nothing to
+/// preserve by escaping it.
+const CSS_FORBIDDEN: [char; 6] = ['<', '{', '}', '@', ';', '\\'];
+
+/// Whether a selector is safe to write into the stylesheet.
+///
+/// Shared with [`crate::cosmetic`], so that a selector from a list and a
+/// selector from the picker are held to one standard rather than two.
+pub fn usable(selector: &str) -> bool {
+	!selector.is_empty() && !selector.contains(CSS_FORBIDDEN)
+}
 
 /// The hidden-element selectors, per host, kept in memory and mirrored to disk.
 ///
@@ -222,6 +239,11 @@ pub struct Internal {
 	/// list", and — since a refresh replaces the list underneath us — the
 	/// registry rather than the list it held when this was built.
 	blocklist: Option<Arc<crate::blocklist::Blocklists>>,
+	/// The cosmetic-rule registry, or `None` when those are switched off. The
+	/// stylesheet merges what it holds with what the picker stored, and the
+	/// status page reports on it — for the same reason, and through the same
+	/// indirection, as the blocklist above.
+	cosmetic: Option<Arc<crate::cosmetic::Cosmetics>>,
 }
 
 impl Internal {
@@ -239,6 +261,10 @@ impl Internal {
 				.blocklist
 				.enabled
 				.then(|| crate::blocklist::shared(config)),
+			cosmetic: config
+				.cosmetic
+				.enabled
+				.then(|| crate::cosmetic::shared(config)),
 		}
 	}
 
@@ -329,6 +355,10 @@ impl Internal {
 				.as_ref()
 				.map(|lists| lists.current().status())
 				.filter(|list| list.domains > 0),
+			self.cosmetic
+				.as_ref()
+				.map(|rules| rules.current().status())
+				.filter(|rules| rules.rules > 0),
 			self.ca.is_ephemeral(),
 		);
 
@@ -401,13 +431,31 @@ impl Internal {
 	/// before the script has had a chance to run. A host with nothing hidden
 	/// gets an empty body rather than a 404 — it is not an error to have hidden
 	/// nothing yet.
+	///
+	/// Two lists, in one rule: what somebody picked here, then what the cosmetic
+	/// lists say about this host. The picked ones come first and win any
+	/// duplicate, because they are the half of the file a person on this machine
+	/// actually chose; each half is sorted already, so the whole thing is stable
+	/// enough to diff between two fetches.
 	fn stylesheet(&self, host: &str) -> ProxyResponse {
-		let usable: Vec<String> = self
+		let mut selectors: Vec<String> = self
 			.store
 			.selectors(host)
 			.into_iter()
-			.filter(|selector| !selector.contains(CSS_FORBIDDEN))
+			.filter(|selector| usable(selector))
 			.collect();
+
+		// Filtered against what is already there rather than sorted together
+		// afterwards: this is the deduplication as well as the ordering.
+		let listed: Vec<String> = self
+			.cosmetic
+			.as_ref()
+			.map(|rules| rules.current().selectors(host))
+			.unwrap_or_default()
+			.into_iter()
+			.filter(|selector| !selectors.contains(selector))
+			.collect();
+		selectors.extend(listed);
 
 		let mut response = empty(200);
 		response.headers.push((
@@ -415,9 +463,10 @@ impl Internal {
 			"text/css; charset=utf-8".to_string(),
 		));
 
-		if !usable.is_empty() {
+		if !selectors.is_empty() {
 			response.body =
-				format!("{} {{ display: none !important }}", usable.join(", ")).into_bytes();
+				format!("{} {{ display: none !important }}", selectors.join(", "))
+					.into_bytes();
 		}
 
 		response
@@ -551,15 +600,16 @@ addEventListener('click', (e) => {
 
 /// Render the status page.
 ///
-/// `list` is `None` when no blocklist is loaded, which is not the same thing as
-/// one that has blocked nothing: a bare zero there would read as "this is
-/// working and there was nothing to block".
+/// `list` and `rules` are `None` when nothing of that kind is loaded, which is
+/// not the same thing as a list that has caught nothing: a bare zero there
+/// would read as "this is working and there was nothing to catch".
 fn status_page(
 	host: &str,
 	counted: &Snapshot,
 	selectors: &[String],
 	bypassed: bool,
 	list: Option<crate::blocklist::Status>,
+	rules: Option<crate::cosmetic::Status>,
 	ephemeral: bool,
 ) -> String {
 	let host = escape(host);
@@ -578,6 +628,18 @@ fn status_page(
 			metrics::uptime(list.age)
 		),
 		None => r#"<td class="note">no blocklist loaded</td>"#.to_string(),
+	};
+	// The same three facts as the blocklist row, for the same reason: rules that
+	// stopped being refreshed hide less of the web every week and say nothing.
+	let cosmetic = match rules {
+		Some(rules) => format!(
+			r#"<td>{} <span class="note">from {} {}, refreshed {} ago</span></td>"#,
+			metrics::thousands(rules.rules as u64),
+			rules.sources,
+			if rules.sources == 1 { "list" } else { "lists" },
+			metrics::uptime(rules.age)
+		),
+		None => r#"<td class="note">no cosmetic lists loaded</td>"#.to_string(),
 	};
 	let internal = metrics::thousands(counted.internal);
 	let injected = metrics::thousands(counted.injected);
@@ -626,6 +688,7 @@ fn status_page(
   <table>
     <tr><th>Requests</th><td>{requests}</td></tr>
     <tr><th>Blocked</th>{blocked}</tr>
+    <tr><th>Cosmetic rules</th>{cosmetic}</tr>
     <tr><th>mach5 endpoints</th><td>{internal}</td></tr>
     <tr><th>Pages injected</th><td>{injected}</td></tr>
     <tr><th>Fetched unvalidated</th><td>{bypasses}</td></tr>
@@ -781,6 +844,7 @@ mod tests {
 			metrics: Arc::new(Metrics::default()),
 			ca: Arc::new(ca),
 			blocklist: None,
+			cosmetic: None,
 		}
 	}
 
@@ -1139,6 +1203,85 @@ mod tests {
 			.any(|(k, v)| k == "cache-control" && v == "no-store"));
 	}
 
+	/// A list nobody here wrote and a list somebody here picked end up in one
+	/// rule. The picked half comes first and wins any duplicate, and both halves
+	/// stay sorted so two fetches of this can be diffed against each other.
+	#[test]
+	fn the_stylesheet_merges_the_lists_with_what_was_picked() {
+		let dir = TempDir::new().unwrap();
+		let mut internal = internal(&dir);
+		let list = dir.path().join("easylist.txt");
+		std::fs::write(
+			&list,
+			"example.com##.cookie-banner\n\
+			 example.com##.promo\n\
+			 www.example.com##.newsletter\n\
+			 example.com#@#.wanted\n\
+			 example.com##.wanted\n\
+			 other.example##.elsewhere\n",
+		)
+		.unwrap();
+		internal.cosmetic = Some(Arc::new(crate::cosmetic::Cosmetics::new(
+			crate::cosmetic::Cosmetic::load(&[list], false),
+		)));
+
+		for selector in [".promo", "#ad"] {
+			call(
+				&internal,
+				"POST",
+				"https://www.example.com/.mach5/hidden",
+				&serde_json::json!({ "selector": selector }).to_string(),
+			);
+		}
+
+		let css = body_of(&call(
+			&internal,
+			"GET",
+			"https://www.example.com/.mach5/hidden.css",
+			"",
+		));
+
+		assert_eq!(
+			css,
+			"#ad, .promo, .cookie-banner, .newsletter { display: none !important }",
+			"picked first, then the lists, with the duplicate kept once"
+		);
+	}
+
+	#[test]
+	fn a_host_the_lists_say_nothing_about_gets_only_what_was_picked() {
+		let dir = TempDir::new().unwrap();
+		let mut internal = internal(&dir);
+		let list = dir.path().join("easylist.txt");
+		std::fs::write(&list, "example.com##.cookie-banner\n").unwrap();
+		internal.cosmetic = Some(Arc::new(crate::cosmetic::Cosmetics::new(
+			crate::cosmetic::Cosmetic::load(&[list], false),
+		)));
+
+		call(
+			&internal,
+			"POST",
+			"https://other.example/.mach5/hidden",
+			r##"{"selector":"#ad"}"##,
+		);
+
+		assert_eq!(
+			body_of(&call(
+				&internal,
+				"GET",
+				"https://other.example/.mach5/hidden.css",
+				""
+			)),
+			"#ad { display: none !important }"
+		);
+		assert!(
+			call(&internal, "GET", "https://third.example/.mach5/hidden.css", "")
+				.body
+				.is_empty(),
+			"no rule, not an empty rule"
+		);
+	}
+
 	#[test]
 	fn a_host_with_nothing_hidden_gets_an_empty_stylesheet() {
 		let dir = TempDir::new().unwrap();
@@ -1153,6 +1296,9 @@ mod tests {
 		assert!(response.body.is_empty(), "no rule, not an empty rule");
 	}
 
+	/// A `>` is a child combinator and nothing else — it cannot close a rule,
+	/// open an at-rule or end a declaration — so it reaches the stylesheet. The
+	/// characters that *can* still do not.
 	#[test]
 	fn a_hostile_selector_never_reaches_the_stylesheet() {
 		let dir = TempDir::new().unwrap();
@@ -1164,7 +1310,6 @@ mod tests {
 			"@import url(https://evil.example/x.css)",
 			".x; color: red",
 			"</style><script>alert(1)</script>",
-			".x > .y",
 			".x\\3c ",
 		] {
 			let stored = call(
@@ -1177,7 +1322,14 @@ mod tests {
 			assert_eq!(stored.status, 204, "the store itself takes anything");
 		}
 
-		call(&internal, "POST", url, r##"{"selector":"#ad"}"##);
+		for selector in ["#ad", ".x > .y"] {
+			call(
+				&internal,
+				"POST",
+				url,
+				&serde_json::json!({ "selector": selector }).to_string(),
+			);
+		}
 
 		let css = body_of(&call(
 			&internal,
@@ -1187,9 +1339,13 @@ mod tests {
 		));
 
 		assert_eq!(
-			css, "#ad { display: none !important }",
-			"only the harmless selector survives"
+			css, "#ad, .x > .y { display: none !important }",
+			"only the selectors that cannot break out survive"
 		);
+		assert!(usable(".wrap > .ad"), "a child combinator is a selector");
+		assert!(!usable(".x { }"));
+		assert!(!usable("</style>"));
+		assert!(!usable(""), "an empty selector is not a rule");
 	}
 
 	#[test]
@@ -1417,6 +1573,31 @@ mod tests {
 		assert!(loaded.contains(">9 "), "{loaded}");
 		assert!(loaded.contains("from 1 list, refreshed 0s ago"), "{loaded}");
 		assert!(!loaded.contains("no blocklist loaded"));
+	}
+
+	/// The same distinction the blocklist row makes: a zero because nothing was
+	/// loaded reads very differently from a zero because there was nothing to
+	/// hide.
+	#[test]
+	fn the_page_tells_missing_cosmetic_lists_from_loaded_ones() {
+		let dir = TempDir::new().unwrap();
+		let mut internal = internal(&dir);
+
+		let none = body_of(&call(&internal, "GET", "https://example.com/.mach5/", ""));
+
+		assert!(none.contains("no cosmetic lists loaded"), "{none}");
+
+		let list = dir.path().join("easylist.txt");
+		std::fs::write(&list, "example.com##.banner\nexample.com##.promo\n").unwrap();
+		internal.cosmetic = Some(Arc::new(crate::cosmetic::Cosmetics::new(
+			crate::cosmetic::Cosmetic::load(&[list], false),
+		)));
+
+		let loaded = body_of(&call(&internal, "GET", "https://example.com/.mach5/", ""));
+
+		assert!(loaded.contains(">2 "), "{loaded}");
+		assert!(loaded.contains("from 1 list, refreshed 0s ago"), "{loaded}");
+		assert!(!loaded.contains("no cosmetic lists loaded"));
 	}
 
 	#[test]

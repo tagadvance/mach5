@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use crate::config::Config;
-use crate::interceptor::{Interceptor, ProxyRequest, ProxyResponse};
+use crate::interceptor::{Interceptor, ProxyRequest, ProxyResponse, ResponseHead};
 
 /// A 1×1 transparent GIF. Serving this rather than an empty body keeps a
 /// blocked image from leaving a broken-image icon in the page.
@@ -132,6 +132,12 @@ impl Interceptor for Arc<Blocklist> {
 		log::debug!("blocked {host}");
 
 		Some(blocked(req))
+	}
+
+	/// Decides on the request alone, so it must never be the reason a response
+	/// body is held in memory instead of streaming.
+	fn wants_body(&self, _req: &ProxyRequest, _head: &ResponseHead) -> bool {
+		false
 	}
 }
 
@@ -436,6 +442,20 @@ mod tests {
 			.headers
 			.iter()
 			.any(|(k, v)| k == "x-mach5" && v == "blocked"));
+	}
+
+	#[test]
+	fn blocking_never_claims_a_response_body() {
+		let list = Arc::new(list("0.0.0.0 ads.example.com\n"));
+		let head = ResponseHead {
+			status: 200,
+			headers: vec![("content-type".to_string(), "video/mp4".to_string())],
+		};
+
+		assert!(
+			!list.wants_body(&request("https://example.org/clip.mp4", "*/*"), &head),
+			"a request-only link must not switch off streaming"
+		);
 	}
 
 	#[test]

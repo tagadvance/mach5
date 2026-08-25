@@ -36,6 +36,12 @@ struct Validity {
 
 pub struct CertAuthority {
 	issuer: Issuer<'static, KeyPair>,
+	/// The root's own certificate, DER-encoded. Kept from construction because
+	/// every device that has to trust this proxy needs a copy, and the encoding
+	/// never changes for the life of the process.
+	root: Vec<u8>,
+	/// Whether the root was generated at startup rather than loaded from disk.
+	ephemeral: bool,
 	cache: Mutex<HashMap<String, Leaf>>,
 	validity: Validity,
 }
@@ -70,9 +76,12 @@ impl CertAuthority {
 	/// Load a CA from PEM cert + PEM private key.
 	pub fn from_pem(cert_pem: &str, key_pem: &str, config: &Config) -> Result<Self, Box<dyn Error>> {
 		let key = KeyPair::from_pem(key_pem)?;
+		// Through boring rather than rcgen: this is the same PEM the issuer is
+		// built from, and boring is already here to hand it back as DER.
+		let root = X509::from_pem(cert_pem.as_bytes())?.to_der()?;
 		let issuer = Issuer::from_ca_cert_pem(cert_pem, key)?;
 
-		Ok(Self::new(issuer, config))
+		Ok(Self::new(issuer, root, false, config))
 	}
 
 	/// Generate a throwaway self-signed CA. Development only: nothing signed by
@@ -87,14 +96,24 @@ impl CertAuthority {
 		dn.push(DnType::CommonName, "mach5 dev CA");
 		params.distinguished_name = dn;
 
+		// Self-signed first, because an issuer alone is a signing identity with
+		// no certificate to hand anyone: nothing could be installed to trust it.
+		let root = params.self_signed(&key)?.der().to_vec();
 		let issuer = Issuer::new(params, key);
 
-		Ok(Self::new(issuer, config))
+		Ok(Self::new(issuer, root, true, config))
 	}
 
-	fn new(issuer: Issuer<'static, KeyPair>, config: &Config) -> Self {
+	fn new(
+		issuer: Issuer<'static, KeyPair>,
+		root: Vec<u8>,
+		ephemeral: bool,
+		config: &Config,
+	) -> Self {
 		Self {
 			issuer,
+			root,
+			ephemeral,
 			cache: Mutex::new(HashMap::new()),
 			validity: Validity {
 				ttl: config.leaf_ttl(),
@@ -102,6 +121,25 @@ impl CertAuthority {
 				refresh_margin: config.refresh_margin(),
 			},
 		}
+	}
+
+	/// The root's certificate, DER-encoded.
+	///
+	/// This is the public certificate and only ever that. The private key stays
+	/// inside `issuer`, where nothing in the endpoint layer can reach it, and
+	/// must never be given a way out of this type. Handing the certificate to
+	/// whoever asks is not a leak: it is a public certificate whose entire
+	/// purpose is to be installed on the devices that have to trust what this
+	/// proxy mints.
+	pub fn root_certificate(&self) -> &[u8] {
+		&self.root
+	}
+
+	/// Whether the root was generated at startup instead of loaded from disk.
+	/// Worth saying out loud before somebody installs it: the next restart mints
+	/// a different root, and every device that trusted this one stops working.
+	pub fn is_ephemeral(&self) -> bool {
+		self.ephemeral
 	}
 
 	/// Return a leaf for `sni`, minting and caching on first request and
@@ -212,6 +250,32 @@ mod tests {
 			(leaf.not_after - expected).abs() < Duration::minutes(1),
 			"configured TTL should override the default"
 		);
+	}
+
+	/// The certificate the proxy hands out has to be the one that actually
+	/// signed what it mints, or installing it changes nothing.
+	#[test]
+	fn the_root_certificate_signs_the_leaves() {
+		let ca = CertAuthority::generate_dev(&Config::default()).unwrap();
+		let root = X509::from_der(ca.root_certificate()).unwrap();
+		let leaf = ca.mint("example.com").unwrap();
+
+		assert!(leaf.cert.verify(&root.public_key().unwrap()).unwrap());
+		assert!(ca.is_ephemeral(), "generated, so nothing should trust it long");
+	}
+
+	#[test]
+	fn a_loaded_root_is_served_as_loaded() {
+		let key = KeyPair::generate().unwrap();
+		let mut params = CertificateParams::default();
+		params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+		let root = params.self_signed(&key).unwrap();
+
+		let ca =
+			CertAuthority::from_pem(&root.pem(), &key.serialize_pem(), &Config::default()).unwrap();
+
+		assert_eq!(ca.root_certificate(), root.der().as_ref());
+		assert!(!ca.is_ephemeral(), "loaded from disk, so it survives a restart");
 	}
 
 	#[test]

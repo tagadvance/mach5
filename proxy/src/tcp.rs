@@ -52,10 +52,10 @@ struct ChainPool {
 }
 
 impl ChainPool {
-	fn new(size: usize, config: &Config) -> Self {
+	fn new(size: usize, config: &Config, ca: &Arc<CertAuthority>) -> Self {
 		let (give_back, take) = std::sync::mpsc::channel();
 		for _ in 0..size {
-			let _ = give_back.send(Chain::from_config(config));
+			let _ = give_back.send(Chain::from_config(config, ca.clone()));
 		}
 
 		Self {
@@ -112,7 +112,7 @@ pub fn spawn(config: Arc<Config>, ca: Arc<CertAuthority>) -> std::io::Result<()>
 	let addr = config.listen_tcp.0;
 
 	let shared = Arc::new(Shared {
-		pool: ChainPool::new(config.worker_threads(), &config),
+		pool: ChainPool::new(config.worker_threads(), &config, &ca),
 		agents: upstream::agents(&config),
 		config,
 	});

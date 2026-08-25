@@ -12,7 +12,8 @@
 //! plus the two files [`crate::inject`] points every page at: the stylesheet
 //! that applies the list, and the picker that adds to it. The bare prefix is a
 //! status page: what the proxy has counted, and what is hidden on the site you
-//! are reading it from.
+//! are reading it from. And there is the root certificate itself — the one file
+//! a device has to have before any of the rest of this works.
 //!
 //! Which list a request touches is decided by [`crate::host_of`] on the URL the
 //! client asked for, never by anything in the request itself. Same-origin is
@@ -26,6 +27,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
+use crate::ca::CertAuthority;
 use crate::config::Config;
 use crate::interceptor::{Interceptor, ProxyRequest, ProxyResponse, ResponseHead};
 use crate::interstitial::{escape, STYLE};
@@ -37,6 +39,11 @@ const PREFIX: &str = "/.mach5/";
 
 /// Where the certificate warning page sends someone who typed the phrase.
 const BYPASS: &str = "/.mach5/bypass";
+
+/// The root certificate, and the name a device sees it saved under. A `.crt`
+/// rather than a `.der`: that is the extension the install flows recognise.
+const CERTIFICATE: &str = "/.mach5/ca";
+const CERTIFICATE_FILENAME: &str = "mach5-root.crt";
 
 /// Bounds on what one page can store. A selector is a handful of characters in
 /// practice; these exist so a buggy — or hostile — page cannot grow the file
@@ -206,6 +213,10 @@ pub struct Internal {
 	/// How long a typed bypass lasts, or `None` when the mechanism is off.
 	bypass_ttl: Option<std::time::Duration>,
 	metrics: Arc<Metrics>,
+	/// The certificate authority, for the one endpoint that hands out its root
+	/// certificate. Nothing here can reach the private key — see
+	/// [`CertAuthority::root_certificate`].
+	ca: Arc<CertAuthority>,
 	/// The blocklist registry, or `None` when blocking is switched off. The
 	/// status page needs to tell "nothing was blocked" apart from "there is no
 	/// list", and — since a refresh replaces the list underneath us — the
@@ -214,13 +225,14 @@ pub struct Internal {
 }
 
 impl Internal {
-	pub fn new(config: &Config) -> Self {
+	pub fn new(config: &Config, ca: Arc<CertAuthority>) -> Self {
 		Self {
 			store: shared(config),
 			bypasses: crate::insecure::bypasses(),
 			// `None` is the whole switch: no TTL, no endpoint.
 			bypass_ttl: config.bypass_phrase().map(|_| config.bypass_ttl()),
 			metrics: metrics::shared(),
+			ca,
 			// Asked for only when it is switched on: reporting on the blocklist
 			// must not be the reason a disabled one is read off disk.
 			blocklist: config
@@ -285,6 +297,7 @@ impl Internal {
 			}
 			("/.mach5/hidden.css", "GET") => self.stylesheet(host),
 			("/.mach5/mach5.js", "GET") => script(),
+			(CERTIFICATE, "GET") => self.certificate(),
 			(
 				"/.mach5"
 				| "/.mach5/"
@@ -293,7 +306,8 @@ impl Internal {
 				| "/.mach5/hidden/remove"
 				| "/.mach5/hidden/clear"
 				| "/.mach5/hidden.css"
-				| "/.mach5/mach5.js",
+				| "/.mach5/mach5.js"
+				| CERTIFICATE,
 				_,
 			) => empty(405),
 			_ => empty(404),
@@ -315,6 +329,7 @@ impl Internal {
 				.as_ref()
 				.map(|lists| lists.current().status())
 				.filter(|list| list.domains > 0),
+			self.ca.is_ephemeral(),
 		);
 
 		let mut response = empty(200);
@@ -323,6 +338,30 @@ impl Internal {
 			"text/html; charset=utf-8".to_string(),
 		));
 		response.body = page.into_bytes();
+
+		response
+	}
+
+	/// The root certificate, as a file a device will offer to install.
+	///
+	/// DER rather than PEM: it is what the install flow expects on Android, iOS
+	/// and Windows, and the browsers that would rather have PEM accept DER here
+	/// anyway. The disposition is the other half of that — without it a browser
+	/// renders the bytes instead of offering to install them.
+	///
+	/// The public certificate and nothing else. There is deliberately no
+	/// endpoint, here or anywhere, that can reach the private key.
+	fn certificate(&self) -> ProxyResponse {
+		let mut response = empty(200);
+		response.headers.push((
+			"content-type".to_string(),
+			"application/x-x509-ca-cert".to_string(),
+		));
+		response.headers.push((
+			"content-disposition".to_string(),
+			format!("attachment; filename=\"{CERTIFICATE_FILENAME}\""),
+		));
+		response.body = self.ca.root_certificate().to_vec();
 
 		response
 	}
@@ -521,6 +560,7 @@ fn status_page(
 	selectors: &[String],
 	bypassed: bool,
 	list: Option<crate::blocklist::Status>,
+	ephemeral: bool,
 ) -> String {
 	let host = escape(host);
 	let uptime = metrics::uptime(std::time::Duration::from_secs(counted.uptime_seconds));
@@ -554,6 +594,19 @@ fn status_page(
 		"<p class=\"note\">This site&rsquo;s certificate is being validated normally.</p>"
 	};
 	let hidden = selector_list(selectors);
+	// Loudly, when the root is the generated one: installing a certificate that
+	// is replaced on the next restart is effort spent to be confused later.
+	let authority = if ephemeral {
+		"<strong>This is an ephemeral dev CA</strong>, regenerated every time mach5 \
+		 restarts &mdash; installing it buys you one run."
+	} else {
+		"This is the configured root CA."
+	};
+	let certificate = format!(
+		"<p class=\"note\"><a href=\"{CERTIFICATE}\">Install the mach5 root certificate</a> on \
+		 a device before anything else here works &mdash; on a phone it usually lands in \
+		 Settings rather than in the browser. {authority}</p>"
+	);
 
 	format!(
 		r#"<!doctype html>
@@ -569,6 +622,7 @@ fn status_page(
 <main>
   <h1>mach5</h1>
   <p class="lede">Running for {uptime}.</p>
+  {certificate}
   <table>
     <tr><th>Requests</th><td>{requests}</td></tr>
     <tr><th>Blocked</th>{blocked}</tr>
@@ -716,13 +770,30 @@ mod tests {
 	use tempfile::TempDir;
 
 	fn internal(dir: &TempDir) -> Internal {
+		internal_with(dir, CertAuthority::generate_dev(&Config::default()).unwrap())
+	}
+
+	fn internal_with(dir: &TempDir, ca: CertAuthority) -> Internal {
 		Internal {
 			store: Arc::new(Store::load(dir.path().join("hidden.json"))),
 			bypasses: Arc::new(crate::insecure::Bypasses::default()),
 			bypass_ttl: Some(std::time::Duration::from_secs(60)),
 			metrics: Arc::new(Metrics::default()),
+			ca: Arc::new(ca),
 			blocklist: None,
 		}
+	}
+
+	/// A root loaded from PEM, the way a deployment with a real CA runs. Built
+	/// here rather than kept as a fixture so the test carries its own root and
+	/// nothing on disk is a private key.
+	fn loaded_ca() -> CertAuthority {
+		let key = rcgen::KeyPair::generate().unwrap();
+		let mut params = rcgen::CertificateParams::default();
+		params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+		let root = params.self_signed(&key).unwrap();
+
+		CertAuthority::from_pem(&root.pem(), &key.serialize_pem(), &Config::default()).unwrap()
 	}
 
 	fn request(method: &str, url: &str, body: &str) -> ProxyRequest {
@@ -1143,6 +1214,52 @@ mod tests {
 			.any(|(k, v)| k == "cache-control" && v == "max-age=300"));
 	}
 
+	/// The endpoint that makes every other one usable: nothing this proxy mints
+	/// is trusted until a device has installed what this hands back.
+	#[test]
+	fn the_root_certificate_is_served_ready_to_install() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		let response = call(&internal, "GET", "https://example.com/.mach5/ca", "");
+
+		assert_eq!(response.status, 200);
+		assert_eq!(response.body, internal.ca.root_certificate());
+		assert_eq!(
+			response.body.first(),
+			Some(&0x30),
+			"DER, not PEM: a certificate is a SEQUENCE"
+		);
+
+		// Both headers are load-bearing: the type is what an installer looks at,
+		// and without the disposition a browser renders the bytes instead.
+		assert!(response
+			.headers
+			.iter()
+			.any(|(k, v)| k == "content-type" && v == "application/x-x509-ca-cert"));
+		assert!(response
+			.headers
+			.iter()
+			.any(|(k, v)| k == "content-disposition"
+				&& v == r#"attachment; filename="mach5-root.crt""#));
+		assert!(response
+			.headers
+			.iter()
+			.any(|(k, v)| k == "cache-control" && v == "no-store"));
+	}
+
+	/// A regression guard on somebody later serving a "convenient" bundle: the
+	/// public certificate is the only thing that may ever leave this endpoint.
+	#[test]
+	fn the_certificate_endpoint_never_serves_the_private_key() {
+		let dir = TempDir::new().unwrap();
+		let response = call(&internal(&dir), "GET", "https://example.com/.mach5/ca", "");
+		let body = String::from_utf8_lossy(&response.body);
+
+		assert!(!body.contains("PRIVATE KEY"), "the key must never be reachable");
+		assert!(!body.contains("-----BEGIN"));
+	}
+
 	#[test]
 	fn an_unknown_endpoint_is_not_found() {
 		let dir = TempDir::new().unwrap();
@@ -1222,6 +1339,34 @@ mod tests {
 
 		assert!(bypassed.contains("<strong>bypassed</strong>"), "{bypassed}");
 		assert!(ordinary.contains("validated normally"), "{ordinary}");
+	}
+
+	/// Installing the root is the first thing anyone has to do, so the page has
+	/// to offer it — and has to say when installing it would be wasted effort.
+	#[test]
+	fn the_status_page_offers_the_certificate_and_says_which_one_it_is() {
+		let dir = TempDir::new().unwrap();
+
+		let dev = body_of(&call(
+			&internal(&dir),
+			"GET",
+			"https://example.com/.mach5/",
+			"",
+		));
+
+		assert!(dev.contains(r#"href="/.mach5/ca""#), "{dev}");
+		assert!(dev.contains("Settings"), "{dev}");
+		assert!(dev.contains("<strong>This is an ephemeral dev CA</strong>"), "{dev}");
+
+		let loaded = body_of(&call(
+			&internal_with(&dir, loaded_ca()),
+			"GET",
+			"https://example.com/.mach5/",
+			"",
+		));
+
+		assert!(loaded.contains(r#"href="/.mach5/ca""#), "{loaded}");
+		assert!(!loaded.contains("ephemeral"), "a real root is not: {loaded}");
 	}
 
 	/// A selector is a string a page put in the store, so the page it comes back
@@ -1458,6 +1603,7 @@ mod tests {
 			"https://example.com/.mach5/stats.json",
 			"https://example.com/.mach5/hidden.css",
 			"https://example.com/.mach5/mach5.js",
+			"https://example.com/.mach5/ca",
 		] {
 			assert_eq!(call(&internal, "POST", url, "").status, 405, "{url}");
 		}

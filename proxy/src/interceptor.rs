@@ -91,7 +91,14 @@ impl Chain {
 	/// blocklist, the proxy's own endpoints, the page injection, then the
 	/// external plugins in the plugin directory, plus the optional response
 	/// stamp.
-	pub fn from_config(config: &crate::config::Config) -> Self {
+	///
+	/// The certificate authority comes along because the internal endpoints hand
+	/// out its root certificate; both front ends already hold one for the
+	/// handshake, so it is the same CA a device is being asked to trust.
+	pub fn from_config(
+		config: &crate::config::Config,
+		ca: std::sync::Arc<crate::ca::CertAuthority>,
+	) -> Self {
 		let mut links: Vec<Box<dyn Interceptor>> = Vec::new();
 
 		// Ahead of everything, and not configurable: a request carrying our own
@@ -110,7 +117,7 @@ impl Chain {
 		// Before the plugins: a plugin has no business seeing — or answering —
 		// the proxy's own endpoints.
 		if config.internal.enabled {
-			links.push(Box::new(crate::internal::Internal::new(config)));
+			links.push(Box::new(crate::internal::Internal::new(config, ca)));
 		}
 
 		// Before the plugins: a plugin should see the page as the origin wrote

@@ -133,7 +133,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 	let ca = Arc::new(CertAuthority::from_config(&config)?);
 	tcp::spawn(config.clone(), ca.clone())?;
 
-	let mut quic_config = build_quic_config(ca, &config)?;
+	let mut quic_config = build_quic_config(ca.clone(), &config)?;
 	let h3_config = quiche::h3::Config::new()?;
 
 	let mut poll = mio::Poll::new()?;
@@ -143,7 +143,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 		.register(&mut socket, SOCKET, mio::Interest::READABLE)?;
 	let waker = Arc::new(mio::Waker::new(poll.registry(), WAKER)?);
 
-	let (jobs, results) = spawn_workers(config.clone(), waker);
+	let (jobs, results) = spawn_workers(config.clone(), ca, waker);
 	log::info!("listening on {listen} (UDP/QUIC)");
 
 	let max_request_body = config.max_request_body();
@@ -204,6 +204,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn spawn_workers(
 	config: Arc<Config>,
+	ca: Arc<CertAuthority>,
 	waker: Arc<mio::Waker>,
 ) -> (Sender<FetchJob>, Receiver<FetchResult>) {
 	let (job_tx, job_rx) = std::sync::mpsc::channel::<FetchJob>();
@@ -218,11 +219,12 @@ fn spawn_workers(
 		let waker = waker.clone();
 		let agents = agents.clone();
 		let config = config.clone();
+		let ca = ca.clone();
 
 		std::thread::spawn(move || {
 			// Each worker owns its own interceptor chain, so an external plugin
 			// process is never a lock shared across workers.
-			let interceptor: Box<dyn Interceptor> = Box::new(Chain::from_config(&config));
+			let interceptor: Box<dyn Interceptor> = Box::new(Chain::from_config(&config, ca));
 
 			loop {
 				let job = {

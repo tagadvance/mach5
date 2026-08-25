@@ -584,7 +584,8 @@ mod tests {
 	#[test]
 	fn disabled_plugins_are_not_loaded() {
 		let config = Config::from_str("[plugins]\nenabled = false\n").unwrap();
-		let chain = crate::interceptor::Chain::from_config(&config);
+		let ca = std::sync::Arc::new(crate::ca::CertAuthority::generate_dev(&config).unwrap());
+		let chain = crate::interceptor::Chain::from_config(&config, ca);
 
 		// Nothing configured and plugins off: the chain must be a no-op.
 		let mut req = ProxyRequest {

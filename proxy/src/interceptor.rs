@@ -156,11 +156,57 @@ impl Chain {
 	}
 }
 
+/// What the chain has to say about a request before its body has been read.
+pub enum BeforeBody {
+	/// A link answered it outright — a blocked host, or one of the proxy's own
+	/// endpoints. The body was never needed and must not be read.
+	Answered(ProxyResponse),
+	/// Nothing answered yet. Read the body if `from` is short of the end, then
+	/// resume the chain there.
+	Resume { from: usize },
+}
+
+impl Chain {
+	/// Offer the request to every link up to the first one that wants its body.
+	///
+	/// This exists so a blocked request is refused before its upload is read
+	/// rather than after. The blocklist and the proxy's own endpoints decide on
+	/// the URL alone and sit ahead of the plugins, so in practice they answer
+	/// while the body is still on the wire — which is the difference between
+	/// declining a 2GB upload and swallowing it first.
+	pub fn before_body(&self, req: &mut ProxyRequest) -> BeforeBody {
+		for (from, link) in self.links.iter().enumerate() {
+			if link.wants_request_body(req) {
+				return BeforeBody::Resume { from };
+			}
+
+			if let Some(response) = link.on_request(req) {
+				return BeforeBody::Answered(response);
+			}
+		}
+
+		BeforeBody::Resume {
+			from: self.links.len(),
+		}
+	}
+
+	/// How many links there are, so a caller can tell "the chain ran out" from
+	/// "a link is waiting for the body".
+	pub fn len(&self) -> usize {
+		self.links.len()
+	}
+
+	/// Resume the chain at `from`, once the body is where it needs to be.
+	pub fn on_request_from(&self, req: &mut ProxyRequest, from: usize) -> Option<ProxyResponse> {
+		self.links[from..].iter().find_map(|link| link.on_request(req))
+	}
+}
+
 impl Interceptor for Chain {
 	/// Stops at the first link that answers, and hands that response straight
 	/// back untouched by the rest of the chain.
 	fn on_request(&self, req: &mut ProxyRequest) -> Option<ProxyResponse> {
-		self.links.iter().find_map(|link| link.on_request(req))
+		self.on_request_from(req, 0)
 	}
 
 	/// True if anything in the chain wants it, since one interceptor needing
@@ -396,15 +442,72 @@ mod tests {
 		);
 	}
 
+	struct Hungry;
+	impl Interceptor for Hungry {
+		fn wants_request_body(&self, _req: &ProxyRequest) -> bool {
+			true
+		}
+	}
+
+	/// The ordering that keeps a blocked upload from being read: a link needing
+	/// no body gets to answer while the body is still on the wire.
+	#[test]
+	fn a_link_needing_no_body_answers_before_the_body_is_read() {
+		let chain = Chain {
+			links: vec![Box::new(Answer(204)), Box::new(Hungry)],
+		};
+
+		let answer = chain.before_body(&mut request());
+
+		assert!(
+			matches!(answer, BeforeBody::Answered(r) if r.status == 204),
+			"the blocker is ahead of the plugin, so it answers first"
+		);
+	}
+
+	#[test]
+	fn the_chain_resumes_where_the_body_is_wanted() {
+		let called = Arc::new(AtomicBool::new(false));
+		let chain = Chain {
+			links: vec![
+				Box::new(Recorder {
+					called: called.clone(),
+				}),
+				Box::new(Hungry),
+				Box::new(Answer(403)),
+			],
+		};
+		let mut req = request();
+
+		let BeforeBody::Resume { from } = chain.before_body(&mut req) else {
+			panic!("nothing answered, so the chain must resume");
+		};
+
+		assert_eq!(from, 1, "at the first link that wants the body");
+		assert!(called.load(Ordering::SeqCst), "and the one before it ran");
+		assert_eq!(
+			chain.on_request_from(&mut req, from).map(|r| r.status),
+			Some(403),
+			"resuming runs the rest"
+		);
+	}
+
+	#[test]
+	fn a_chain_that_wants_no_body_runs_to_the_end() {
+		let chain = Chain {
+			links: vec![Box::new(Recorder {
+				called: Arc::new(AtomicBool::new(false)),
+			})],
+		};
+
+		assert!(matches!(
+			chain.before_body(&mut request()),
+			BeforeBody::Resume { from } if from == chain.len()
+		));
+	}
+
 	#[test]
 	fn one_link_wanting_the_upload_is_enough() {
-		struct Hungry;
-		impl Interceptor for Hungry {
-			fn wants_request_body(&self, _req: &ProxyRequest) -> bool {
-				true
-			}
-		}
-
 		let chain = Chain {
 			links: vec![
 				Box::new(Recorder {

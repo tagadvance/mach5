@@ -323,20 +323,33 @@ fn fetch_blocking(
 	};
 	let interceptor = borrowed.get();
 
-	let body = match take_upload(&shared.config, interceptor, &mut request, upload) {
+	// Anything that can answer without the body answers first, so a blocked
+	// upload is refused rather than read.
+	let resume = match interceptor.before_body(&mut request) {
+		crate::interceptor::BeforeBody::Answered(response) => {
+			short_circuit(shared, request, response, head_tx);
+
+			return;
+		}
+		crate::interceptor::BeforeBody::Resume { from } => from,
+	};
+
+	let body = match crate::body::take(
+		&shared.config,
+		resume < interceptor.len(),
+		&mut request,
+		upload,
+	) {
 		Ok(body) => body,
-		Err(response) => {
-			let _ = head_tx.send(Outcome::Buffered(response));
+		Err(rejected) => {
+			let _ = head_tx.send(Outcome::Buffered(error_body(rejected.status, rejected.message)));
 
 			return;
 		}
 	};
 
-	if let Some(mut response) = interceptor.on_request(&mut request) {
-		log::info!("short-circuited {} {}", request.method, request.url);
-		apply_alt_svc(&shared.config, &mut response.headers);
-		metrics.bytes_to_client.add(response.body.len() as u64);
-		let _ = head_tx.send(Outcome::Buffered(response));
+	if let Some(response) = interceptor.on_request_from(&mut request, resume) {
+		short_circuit(shared, request, response, head_tx);
 
 		return;
 	}
@@ -535,49 +548,19 @@ fn apply_alt_svc(config: &Config, headers: &mut Vec<(String, String)>) {
 	}
 }
 
-/// Decide what becomes of the upload: read into memory for the interceptors, or
-/// left to stream past them into the upstream request.
-///
-/// Asked before `on_request`, because the answer decides what `on_request` gets
-/// to see. Only the headers are available to decide on, which is all a plugin's
-/// request filter matches against anyway.
-fn take_upload(
-	config: &Config,
-	interceptor: &Chain,
-	request: &mut ProxyRequest,
-	upload: Option<(tokio::sync::mpsc::Receiver<crate::body::Chunk>, Option<u64>)>,
-) -> Result<crate::body::RequestBody, ProxyResponse> {
-	let Some((chunks, length)) = upload else {
-		return Ok(crate::body::RequestBody::None);
-	};
-
-	let mut reader = crate::body::Reader::new(chunks);
-
-	if !interceptor.wants_request_body(request) {
-		return Ok(crate::body::RequestBody::Streaming { reader, length });
-	}
-
-	match crate::body::read_to_cap(&mut reader, config.max_request_body()) {
-		Ok(body) => {
-			request.body = body;
-
-			Ok(crate::body::RequestBody::None)
-		}
-		Err(crate::body::TooLarge::Cap) => {
-			log::warn!(
-				"{} {} wanted in memory but exceeds max_request_body_mb",
-				request.method,
-				request.url
-			);
-
-			Err(error_body(413, "request body too large"))
-		}
-		Err(crate::body::TooLarge::Interrupted(e)) => {
-			log::debug!("upload interrupted for {}: {e}", request.url);
-
-			Err(error_body(400, "request body interrupted"))
-		}
-	}
+/// Serve a response an interceptor produced instead of fetching the origin.
+fn short_circuit(
+	shared: &Shared,
+	request: ProxyRequest,
+	mut response: ProxyResponse,
+	head_tx: tokio::sync::oneshot::Sender<Outcome>,
+) {
+	log::info!("short-circuited {} {}", request.method, request.url);
+	apply_alt_svc(&shared.config, &mut response.headers);
+	crate::metrics::shared()
+		.bytes_to_client
+		.add(response.body.len() as u64);
+	let _ = head_tx.send(Outcome::Buffered(response));
 }
 
 /// Render an upstream failure as a page the person can actually read.

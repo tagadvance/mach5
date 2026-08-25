@@ -51,6 +51,9 @@ struct FetchJob {
 	conn: quiche::ConnectionId<'static>,
 	stream_id: u64,
 	request: ProxyRequest,
+	/// The body still arriving, when there is one, and the length the client
+	/// declared for it.
+	upload: Option<(tokio::sync::mpsc::Receiver<body::Chunk>, Option<u64>)>,
 }
 
 /// A fetched response on its way back to a client, in one of two shapes: a
@@ -101,9 +104,38 @@ struct Client {
 	conn: quiche::Connection,
 	http3: Option<quiche::h3::Connection>,
 	pending: Vec<Pending>,
-	/// Requests whose headers have arrived but whose body is still streaming in,
-	/// keyed by stream id.
-	partial: HashMap<u64, ProxyRequest>,
+	/// Bodies still arriving, keyed by stream id. The request itself went to a
+	/// worker the moment its headers landed; this is the tap still running.
+	uploads: HashMap<u64, Upload>,
+}
+
+/// An upload in flight, between the QUIC stream it arrives on and the worker
+/// reading the other end of its channel.
+struct Upload {
+	chunks: tokio::sync::mpsc::Sender<body::Chunk>,
+	/// Bytes read off the stream that the channel had no room for. The event
+	/// loop must never block, so a full channel parks chunks here instead —
+	/// bounded, because parking without a bound is just buffering again.
+	overflow: VecDeque<body::Chunk>,
+	parked: usize,
+	/// The client has sent everything. The sender is still held until the
+	/// overflow drains, since dropping it is what tells the worker the body
+	/// ended.
+	finished: bool,
+}
+
+impl Upload {
+	/// Whether there is room to read more off the stream. Past this, we simply
+	/// stop reading and QUIC's own flow control tells the client to wait —
+	/// which is the backpressure working, not a stall.
+	fn has_room(&self, cap: usize) -> bool {
+		self.parked < cap
+	}
+
+	fn park(&mut self, chunk: body::Chunk) {
+		self.parked += chunk.len();
+		self.overflow.push_back(chunk);
+	}
 }
 
 type ClientMap = HashMap<quiche::ConnectionId<'static>, Client>;
@@ -151,7 +183,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 	let (jobs, results) = spawn_workers(config.clone(), ca, waker);
 	log::info!("listening on {listen} (UDP/QUIC)");
 
-	let max_request_body = config.max_request_body();
+	let park_cap = config.stream_buffer_bytes();
 	let mut buf = [0u8; 65535];
 	let mut out = vec![0u8; config.quic.max_datagram_size];
 	let mut clients: ClientMap = HashMap::new();
@@ -192,7 +224,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 			client.conn.on_timeout();
 		}
 
-		drive_http3(&h3_config, &mut clients, &jobs, max_request_body);
+		drive_http3(&h3_config, &mut clients, &jobs, park_cap);
 		flush(&socket, &mut out, &mut clients);
 
 		clients.retain(|_, c| {
@@ -229,7 +261,7 @@ fn spawn_workers(
 		std::thread::spawn(move || {
 			// Each worker owns its own interceptor chain, so an external plugin
 			// process is never a lock shared across workers.
-			let interceptor: Box<dyn Interceptor> = Box::new(Chain::from_config(&config, ca));
+			let interceptor = Chain::from_config(&config, ca);
 
 			loop {
 				let job = {
@@ -241,7 +273,7 @@ fn spawn_workers(
 					Err(_) => break, // senders dropped: shut down
 				};
 
-				if handle_job(&agents, &config, &*interceptor, job, &res_tx, &waker).is_err() {
+				if handle_job(&agents, &config, &interceptor, job, &res_tx, &waker).is_err() {
 					break;
 				}
 			}
@@ -260,7 +292,7 @@ fn spawn_workers(
 fn handle_job(
 	agents: &upstream::Agents,
 	config: &Config,
-	interceptor: &dyn Interceptor,
+	interceptor: &Chain,
 	mut job: FetchJob,
 	results: &Sender<FetchResult>,
 	waker: &mio::Waker,
@@ -268,8 +300,35 @@ fn handle_job(
 	let metrics = metrics::shared();
 	metrics.requests.increment();
 
-	// Ahead of `send`, which borrows the job for the rest of this function.
-	let answer = interceptor.on_request(&mut job.request);
+	// All of this is ahead of `send`, which borrows the job for the rest of the
+	// function. Anything that can answer without the body answers first, so a
+	// blocked upload is refused rather than read.
+	let early = interceptor.before_body(&mut job.request);
+	let resume = match early {
+		interceptor::BeforeBody::Answered(response) => {
+			log::info!(
+				"short-circuited {} {}",
+				job.request.method,
+				job.request.url
+			);
+			metrics.bytes_to_client.add(response.body.len() as u64);
+
+			return send_full(results, waker, &job, response);
+		}
+		interceptor::BeforeBody::Resume { from } => from,
+	};
+
+	let upload = body::take(
+		config,
+		resume < interceptor.len(),
+		&mut job.request,
+		job.upload.take(),
+	);
+	let answer = match &upload {
+		Ok(_) => interceptor.on_request_from(&mut job.request, resume),
+		// A body we could not accept is answered instead of forwarded.
+		Err(_) => None,
+	};
 
 	let send = |payload| {
 		results
@@ -284,6 +343,15 @@ fn handle_job(
 		Ok(())
 	};
 
+	let upload = match upload {
+		Ok(upload) => upload,
+		Err(rejected) => {
+			let page = error_response_body(rejected.status, rejected.message);
+
+			return send(Payload::Full(page));
+		}
+	};
+
 	if let Some(response) = answer {
 		log::info!("short-circuited {} {}", job.request.method, job.request.url);
 		metrics.bytes_to_client.add(response.body.len() as u64);
@@ -291,9 +359,7 @@ fn handle_job(
 		return send(Payload::Full(response));
 	}
 
-	// The QUIC front end still reads the body before dispatching, so it always
-	// arrives whole in `job.request.body`. Streaming it is the next commit.
-	let resp = match upstream::call(agents, &job.request, body::RequestBody::None) {
+	let resp = match upstream::call(agents, &job.request, upload) {
 		Ok(resp) => resp,
 		Err(failure) => {
 			let host = host_of(&job.request.url);
@@ -570,7 +636,7 @@ fn recv_packet(
 					conn,
 					http3: None,
 					pending: Vec::new(),
-					partial: HashMap::new(),
+					uploads: HashMap::new(),
 				},
 			);
 
@@ -591,7 +657,7 @@ fn drive_http3(
 	h3_config: &quiche::h3::Config,
 	clients: &mut ClientMap,
 	jobs: &Sender<FetchJob>,
-	max_request_body: usize,
+	park_cap: usize,
 ) {
 	let keys: Vec<_> = clients.keys().cloned().collect();
 
@@ -619,10 +685,9 @@ fn drive_http3(
 			&key,
 			&mut client.conn,
 			http3,
-			&mut client.partial,
-			&mut client.pending,
+			&mut client.uploads,
 			jobs,
-			max_request_body,
+			park_cap,
 		);
 		pump_responses(&mut client.conn, http3, &mut client.pending);
 	}
@@ -632,43 +697,51 @@ fn poll_requests(
 	key: &quiche::ConnectionId<'static>,
 	conn: &mut quiche::Connection,
 	http3: &mut quiche::h3::Connection,
-	partial: &mut HashMap<u64, ProxyRequest>,
-	pending: &mut Vec<Pending>,
+	uploads: &mut HashMap<u64, Upload>,
 	jobs: &Sender<FetchJob>,
-	max_request_body: usize,
+	park_cap: usize,
 ) {
-	let mut buf = [0u8; 16_384];
-
 	loop {
 		match http3.poll(conn) {
 			Ok((stream_id, quiche::h3::Event::Headers { list, more_frames })) => {
 				match build_request(&list) {
-					// No body to wait for: dispatch straight away.
-					Some(request) if !more_frames => dispatch(key, stream_id, request, jobs),
-					// A body (or trailers) follows; hold the request until the
-					// stream finishes so we forward it whole.
-					Some(request) => {
-						partial.insert(stream_id, request);
+					Some((request, _)) if !more_frames => {
+						// No body to wait for.
+						dispatch(key, stream_id, request, None, jobs);
+					}
+					Some((request, length)) => {
+						// A body follows. The request goes to a worker now and
+						// the body follows it down a channel, so a large upload
+						// is never assembled anywhere.
+						let (chunks, receiver) = body::channel();
+						uploads.insert(
+							stream_id,
+							Upload {
+								chunks,
+								overflow: VecDeque::new(),
+								parked: 0,
+								finished: false,
+							},
+						);
+						dispatch(key, stream_id, request, Some((receiver, length)), jobs);
 					}
 					None => log::warn!("stream={stream_id} missing pseudo-headers; ignoring"),
 				}
 			}
-			Ok((stream_id, quiche::h3::Event::Data)) => {
-				if let Err(status) =
-					read_body(http3, conn, stream_id, partial, &mut buf, max_request_body)
-				{
-					partial.remove(&stream_id);
-					pending.push(error_response(stream_id, status, "request body too large"));
-				}
-			}
+			// Data is drained below rather than here: the same work has to
+			// happen on passes where no event fires, because a full channel
+			// leaves bytes on the stream that nothing else would come back for.
+			Ok((_, quiche::h3::Event::Data)) => {}
 			Ok((stream_id, quiche::h3::Event::Finished)) => {
-				if let Some(request) = partial.remove(&stream_id) {
-					dispatch(key, stream_id, request, jobs);
+				if let Some(upload) = uploads.get_mut(&stream_id) {
+					upload.finished = true;
 				}
 			}
 			Ok((stream_id, quiche::h3::Event::Reset(code))) => {
 				log::debug!("stream={stream_id} reset by peer (code {code})");
-				partial.remove(&stream_id);
+				// Dropping the sender ends the worker's body early, which is
+				// the truth: the client stopped sending.
+				uploads.remove(&stream_id);
 			}
 			Ok((_, quiche::h3::Event::PriorityUpdate)) => {}
 			Ok((_, quiche::h3::Event::GoAway)) => {}
@@ -680,91 +753,156 @@ fn poll_requests(
 			}
 		}
 	}
+
+	pump_uploads(conn, http3, uploads, park_cap);
 }
 
-/// Drain the body bytes currently readable on `stream_id` into its pending
-/// request. Errs with an HTTP status when the body exceeds [`MAX_REQUEST_BODY`].
-fn read_body(
-	http3: &mut quiche::h3::Connection,
+/// Move body bytes from the QUIC streams towards the workers.
+///
+/// Runs every pass rather than only on a `Data` event. Reading stops as soon as
+/// the channel and its overflow are full, and quiche does not promise to raise
+/// another event for bytes that were already readable — so waiting for one
+/// would strand an upload half-sent.
+fn pump_uploads(
 	conn: &mut quiche::Connection,
-	stream_id: u64,
-	partial: &mut HashMap<u64, ProxyRequest>,
-	buf: &mut [u8],
-	max_request_body: usize,
-) -> Result<(), u16> {
-	loop {
-		let read = match http3.recv_body(conn, stream_id, buf) {
-			Ok(0) => return Ok(()),
-			Ok(n) => n,
-			Err(quiche::h3::Error::Done) => return Ok(()),
-			Err(e) => {
-				log::debug!("recv_body on stream={stream_id} failed: {e}");
+	http3: &mut quiche::h3::Connection,
+	uploads: &mut HashMap<u64, Upload>,
+	park_cap: usize,
+) {
+	let mut buf = [0u8; 16_384];
+	let mut done = Vec::new();
 
-				return Ok(());
+	for (&stream_id, upload) in uploads.iter_mut() {
+		// Whatever was parked goes first, or the body would arrive reordered.
+		let mut closed = false;
+		while let Some(chunk) = upload.overflow.pop_front() {
+			let size = chunk.len();
+			match upload.chunks.try_send(chunk) {
+				Ok(()) => upload.parked -= size,
+				Err(tokio::sync::mpsc::error::TrySendError::Full(chunk)) => {
+					upload.overflow.push_front(chunk);
+
+					break;
+				}
+				Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+					closed = true;
+
+					break;
+				}
 			}
-		};
+		}
 
-		// Body bytes on a stream we are not tracking (e.g. already rejected):
-		// keep draining so the stream does not stall, but discard them.
-		let Some(request) = partial.get_mut(&stream_id) else {
+		if closed {
+			done.push(stream_id);
+
 			continue;
-		};
+		}
 
-		if !append_bounded(&mut request.body, &buf[..read], max_request_body) {
-			log::warn!("stream={stream_id} body exceeds {max_request_body} bytes; rejecting");
+		let mut drained = false;
+		while upload.has_room(park_cap) {
+			let read = match http3.recv_body(conn, stream_id, &mut buf) {
+				Ok(0) => {
+					drained = true;
 
-			return Err(413);
+					break;
+				}
+				Ok(n) => n,
+				Err(quiche::h3::Error::Done) => {
+					drained = true;
+
+					break;
+				}
+				Err(e) => {
+					log::debug!("recv_body on stream={stream_id} failed: {e}");
+					done.push(stream_id);
+
+					break;
+				}
+			};
+
+			match upload.chunks.try_send(buf[..read].to_vec()) {
+				Ok(()) => {}
+				Err(tokio::sync::mpsc::error::TrySendError::Full(chunk)) => upload.park(chunk),
+				Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+					// The worker is finished with this body — it short-circuited,
+					// or the fetch failed. Stop carrying bytes nobody wants.
+					done.push(stream_id);
+
+					break;
+				}
+			}
+		}
+
+		// Only once the client has finished *and* everything it sent has been
+		// handed on: dropping the sender is what ends the body.
+		if upload.finished && drained && upload.overflow.is_empty() {
+			done.push(stream_id);
 		}
 	}
-}
 
-/// Append `chunk` to `body`, refusing rather than growing past `cap`. Guards
-/// against a client exhausting memory with an endless body.
-fn append_bounded(body: &mut Vec<u8>, chunk: &[u8], cap: usize) -> bool {
-	if body.len() + chunk.len() > cap {
-		return false;
+	for stream_id in done {
+		uploads.remove(&stream_id);
 	}
-
-	body.extend_from_slice(chunk);
-
-	true
 }
 
 fn dispatch(
 	key: &quiche::ConnectionId<'static>,
 	stream_id: u64,
 	request: ProxyRequest,
+	upload: Option<(tokio::sync::mpsc::Receiver<body::Chunk>, Option<u64>)>,
 	jobs: &Sender<FetchJob>,
 ) {
 	log::info!(
-		"proxying stream={stream_id} {} {} ({} body bytes)",
+		"proxying stream={stream_id} {} {}{}",
 		request.method,
 		request.url,
-		request.body.len()
+		if upload.is_some() {
+			" (body streaming)"
+		} else {
+			""
+		}
 	);
 
 	let job = FetchJob {
 		conn: key.clone(),
 		stream_id,
 		request,
+		upload,
 	};
 	if jobs.send(job).is_err() {
 		log::error!("worker pool is gone; cannot dispatch request");
 	}
 }
 
-fn error_response(stream_id: u64, status: u16, message: &str) -> Pending {
-	Pending {
-		stream_id,
+/// A plain refusal, for a request that never reaches an origin.
+/// Send one complete response back to the event loop. Used where the borrow of
+/// the job has not yet been handed to the closure that usually does this.
+fn send_full(
+	results: &Sender<FetchResult>,
+	waker: &mio::Waker,
+	job: &FetchJob,
+	response: ProxyResponse,
+) -> Result<(), ()> {
+	results
+		.send(FetchResult {
+			conn: job.conn.clone(),
+			stream_id: job.stream_id,
+			payload: Payload::Full(response),
+		})
+		.map_err(|_| ())?;
+	let _ = waker.wake();
+
+	Ok(())
+}
+
+fn error_response_body(status: u16, message: &str) -> ProxyResponse {
+	ProxyResponse {
 		status,
 		headers: vec![("content-type".to_string(), "text/plain".to_string())],
-		headers_sent: false,
-		chunks: VecDeque::from([format!("mach5: {message}\n").into_bytes()]),
-		offset: 0,
-		complete: true,
-		fin_sent: false,
+		body: format!("mach5: {message}\n").into_bytes(),
 	}
 }
+
 
 /// Send as much of each pending response as the streams will currently accept,
 /// keeping whatever is left for the next pass.
@@ -888,15 +1026,22 @@ fn flush(socket: &mio::net::UdpSocket, out: &mut [u8], clients: &mut ClientMap) 
 
 /// Build the upstream request from a request's pseudo-headers. Returns None if
 /// the mandatory pseudo-headers are absent.
-fn build_request(list: &[quiche::h3::Header]) -> Option<ProxyRequest> {
+/// The request, and the body length the client declared for it — kept because
+/// the hop-by-hop filter drops `content-length`, and passing it upstream is
+/// what keeps an upload out of chunked encoding.
+fn build_request(list: &[quiche::h3::Header]) -> Option<(ProxyRequest, Option<u64>)> {
 	let mut method = None;
 	let mut authority = None;
 	let mut path = None;
 	let mut scheme = None;
+	let mut length = None;
 	let mut headers = Vec::new();
 
 	for h in list {
 		let value = String::from_utf8_lossy(h.value()).into_owned();
+		if h.name().eq_ignore_ascii_case(b"content-length") {
+			length = value.parse::<u64>().ok();
+		}
 		match h.name() {
 			b":method" => method = Some(value),
 			b":authority" => authority = Some(value),
@@ -917,12 +1062,15 @@ fn build_request(list: &[quiche::h3::Header]) -> Option<ProxyRequest> {
 	// SO_ORIGINAL_DST to preserve nonstandard ports.
 	let url = format!("{scheme}://{}{}", authority_host(&authority?), path?);
 
-	Some(ProxyRequest {
-		method: method?,
-		url,
-		headers,
-		body: Vec::new(),
-	})
+	Some((
+		ProxyRequest {
+			method: method?,
+			url,
+			headers,
+			body: Vec::new(),
+		},
+		length,
+	))
 }
 
 /// Host portion of an `:authority`, dropping any `:port` and keeping an IPv6
@@ -1043,30 +1191,13 @@ mod tests {
 			quiche::h3::Header::new(b"connection", b"keep-alive"),
 		];
 
-		let req = build_request(&list).expect("should parse");
+		let (req, length) = build_request(&list).expect("should parse");
 
+		assert_eq!(length, None, "a GET declares no body length");
 		assert_eq!(req.method, "GET");
 		assert_eq!(req.url, "https://example.com/index.html");
 		// host (ureq sets it) and hop-by-hop headers are dropped; user-agent kept.
 		assert_eq!(req.headers, vec![("user-agent".to_string(), "curl".to_string())]);
-	}
-
-	#[test]
-	fn append_bounded_accepts_up_to_cap() {
-		let mut body = Vec::new();
-
-		assert!(append_bounded(&mut body, b"abc", 6));
-		assert!(append_bounded(&mut body, b"def", 6), "exact fit is allowed");
-		assert_eq!(body, b"abcdef");
-	}
-
-	#[test]
-	fn append_bounded_rejects_overflow_without_growing() {
-		let mut body = Vec::new();
-		append_bounded(&mut body, b"abcde", 6);
-
-		assert!(!append_bounded(&mut body, b"xy", 6));
-		assert_eq!(body, b"abcde", "rejected chunk must not be appended");
 	}
 
 	#[test]

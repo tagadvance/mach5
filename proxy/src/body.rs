@@ -117,6 +117,63 @@ pub fn read_to_cap(reader: &mut impl Read, cap: usize) -> Result<Vec<u8>, TooLar
 	}
 }
 
+/// Decide what becomes of an upload: read into memory for the interceptors, or
+/// left to stream past them into the upstream request.
+///
+/// `wanted` comes from [`crate::interceptor::Chain::before_body`], which has
+/// already offered the request to every link that needs no body — so anything
+/// arriving here is genuinely on its way upstream.
+pub fn take(
+	config: &crate::config::Config,
+	wanted: bool,
+	request: &mut crate::interceptor::ProxyRequest,
+	upload: Option<(Receiver<Chunk>, Option<u64>)>,
+) -> Result<RequestBody, Rejected> {
+	let Some((chunks, length)) = upload else {
+		return Ok(RequestBody::None);
+	};
+
+	let mut reader = Reader::new(chunks);
+
+	if !wanted {
+		return Ok(RequestBody::Streaming { reader, length });
+	}
+
+	match read_to_cap(&mut reader, config.max_request_body()) {
+		Ok(body) => {
+			request.body = body;
+
+			Ok(RequestBody::None)
+		}
+		Err(TooLarge::Cap) => {
+			log::warn!(
+				"{} {} is wanted in memory but exceeds max_request_body_mb",
+				request.method,
+				request.url
+			);
+
+			Err(Rejected {
+				status: 413,
+				message: "request body too large",
+			})
+		}
+		Err(TooLarge::Interrupted(e)) => {
+			log::debug!("upload interrupted for {}: {e}", request.url);
+
+			Err(Rejected {
+				status: 400,
+				message: "request body interrupted",
+			})
+		}
+	}
+}
+
+/// Why an upload was refused, for whichever front end has to render it.
+pub struct Rejected {
+	pub status: u16,
+	pub message: &'static str,
+}
+
 pub enum TooLarge {
 	Cap,
 	Interrupted(std::io::Error),

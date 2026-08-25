@@ -477,6 +477,12 @@ impl Config {
 		self.limits.worker_threads.resolve()
 	}
 
+	/// The backpressure bound in bytes: how much of a body may sit in memory
+	/// between the wire and whatever is consuming it.
+	pub fn stream_buffer_bytes(&self) -> usize {
+		self.limits.stream_buffer_mb * 1024 * 1024
+	}
+
 	/// Streaming backpressure expressed as a number of in-flight chunks.
 	pub fn stream_buffer_chunks(&self, chunk_size: usize) -> usize {
 		((self.limits.stream_buffer_mb * 1024 * 1024) / chunk_size).max(1)

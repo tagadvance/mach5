@@ -538,6 +538,7 @@ fn status_page(
 	let upstream_failures = metrics::thousands(counted.upstream_failures);
 	let from_origin = metrics::bytes(counted.bytes_from_origin);
 	let to_client = metrics::bytes(counted.bytes_to_client);
+	let saved = metrics::bytes(counted.bytes_saved_by_compression);
 	let certificates = if bypassed {
 		"<p>Certificate validation is <strong>bypassed</strong> for this site until \
 		 the bypass expires.</p>"
@@ -570,6 +571,7 @@ fn status_page(
     <tr><th>Other upstream failures</th><td>{upstream_failures}</td></tr>
     <tr><th>Body bytes from origins</th><td>{from_origin}</td></tr>
     <tr><th>Body bytes to clients</th><td>{to_client}</td></tr>
+    <tr><th>Bytes saved compressing</th><td>{saved}</td></tr>
   </table>
   <h2>{host}</h2>
   {certificates}
@@ -1267,6 +1269,7 @@ mod tests {
 		let internal = internal(&dir);
 		internal.metrics.blocked.add(3);
 		internal.metrics.bytes_to_client.add(2048);
+		internal.metrics.bytes_saved_by_compression.add(6144);
 
 		let response = call(
 			&internal,
@@ -1289,6 +1292,7 @@ mod tests {
 
 		assert_eq!(stats["blocked"], 3);
 		assert_eq!(stats["bytes_to_client"], 2048);
+		assert_eq!(stats["bytes_saved_by_compression"], 6144);
 		assert_eq!(stats["internal"], 1, "this very request");
 		assert!(stats["uptime_seconds"].is_u64());
 	}

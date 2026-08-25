@@ -19,6 +19,10 @@ key = "security/mach5_root.pem"
 alt_svc = 'h3=":443"; ma=86400'
 keep_alive = true
 idle_timeout_seconds = 60
+# Compress a buffered body an origin sent in the clear, when the client accepts
+# a coding we can produce. Text only, and only above a kilobyte — a JPEG would
+# just get bigger.
+compress = true
 
 [paths]
 # A named volume, so re-encoded assets survive a container restart.

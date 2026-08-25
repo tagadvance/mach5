@@ -66,6 +66,9 @@ pub struct Http {
 	pub keep_alive: bool,
 	/// How long to wait for a request on an idle kept-alive connection.
 	pub idle_timeout_seconds: u64,
+	/// Compress a buffered body the origin sent uncompressed, when the client
+	/// accepts a coding we can produce. Free bytes on the one hop we control.
+	pub compress: bool,
 }
 
 impl Default for Http {
@@ -74,6 +77,7 @@ impl Default for Http {
 			alt_svc: r#"h3=":4433"; ma=86400"#.to_string(),
 			keep_alive: true,
 			idle_timeout_seconds: 60,
+			compress: true,
 		}
 	}
 }
@@ -538,6 +542,17 @@ mod tests {
 			"a wiped cache must not take someone's selectors with it"
 		);
 		assert!(config.internal.enabled, "the endpoints are on by default");
+	}
+
+	#[test]
+	fn compression_is_on_unless_it_is_turned_off() {
+		assert!(Config::default().http.compress);
+		assert!(Config::from_str("").unwrap().http.compress);
+
+		let off = Config::from_str("[http]\ncompress = false\n").unwrap();
+
+		assert!(!off.http.compress);
+		assert!(off.http.keep_alive, "an unrelated default is untouched");
 	}
 
 	#[test]

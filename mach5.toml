@@ -21,6 +21,11 @@ listen_tcp = "0.0.0.0:4443"
 alt_svc = 'h3=":4433"; ma=86400'
 keep_alive = true
 idle_timeout_seconds = 60
+# Compress a buffered body an origin sent in the clear, when the client accepts
+# a coding we can produce. Text only, and only above a kilobyte — a JPEG would
+# just get bigger. Streamed bodies are relayed with whatever coding they arrived
+# in, whether this is on or off.
+compress = true
 
 [ca]
 # Root CA used to sign leaves minted per SNI host. Leave both unset to generate

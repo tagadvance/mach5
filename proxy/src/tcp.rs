@@ -337,6 +337,19 @@ fn fetch_blocking(
 		};
 		interceptor.on_response(&request, &mut response);
 		response.body = encoding::encode(&mut response.headers, response.body, coding);
+		if shared.config.http.compress {
+			let plain = response.body.len();
+			response.body = encoding::ensure_compressed(
+				&request.headers,
+				response.status,
+				&mut response.headers,
+				response.body,
+				coding,
+			);
+			metrics
+				.bytes_saved_by_compression
+				.add(plain.saturating_sub(response.body.len()) as u64);
+		}
 		apply_alt_svc(&shared.config, &mut response.headers);
 		metrics.bytes_to_client.add(response.body.len() as u64);
 		let _ = head_tx.send(Outcome::Buffered(response));
@@ -344,6 +357,9 @@ fn fetch_blocking(
 		return;
 	}
 
+	// Nothing wants the body: relay it as it arrives. Deliberately not a place
+	// to compress — the coding here is whatever the origin chose, and we never
+	// hold enough of the body to know what a different one would cost.
 	interceptor.on_response_head(&request, &mut head);
 	apply_alt_svc(&shared.config, &mut head.headers);
 	// Asked once, before the head is handed off: the answer holds for the whole

@@ -65,6 +65,10 @@ pub struct Metrics {
 	/// Response body bytes sent to clients. Differs from the above whenever an
 	/// interceptor rewrote a body — which is the point of counting both.
 	pub bytes_to_client: Counter,
+	/// Bytes `bytes_to_client` does not contain because we compressed a body
+	/// the origin left in the clear: what the client would have had to read
+	/// otherwise.
+	pub bytes_saved_by_compression: Counter,
 }
 
 /// `Instant::now` is why this is written out rather than derived.
@@ -81,6 +85,7 @@ impl Default for Metrics {
 			upstream_failures: Counter::default(),
 			bytes_from_origin: Counter::default(),
 			bytes_to_client: Counter::default(),
+			bytes_saved_by_compression: Counter::default(),
 		}
 	}
 }
@@ -107,6 +112,7 @@ impl Metrics {
 			upstream_failures: self.upstream_failures.get(),
 			bytes_from_origin: self.bytes_from_origin.get(),
 			bytes_to_client: self.bytes_to_client.get(),
+			bytes_saved_by_compression: self.bytes_saved_by_compression.get(),
 		}
 	}
 }
@@ -125,6 +131,7 @@ pub struct Snapshot {
 	pub upstream_failures: u64,
 	pub bytes_from_origin: u64,
 	pub bytes_to_client: u64,
+	pub bytes_saved_by_compression: u64,
 }
 
 /// One set per process, exactly as [`crate::blocklist::shared`] does it. Both
@@ -224,6 +231,7 @@ mod tests {
 		metrics.upstream_failures.add(1);
 		metrics.bytes_from_origin.add(1000);
 		metrics.bytes_to_client.add(1200);
+		metrics.bytes_saved_by_compression.add(800);
 
 		let json = serde_json::to_value(metrics.snapshot()).unwrap();
 
@@ -236,7 +244,26 @@ mod tests {
 		assert_eq!(json["upstream_failures"], 1);
 		assert_eq!(json["bytes_from_origin"], 1000);
 		assert_eq!(json["bytes_to_client"], 1200);
+		assert_eq!(json["bytes_saved_by_compression"], 800);
 		assert!(json["uptime_seconds"].is_u64());
+	}
+
+	#[test]
+	fn saved_bytes_are_the_difference_compression_made() {
+		let metrics = Metrics::default();
+		let plain = 4096u64;
+		let compressed = 1024u64;
+
+		metrics.bytes_to_client.add(compressed);
+		metrics.bytes_saved_by_compression.add(plain - compressed);
+
+		assert_eq!(metrics.bytes_saved_by_compression.get(), 3072);
+		assert_eq!(
+			metrics.bytes_to_client.get() + metrics.bytes_saved_by_compression.get(),
+			plain,
+			"the two together are what the origin gave us"
+		);
+		assert_eq!(bytes(metrics.bytes_saved_by_compression.get()), "3.0 KB");
 	}
 
 	#[test]

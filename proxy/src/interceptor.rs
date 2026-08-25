@@ -68,9 +68,9 @@ pub struct Chain {
 }
 
 impl Chain {
-	/// Build the chain described by the configuration: the blocklist, then the
-	/// external plugins in the plugin directory, plus the optional response
-	/// stamp.
+	/// Build the chain described by the configuration: the blocklist, the
+	/// proxy's own endpoints, then the external plugins in the plugin
+	/// directory, plus the optional response stamp.
 	pub fn from_config(config: &crate::config::Config) -> Self {
 		let mut links: Vec<Box<dyn Interceptor>> = Vec::new();
 
@@ -80,6 +80,12 @@ impl Chain {
 			if !blocklist.is_empty() {
 				links.push(Box::new(blocklist));
 			}
+		}
+
+		// Before the plugins: a plugin has no business seeing — or answering —
+		// the proxy's own endpoints.
+		if config.internal.enabled {
+			links.push(Box::new(crate::internal::Internal::new(config)));
 		}
 
 		if config.plugins.enabled {
@@ -243,6 +249,27 @@ mod tests {
 			"links after the one that answered must not run"
 		);
 		assert_eq!(req.url, "https://example.com/", "and must not rewrite it");
+	}
+
+	/// The default is deliberately "buffer", so a link that forgets to answer
+	/// still works. The cost is that every request-only link must opt out by
+	/// hand or it switches off streaming for the whole proxy.
+	#[test]
+	fn a_link_that_forgets_to_answer_still_buffers() {
+		let chain = Chain {
+			links: vec![Box::new(Recorder {
+				called: Arc::new(AtomicBool::new(false)),
+			})],
+		};
+		let head = ResponseHead {
+			status: 200,
+			headers: vec![("content-type".to_string(), "video/mp4".to_string())],
+		};
+
+		assert!(
+			chain.wants_body(&request(), &head),
+			"a link that forgets to answer still buffers, by design"
+		);
 	}
 
 	#[test]

@@ -25,6 +25,9 @@ services:
       # The root CA. Read-only, and never baked into the image.
       - ./security:/etc/mach5/security:ro
       - mach5-cache:/var/cache/mach5
+      # Hidden-element selectors and anything else someone builds up by hand.
+      # Not the cache volume: this is the one you would miss.
+      - mach5-state:/var/lib/mach5
 
     environment:
       # info is a reasonable default; RUST_LOG=debug for handshake detail.
@@ -39,3 +42,4 @@ services:
 
 volumes:
   mach5-cache:
+  mach5-state:

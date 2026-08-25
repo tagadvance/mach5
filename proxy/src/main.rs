@@ -11,6 +11,7 @@ mod ca;
 mod config;
 mod encoding;
 mod interceptor;
+mod internal;
 mod interstitial;
 mod plugin;
 mod tcp;
@@ -111,6 +112,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 		log::warn!(
 			"could not create cache dir {}: {e}",
 			config.paths.cache_dir.display()
+		);
+	}
+
+	if let Err(e) = std::fs::create_dir_all(&config.paths.state_dir) {
+		log::warn!(
+			"could not create state dir {}: {e}",
+			config.paths.state_dir.display()
 		);
 	}
 

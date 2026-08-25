@@ -23,6 +23,11 @@ idle_timeout_seconds = 60
 [paths]
 # A named volume, so re-encoded assets survive a container restart.
 cache_dir = "/var/cache/mach5"
+# Where data someone actually typed is kept — hidden-element selectors, so far.
+# Deliberately not the cache: a cache may be wiped at any moment, and losing a
+# list built up by hand is a different kind of loss to re-encoding an image.
+# This needs a writable volume of its own, or every restart forgets it.
+state_dir = "/var/lib/mach5"
 
 [plugins]
 dir = "plugins"
@@ -44,6 +49,19 @@ enabled = true
 # files = ["/etc/mach5/lists/hosts"]
 # Never blocked, whatever the lists say. Covers subdomains too.
 # allow = ["example.com"]
+
+[internal]
+# The proxy's own endpoints, under `/.mach5/` on every origin at once. Because
+# the deployment answers every DNS query with the proxy's address, a relative
+# URL on any page reaches us — which is somewhere to host endpoints of our own
+# without owning a domain, and without a page making a cross-origin request.
+#
+# So far that means the per-site list of elements to hide: a cosmetic filter
+# that lives here rather than in the blocklist, which deliberately stops at
+# domain matching. What is stored is keyed by the host the client asked for, so
+# one site can never read or write another's list. Kept in
+# `<state_dir>/hidden.json`, so state_dir above must be writable.
+enabled = true
 
 [tls]
 leaf_ttl_hours = 24

@@ -28,6 +28,7 @@ pub struct Config {
 	pub paths: Paths,
 	pub plugins: Plugins,
 	pub blocklist: Blocklist,
+	pub internal: Internal,
 	pub tls: Tls,
 	pub limits: Limits,
 	pub quic: Quic,
@@ -90,12 +91,18 @@ pub struct Ca {
 pub struct Paths {
 	/// Scratch space for cached artifacts (re-encoded assets and the like).
 	pub cache_dir: PathBuf,
+	/// Where data someone actually typed is kept — the hidden-element
+	/// selectors, so far. Deliberately not under `cache_dir`: a cache may be
+	/// wiped at any moment, and losing a list built up by hand is not the same
+	/// kind of loss as re-encoding an image again.
+	pub state_dir: PathBuf,
 }
 
 impl Default for Paths {
 	fn default() -> Self {
 		Self {
 			cache_dir: default_cache_dir(),
+			state_dir: default_state_dir(),
 		}
 	}
 }
@@ -140,6 +147,19 @@ impl Default for Blocklist {
 			files: Vec::new(),
 			allow: Vec::new(),
 		}
+	}
+}
+
+/// The proxy's own endpoints, served under `/.mach5/` on every origin at once.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Internal {
+	pub enabled: bool,
+}
+
+impl Default for Internal {
+	fn default() -> Self {
+		Self { enabled: true }
 	}
 }
 
@@ -329,6 +349,7 @@ impl Config {
 		self.ca.cert = self.ca.cert.take().map(|p| expand_tilde(&p));
 		self.ca.key = self.ca.key.take().map(|p| expand_tilde(&p));
 		self.paths.cache_dir = expand_tilde(&self.paths.cache_dir);
+		self.paths.state_dir = expand_tilde(&self.paths.state_dir);
 		self.plugins.dir = expand_tilde(&self.plugins.dir);
 		for file in &mut self.blocklist.files {
 			*file = expand_tilde(file);
@@ -377,6 +398,15 @@ fn default_cache_dir() -> PathBuf {
 	std::env::var_os("XDG_CACHE_HOME")
 		.map(PathBuf::from)
 		.unwrap_or_else(|| home().join(".cache"))
+		.join("mach5")
+}
+
+/// Where the XDG base directory spec puts data that is not a cache and not
+/// configuration.
+fn default_state_dir() -> PathBuf {
+	std::env::var_os("XDG_DATA_HOME")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| home().join(".local").join("share"))
 		.join("mach5")
 }
 
@@ -447,6 +477,19 @@ mod tests {
 
 		assert_eq!(config.blocklist.files, vec![home().join("lists/hosts")]);
 		assert!(config.blocklist.enabled, "a list with no files is a no-op");
+	}
+
+	#[test]
+	fn state_is_kept_apart_from_the_cache() {
+		let config = Config::from_str("[paths]\nstate_dir = \"~/state\"\n").unwrap();
+
+		assert_eq!(config.paths.state_dir, home().join("state"));
+		assert_ne!(
+			Config::default().paths.state_dir,
+			Config::default().paths.cache_dir,
+			"a wiped cache must not take someone's selectors with it"
+		);
+		assert!(config.internal.enabled, "the endpoints are on by default");
 	}
 
 	#[test]

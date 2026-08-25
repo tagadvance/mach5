@@ -39,8 +39,10 @@ RUN apt-get update \
 RUN useradd --system --create-home --uid 10001 mach5
 
 # Owned up front so the unprivileged user can write here even when no volume is
-# mounted over it.
-RUN mkdir -p /var/cache/mach5 && chown mach5:mach5 /var/cache/mach5
+# mounted over it. The state dir is separate from the cache on purpose: it holds
+# what someone typed, and a cache is something you throw away.
+RUN mkdir -p /var/cache/mach5 /var/lib/mach5 \
+	&& chown mach5:mach5 /var/cache/mach5 /var/lib/mach5
 
 COPY --from=builder /build/target/release/mach5-proxy /usr/local/bin/mach5-proxy
 

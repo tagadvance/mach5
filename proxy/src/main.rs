@@ -7,6 +7,7 @@
 //! never stalls the single-threaded QUIC event loop.
 
 mod blocklist;
+mod body;
 mod ca;
 mod config;
 mod cosmetic;
@@ -290,7 +291,9 @@ fn handle_job(
 		return send(Payload::Full(response));
 	}
 
-	let resp = match upstream::call(agents, &job.request) {
+	// The QUIC front end still reads the body before dispatching, so it always
+	// arrives whole in `job.request.body`. Streaming it is the next commit.
+	let resp = match upstream::call(agents, &job.request, body::RequestBody::None) {
 		Ok(resp) => resp,
 		Err(failure) => {
 			let host = host_of(&job.request.url);

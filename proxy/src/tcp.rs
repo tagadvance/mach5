@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use boring::ssl::{AlpnError, NameType, SslAcceptor, SslMethod};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
-use hyper::body::{Frame, Incoming};
+use hyper::body::{Body, Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -234,10 +234,43 @@ async fn serve(
 }
 
 async fn handle(shared: Arc<Shared>, sni: Option<String>, req: Request<Incoming>) -> Response<BoxBody> {
-	let request = match to_proxy_request(&shared.config, sni, req).await {
-		Ok(request) => request,
+	let (request, incoming, length) = match to_proxy_request(sni, req) {
+		Ok(parts) => parts,
 		Err(status) => return simple(status, "mach5: malformed request\n"),
 	};
+
+	// An upload is pumped into a bounded channel by this task while the worker
+	// reads the other end. Nothing here awaits the whole body, so an upload is
+	// never held in memory on the way past — and a worker that stops reading
+	// fills the channel, which stops us taking bytes off the client.
+	let upload = (!incoming.is_end_stream() && length != Some(0)).then(|| {
+		let (chunks_tx, chunks_rx) = crate::body::channel();
+
+		tokio::spawn(async move {
+			let mut incoming = incoming;
+			while let Some(frame) = incoming.frame().await {
+				let Ok(frame) = frame else {
+					// A client that dies mid-upload closes the channel by
+					// dropping this sender, which the worker reads as an end.
+					break;
+				};
+				let Ok(data) = frame.into_data() else {
+					// Trailers; nothing upstream is waiting for them.
+					continue;
+				};
+				if data.is_empty() {
+					continue;
+				}
+				if chunks_tx.send(data.to_vec()).await.is_err() {
+					// The worker is done with the body — short-circuited, or
+					// the fetch failed. Stop reading the client.
+					break;
+				}
+			}
+		});
+
+		(chunks_rx, length)
+	});
 
 	// Everything past here blocks: plugin subprocesses and the upstream fetch.
 	let (head_tx, head_rx) = tokio::sync::oneshot::channel();
@@ -245,7 +278,7 @@ async fn handle(shared: Arc<Shared>, sni: Option<String>, req: Request<Incoming>
 	let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(chunk_capacity);
 
 	tokio::task::spawn_blocking(move || {
-		fetch_blocking(&shared, request, head_tx, body_tx);
+		fetch_blocking(&shared, request, upload, head_tx, body_tx);
 	});
 
 	match head_rx.await {
@@ -276,6 +309,7 @@ enum Outcome {
 fn fetch_blocking(
 	shared: &Shared,
 	mut request: ProxyRequest,
+	upload: Option<(tokio::sync::mpsc::Receiver<crate::body::Chunk>, Option<u64>)>,
 	head_tx: tokio::sync::oneshot::Sender<Outcome>,
 	body_tx: tokio::sync::mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
 ) {
@@ -288,6 +322,15 @@ fn fetch_blocking(
 		return;
 	};
 	let interceptor = borrowed.get();
+
+	let body = match take_upload(&shared.config, interceptor, &mut request, upload) {
+		Ok(body) => body,
+		Err(response) => {
+			let _ = head_tx.send(Outcome::Buffered(response));
+
+			return;
+		}
+	};
 
 	if let Some(mut response) = interceptor.on_request(&mut request) {
 		log::info!("short-circuited {} {}", request.method, request.url);
@@ -305,7 +348,7 @@ fn fetch_blocking(
 		request.body.len()
 	);
 
-	let resp = match upstream::call(&shared.agents, &request) {
+	let resp = match upstream::call(&shared.agents, &request, body) {
 		Ok(resp) => resp,
 		Err(failure) => {
 			let page = failure_page(&shared.config, &request, &failure);
@@ -412,12 +455,22 @@ fn fetch_blocking(
 	}
 }
 
-async fn to_proxy_request(
-	config: &Config,
+/// Split the incoming request into what the interceptors see and the body still
+/// arriving behind it. The body is deliberately not read here: whether it is
+/// held in memory at all is the worker's decision, and this is the async side.
+fn to_proxy_request(
 	sni: Option<String>,
 	req: Request<Incoming>,
-) -> Result<ProxyRequest, u16> {
+) -> Result<(ProxyRequest, Incoming, Option<u64>), u16> {
 	let (parts, body) = req.into_parts();
+
+	// Kept before the hop-by-hop filter drops it: it is how the upstream
+	// request can use the same framing the client did.
+	let length = parts
+		.headers
+		.get(hyper::header::CONTENT_LENGTH)
+		.and_then(|value| value.to_str().ok())
+		.and_then(|value| value.parse::<u64>().ok());
 
 	let mut headers = Vec::new();
 	let mut host = None;
@@ -442,24 +495,22 @@ async fn to_proxy_request(
 		.or(host)
 		.ok_or(400u16)?;
 
-	// hyper has already decoded chunked encoding by the time we see this.
-	let collected = body.collect().await.map_err(|_| 400u16)?.to_bytes();
-	if collected.len() > config.max_request_body() {
-		return Err(413);
-	}
-
 	let path = parts
 		.uri
 		.path_and_query()
 		.map(|p| p.as_str())
 		.unwrap_or("/");
 
-	Ok(ProxyRequest {
-		method: parts.method.as_str().to_string(),
-		url: format!("https://{}{path}", crate::authority_host(&authority)),
-		headers,
-		body: collected.to_vec(),
-	})
+	Ok((
+		ProxyRequest {
+			method: parts.method.as_str().to_string(),
+			url: format!("https://{}{path}", crate::authority_host(&authority)),
+			headers,
+			body: Vec::new(),
+		},
+		body,
+		length,
+	))
 }
 
 fn build_response(response: ProxyResponse) -> Response<BoxBody> {
@@ -481,6 +532,51 @@ fn apply_alt_svc(config: &Config, headers: &mut Vec<(String, String)>) {
 
 	if !config.http.alt_svc.is_empty() {
 		headers.push(("alt-svc".to_string(), config.http.alt_svc.clone()));
+	}
+}
+
+/// Decide what becomes of the upload: read into memory for the interceptors, or
+/// left to stream past them into the upstream request.
+///
+/// Asked before `on_request`, because the answer decides what `on_request` gets
+/// to see. Only the headers are available to decide on, which is all a plugin's
+/// request filter matches against anyway.
+fn take_upload(
+	config: &Config,
+	interceptor: &Chain,
+	request: &mut ProxyRequest,
+	upload: Option<(tokio::sync::mpsc::Receiver<crate::body::Chunk>, Option<u64>)>,
+) -> Result<crate::body::RequestBody, ProxyResponse> {
+	let Some((chunks, length)) = upload else {
+		return Ok(crate::body::RequestBody::None);
+	};
+
+	let mut reader = crate::body::Reader::new(chunks);
+
+	if !interceptor.wants_request_body(request) {
+		return Ok(crate::body::RequestBody::Streaming { reader, length });
+	}
+
+	match crate::body::read_to_cap(&mut reader, config.max_request_body()) {
+		Ok(body) => {
+			request.body = body;
+
+			Ok(crate::body::RequestBody::None)
+		}
+		Err(crate::body::TooLarge::Cap) => {
+			log::warn!(
+				"{} {} wanted in memory but exceeds max_request_body_mb",
+				request.method,
+				request.url
+			);
+
+			Err(error_body(413, "request body too large"))
+		}
+		Err(crate::body::TooLarge::Interrupted(e)) => {
+			log::debug!("upload interrupted for {}: {e}", request.url);
+
+			Err(error_body(400, "request body interrupted"))
+		}
 	}
 }
 

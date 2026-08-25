@@ -43,6 +43,22 @@ pub trait Interceptor: Send + Sync {
 		None
 	}
 
+	/// Whether this interceptor needs the request's body in memory before
+	/// [`on_request`](Self::on_request) runs.
+	///
+	/// Defaults to **false**, which is the opposite of
+	/// [`wants_body`](Self::wants_body) and deliberately so. A response body
+	/// defaults to buffered because an interceptor that forgets to answer
+	/// still works; a request body defaults to streaming because an upload is
+	/// unbounded, and the cost of forgetting here is that a large one no longer
+	/// fits in memory. Asking for it is the explicit act.
+	///
+	/// Answering true caps the body at `max_request_body_mb` and refuses
+	/// anything past it, which is what that limit has always been for.
+	fn wants_request_body(&self, _req: &ProxyRequest) -> bool {
+		false
+	}
+
 	/// Called with the whole response once its body has been buffered — which
 	/// only happens when [`wants_body`](Self::wants_body) asked for it.
 	fn on_response(&self, _req: &ProxyRequest, _resp: &mut ProxyResponse) {}
@@ -145,6 +161,12 @@ impl Interceptor for Chain {
 	/// back untouched by the rest of the chain.
 	fn on_request(&self, req: &mut ProxyRequest) -> Option<ProxyResponse> {
 		self.links.iter().find_map(|link| link.on_request(req))
+	}
+
+	/// True if anything in the chain wants it, since one interceptor needing
+	/// the body is enough to have to hold it.
+	fn wants_request_body(&self, req: &ProxyRequest) -> bool {
+		self.links.iter().any(|link| link.wants_request_body(req))
 	}
 
 	fn on_response(&self, req: &ProxyRequest, resp: &mut ProxyResponse) {
@@ -357,6 +379,44 @@ mod tests {
 	/// The default is deliberately "buffer", so a link that forgets to answer
 	/// still works. The cost is that every request-only link must opt out by
 	/// hand or it switches off streaming for the whole proxy.
+	/// The mirror image of the response rule below, and the reason both are
+	/// spelled out: a request body defaults to streaming, a response body to
+	/// buffering, and getting them the wrong way round is silent either way.
+	#[test]
+	fn a_link_that_forgets_to_answer_lets_an_upload_stream() {
+		let chain = Chain {
+			links: vec![Box::new(Recorder {
+				called: Arc::new(AtomicBool::new(false)),
+			})],
+		};
+
+		assert!(
+			!chain.wants_request_body(&request()),
+			"nothing may hold an upload in memory without asking"
+		);
+	}
+
+	#[test]
+	fn one_link_wanting_the_upload_is_enough() {
+		struct Hungry;
+		impl Interceptor for Hungry {
+			fn wants_request_body(&self, _req: &ProxyRequest) -> bool {
+				true
+			}
+		}
+
+		let chain = Chain {
+			links: vec![
+				Box::new(Recorder {
+					called: Arc::new(AtomicBool::new(false)),
+				}),
+				Box::new(Hungry),
+			],
+		};
+
+		assert!(chain.wants_request_body(&request()));
+	}
+
 	#[test]
 	fn a_link_that_forgets_to_answer_still_buffers() {
 		let chain = Chain {

@@ -506,9 +506,7 @@ impl Internal {
 impl Interceptor for Internal {
 	fn on_request(&self, req: &mut ProxyRequest) -> Option<ProxyResponse> {
 		let path = path_of(&req.url);
-		// `/.mach5` on its own is ours too, so that it answers 404 rather than
-		// being forwarded to an origin that has never heard of it.
-		if !path.starts_with(PREFIX) && path != PREFIX.trim_end_matches('/') {
+		if !is_ours(path) {
 			return None;
 		}
 
@@ -518,6 +516,13 @@ impl Interceptor for Internal {
 		self.metrics.internal.increment();
 
 		Some(self.route(host, &req.method, path, query_of(&req.url), &req.body))
+	}
+
+	/// Its `POST` endpoints read what was sent, so the body has to be here
+	/// before [`Self::on_request`] runs — but only for its own paths. An upload
+	/// to the site itself is none of its business.
+	fn wants_request_body(&self, req: &ProxyRequest) -> bool {
+		is_ours(path_of(&req.url))
 	}
 
 	/// Answers its own paths and ignores every other response, so it must never
@@ -844,6 +849,13 @@ fn query_of(url: &str) -> &str {
 	};
 
 	rest.split('#').next().unwrap_or("")
+}
+
+/// Whether this path belongs to the proxy. `/.mach5` on its own counts, so
+/// that it answers rather than being forwarded to an origin that has never
+/// heard of it.
+fn is_ours(path: &str) -> bool {
+	path.starts_with(PREFIX) || path == PREFIX.trim_end_matches('/')
 }
 
 /// Path portion of an absolute URL, without the query or fragment.

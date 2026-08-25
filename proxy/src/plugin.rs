@@ -111,6 +111,8 @@ struct Reply {
 struct InitReply {
 	#[serde(rename = "match")]
 	filter: Filter,
+	/// Whether the request hook should carry the uploaded body.
+	request_body: bool,
 	/// Ask for the body a chunk at a time instead of whole. Exclusive with
 	/// claiming the body: see [`Plugin::wants_body`].
 	chunks: bool,
@@ -150,6 +152,9 @@ fn headers_match(constraints: &BTreeMap<String, String>, headers: &[(String, Str
 
 pub struct Plugin {
 	name: String,
+	/// Declared at `init`: this plugin wants uploads in memory rather than
+	/// streaming past it.
+	request_body: bool,
 	timeout: Duration,
 	filter: Filter,
 	/// Declared once at `init`: this plugin takes streaming bodies a chunk at a
@@ -258,6 +263,7 @@ impl Plugin {
 			name,
 			timeout,
 			filter: Filter::default(),
+			request_body: false,
 			chunks: false,
 			chunking: AtomicBool::new(false),
 			io: Mutex::new(Some(Io {
@@ -283,9 +289,13 @@ impl Plugin {
 		if init.chunks {
 			log::info!("plugin {} takes streaming bodies a chunk at a time", plugin.name);
 		}
+		if init.request_body {
+			log::info!("plugin {} takes uploaded request bodies", plugin.name);
+		}
 
 		plugin.filter = filter;
 		plugin.chunks = init.chunks;
+		plugin.request_body = init.request_body;
 
 		Ok(plugin)
 	}
@@ -373,19 +383,29 @@ impl Plugin {
 }
 
 impl Interceptor for Plugin {
+	/// Only when it asked at `init`. A plugin that did not is not being denied
+	/// anything it expects: it is told the body is streaming and gets on with
+	/// the headers, which is what nearly every plugin actually wants.
+	fn wants_request_body(&self, req: &ProxyRequest) -> bool {
+		self.request_body && self.matches_request(req)
+	}
+
 	fn on_request(&self, req: &mut ProxyRequest) -> Option<ProxyResponse> {
 		if !self.matches_request(req) {
 			return None;
 		}
 
+		// A body we were never given is absent rather than empty, and flagged,
+		// so a plugin can tell "nothing was uploaded" from "it went past you".
+		let carries_body = self.wants_request_body(req);
 		let hook = Hook {
 			hook: "request",
 			method: &req.method,
 			url: &req.url,
 			status: None,
 			headers: Some(&req.headers),
-			body_b64: Some(BASE64.encode(&req.body)),
-			streaming: false,
+			body_b64: carries_body.then(|| BASE64.encode(&req.body)),
+			streaming: !carries_body,
 			is_final: false,
 		};
 
@@ -755,6 +775,18 @@ mod tests {
 		let reply: InitReply = serde_json::from_str("{}").unwrap();
 
 		assert!(reply.filter.is_empty());
+	}
+
+	#[test]
+	fn an_init_reply_may_ask_for_request_bodies() {
+		let asked: InitReply = serde_json::from_str(r#"{"request_body":true}"#).unwrap();
+		let silent: InitReply = serde_json::from_str("{}").unwrap();
+
+		assert!(asked.request_body);
+		assert!(
+			!silent.request_body,
+			"a plugin that says nothing lets uploads stream past it"
+		);
 	}
 
 	#[test]

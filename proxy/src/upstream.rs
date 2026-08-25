@@ -157,7 +157,17 @@ fn is_tls_failure(message: &str) -> bool {
 }
 
 /// Perform the upstream request, mapping transport failures to a message.
-pub fn call(agents: &Agents, req: &ProxyRequest) -> Result<ureq::Response, FetchError> {
+///
+/// `body` is how an upload gets forwarded without ever being held whole:
+/// [`RequestBody::Streaming`] hands ureq a reader the front end is still
+/// filling. When the client told us how long it would be, that length goes back
+/// on — ureq falls back to chunked encoding without it, and enough origins
+/// refuse a chunked upload that it is worth carrying through.
+pub fn call(
+	agents: &Agents,
+	req: &ProxyRequest,
+	body: crate::body::RequestBody,
+) -> Result<ureq::Response, FetchError> {
 	let agent = agents.for_host(crate::host_of(&req.url));
 	let mut request = agent.request(&req.method, &req.url);
 	for (name, value) in &req.headers {
@@ -175,11 +185,17 @@ pub fn call(agents: &Agents, req: &ProxyRequest) -> Result<ureq::Response, Fetch
 	// check by forging it.
 	request = request.set(VIA, via_id());
 
-	let result = if req.body.is_empty() {
-		request.call()
-	} else {
+	let result = match body {
+		crate::body::RequestBody::Streaming { reader, length } => {
+			if let Some(length) = length {
+				request = request.set("content-length", &length.to_string());
+			}
+
+			request.send(reader)
+		}
 		// ureq derives Content-Length from the payload.
-		request.send_bytes(&req.body)
+		crate::body::RequestBody::None if !req.body.is_empty() => request.send_bytes(&req.body),
+		crate::body::RequestBody::None => request.call(),
 	};
 
 	match result {

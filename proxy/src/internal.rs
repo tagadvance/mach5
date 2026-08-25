@@ -10,7 +10,9 @@
 //! The endpoints are the per-site list of CSS selectors to hide — a self-hosted
 //! cosmetic filter, where the blocklist deliberately stops at domain matching —
 //! plus the two files [`crate::inject`] points every page at: the stylesheet
-//! that applies the list, and the picker that adds to it.
+//! that applies the list, and the picker that adds to it. The bare prefix is a
+//! status page: what the proxy has counted, and what is hidden on the site you
+//! are reading it from.
 //!
 //! Which list a request touches is decided by [`crate::host_of`] on the URL the
 //! client asked for, never by anything in the request itself. Same-origin is
@@ -26,6 +28,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::interceptor::{Interceptor, ProxyRequest, ProxyResponse, ResponseHead};
+use crate::interstitial::{escape, STYLE};
+use crate::metrics::{self, Metrics, Snapshot};
 
 /// Everything below this is ours. A leading dot keeps it out of the way of any
 /// real path a site might already serve.
@@ -124,6 +128,29 @@ impl Store {
 		true
 	}
 
+	/// Forget one selector. Silent about whether it was there: the page's remove
+	/// control is the only caller, and a second click on a stale page is not a
+	/// failure worth reporting.
+	fn remove(&self, host: &str, selector: &str) {
+		let mut hidden = self.lock();
+		let Some(set) = hidden.get_mut(host) else {
+			return;
+		};
+
+		if !set.remove(selector) {
+			return;
+		}
+
+		// Removing the last one leaves the host behind as an empty set, which
+		// `clear` would not have; the file should not record a difference
+		// between the two ways of hiding nothing.
+		if set.is_empty() {
+			hidden.remove(host);
+		}
+
+		persist(&self.path, &hidden);
+	}
+
 	fn clear(&self, host: &str) {
 		let mut hidden = self.lock();
 
@@ -178,6 +205,10 @@ pub struct Internal {
 	bypasses: Arc<crate::insecure::Bypasses>,
 	/// How long a typed bypass lasts, or `None` when the mechanism is off.
 	bypass_ttl: Option<std::time::Duration>,
+	metrics: Arc<Metrics>,
+	/// The loaded blocklist, or `None` when blocking is switched off. The status
+	/// page needs to tell "nothing was blocked" apart from "there is no list".
+	blocklist: Option<Arc<crate::blocklist::Blocklist>>,
 }
 
 impl Internal {
@@ -187,6 +218,13 @@ impl Internal {
 			bypasses: crate::insecure::bypasses(),
 			// `None` is the whole switch: no TTL, no endpoint.
 			bypass_ttl: config.bypass_phrase().map(|_| config.bypass_ttl()),
+			metrics: metrics::shared(),
+			// Asked for only when it is switched on: reporting on the blocklist
+			// must not be the reason a disabled one is read off disk.
+			blocklist: config
+				.blocklist
+				.enabled
+				.then(|| crate::blocklist::shared(config)),
 		}
 	}
 
@@ -231,8 +269,13 @@ impl Internal {
 		}
 
 		match (path, method) {
+			// With and without the trailing slash: they are the same page, and a
+			// redirect between them would be one more thing to get wrong.
+			("/.mach5" | "/.mach5/", "GET") => self.status(host),
+			("/.mach5/stats.json", "GET") => self.stats(),
 			("/.mach5/hidden", "GET") => self.hidden(host),
 			("/.mach5/hidden", "POST") => self.hide(host, body),
+			("/.mach5/hidden/remove", "POST") => self.unhide(host, body),
 			("/.mach5/hidden/clear", "POST") => {
 				self.store.clear(host);
 
@@ -241,7 +284,11 @@ impl Internal {
 			("/.mach5/hidden.css", "GET") => self.stylesheet(host),
 			("/.mach5/mach5.js", "GET") => script(),
 			(
-				"/.mach5/hidden"
+				"/.mach5"
+				| "/.mach5/"
+				| "/.mach5/stats.json"
+				| "/.mach5/hidden"
+				| "/.mach5/hidden/remove"
 				| "/.mach5/hidden/clear"
 				| "/.mach5/hidden.css"
 				| "/.mach5/mach5.js",
@@ -249,6 +296,48 @@ impl Internal {
 			) => empty(405),
 			_ => empty(404),
 		}
+	}
+
+	/// The status page, which is about this host as much as about the process:
+	/// the counters are the same everywhere, but what is hidden and whether a
+	/// certificate bypass is running are answers only this origin can give.
+	fn status(&self, host: &str) -> ProxyResponse {
+		let page = status_page(
+			host,
+			&self.metrics.snapshot(),
+			&self.store.selectors(host),
+			self.bypasses.allows(host),
+			// A list that loaded nothing is not a working list, so it must not
+			// report as one.
+			self.blocklist
+				.as_ref()
+				.map(|list| list.len())
+				.filter(|domains| *domains > 0),
+		);
+
+		let mut response = empty(200);
+		response.headers.push((
+			"content-type".to_string(),
+			"text/html; charset=utf-8".to_string(),
+		));
+		response.body = page.into_bytes();
+
+		response
+	}
+
+	/// The same numbers, for something that reads them on a schedule rather than
+	/// once. Flat, because that is what every scraper wants to graph.
+	fn stats(&self) -> ProxyResponse {
+		let body =
+			serde_json::to_vec(&self.metrics.snapshot()).expect("counters are serializable");
+
+		let mut response = empty(200);
+		response
+			.headers
+			.push(("content-type".to_string(), "application/json".to_string()));
+		response.body = body;
+
+		response
 	}
 
 	fn hidden(&self, host: &str) -> ProxyResponse {
@@ -309,6 +398,19 @@ impl Internal {
 
 		empty(204)
 	}
+
+	/// Stop hiding one selector. A 204 either way: the page that sends this may
+	/// have been open since before somebody cleared the list, and unhiding what
+	/// is already visible has produced exactly the state that was asked for.
+	fn unhide(&self, host: &str, body: &[u8]) -> ProxyResponse {
+		let Ok(request) = serde_json::from_slice::<Hide>(body) else {
+			return empty(400);
+		};
+
+		self.store.remove(host, request.selector.trim());
+
+		empty(204)
+	}
 }
 
 impl Interceptor for Internal {
@@ -323,6 +425,7 @@ impl Interceptor for Internal {
 		// The host is the one the client asked for, never one the request could
 		// name, so a page can only ever reach its own site's list.
 		let host = crate::host_of(&req.url);
+		self.metrics.internal.increment();
 
 		Some(self.route(host, &req.method, path, query_of(&req.url), &req.body))
 	}
@@ -362,6 +465,144 @@ fn script() -> ProxyResponse {
 		],
 		body: SCRIPT.as_bytes().to_vec(),
 	}
+}
+
+/// What the status page needs on top of [`crate::interstitial::STYLE`]: a table
+/// of numbers and a list with a control on each row. Everything else — the
+/// type, the colours, dark mode — is already there, and a second copy of it
+/// would be a second thing to keep in step.
+const EXTRA: &str = r#"<style>
+body { align-items: flex-start; }
+table { border-collapse: collapse; width: 100%; margin: 0 0 1rem; }
+th, td { padding: .35rem 0; font-weight: 400; text-align: left; }
+td { text-align: right; font-variant-numeric: tabular-nums; }
+td .note { font-size: .8rem; }
+h2 { font-size: 1.1rem; font-weight: 500; margin: 2rem 0 .75rem; }
+ul { list-style: none; margin: 0; padding: 0; }
+li { display: flex; align-items: center; justify-content: space-between;
+  gap: 1rem; padding: .35rem 0; }
+li button { font-size: .8rem; padding: .3rem .7rem; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .85rem; word-break: break-all; }
+</style>"#;
+
+/// The other half of the remove control. Delegated from the document so that one
+/// listener covers every row, and a reload rather than a DOM edit so what the
+/// page shows afterwards is what the store actually holds.
+///
+/// This is the one page in mach5 that is ours end to end, so an inline script is
+/// safe here in a way it would not be on somebody else's site: no CSP of ours to
+/// work around, and nothing on the page that a site could have written.
+const REMOVE: &str = r#"<script>
+addEventListener('click', (e) => {
+	const control = e.target.closest('button[data-selector]');
+	if (!control) {
+		return;
+	}
+
+	fetch('/.mach5/hidden/remove', {
+		method: 'POST',
+		headers: { 'content-type': 'application/json' },
+		body: JSON.stringify({ selector: control.dataset.selector }),
+	}).then(() => location.reload());
+});
+</script>"#;
+
+/// Render the status page.
+///
+/// `domains` is `None` when no blocklist is loaded, which is not the same thing
+/// as one that has blocked nothing: a bare zero there would read as "this is
+/// working and there was nothing to block".
+fn status_page(
+	host: &str,
+	counted: &Snapshot,
+	selectors: &[String],
+	bypassed: bool,
+	domains: Option<usize>,
+) -> String {
+	let host = escape(host);
+	let uptime = metrics::uptime(std::time::Duration::from_secs(counted.uptime_seconds));
+	let requests = metrics::thousands(counted.requests);
+	let blocked = match domains {
+		Some(domains) => format!(
+			r#"<td>{} <span class="note">of {} domains</span></td>"#,
+			metrics::thousands(counted.blocked),
+			metrics::thousands(domains as u64)
+		),
+		None => r#"<td class="note">no blocklist loaded</td>"#.to_string(),
+	};
+	let internal = metrics::thousands(counted.internal);
+	let injected = metrics::thousands(counted.injected);
+	let bypasses = metrics::thousands(counted.bypassed);
+	let tls_failures = metrics::thousands(counted.tls_failures);
+	let upstream_failures = metrics::thousands(counted.upstream_failures);
+	let from_origin = metrics::bytes(counted.bytes_from_origin);
+	let to_client = metrics::bytes(counted.bytes_to_client);
+	let certificates = if bypassed {
+		"<p>Certificate validation is <strong>bypassed</strong> for this site until \
+		 the bypass expires.</p>"
+	} else {
+		"<p class=\"note\">This site&rsquo;s certificate is being validated normally.</p>"
+	};
+	let hidden = selector_list(selectors);
+
+	format!(
+		r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mach5</title>
+{STYLE}
+{EXTRA}
+</head>
+<body>
+<main>
+  <h1>mach5</h1>
+  <p class="lede">Running for {uptime}.</p>
+  <table>
+    <tr><th>Requests</th><td>{requests}</td></tr>
+    <tr><th>Blocked</th>{blocked}</tr>
+    <tr><th>mach5 endpoints</th><td>{internal}</td></tr>
+    <tr><th>Pages injected</th><td>{injected}</td></tr>
+    <tr><th>Fetched unvalidated</th><td>{bypasses}</td></tr>
+    <tr><th>Certificate failures</th><td>{tls_failures}</td></tr>
+    <tr><th>Other upstream failures</th><td>{upstream_failures}</td></tr>
+    <tr><th>Body bytes from origins</th><td>{from_origin}</td></tr>
+    <tr><th>Body bytes to clients</th><td>{to_client}</td></tr>
+  </table>
+  <h2>{host}</h2>
+  {certificates}
+  {hidden}
+</main>
+{REMOVE}
+</body>
+</html>
+"#
+	)
+}
+
+/// This host's hidden elements, each with the control that stops hiding it.
+///
+/// A selector is a string a page put into the store, so it reaches the markup —
+/// text and attribute alike — only through [`escape`].
+fn selector_list(selectors: &[String]) -> String {
+	if selectors.is_empty() {
+		return "<p class=\"note\">Nothing is hidden on this site.</p>".to_string();
+	}
+
+	let rows: String = selectors
+		.iter()
+		.map(|selector| {
+			let selector = escape(selector);
+
+			format!(
+				r#"<li><code>{selector}</code><button data-selector="{selector}">Remove</button></li>"#
+			)
+		})
+		.collect();
+
+	format!("<ul>{rows}</ul>")
 }
 
 /// A bodyless response.
@@ -469,6 +710,8 @@ mod tests {
 			store: Arc::new(Store::load(dir.path().join("hidden.json"))),
 			bypasses: Arc::new(crate::insecure::Bypasses::default()),
 			bypass_ttl: Some(std::time::Duration::from_secs(60)),
+			metrics: Arc::new(Metrics::default()),
+			blocklist: None,
 		}
 	}
 
@@ -896,13 +1139,287 @@ mod tests {
 		let internal = internal(&dir);
 
 		for url in [
-			"https://example.com/.mach5",
-			"https://example.com/.mach5/",
 			"https://example.com/.mach5/nope",
 			"https://example.com/.mach5/hidden/nope",
+			"https://example.com/.mach5/stats",
 		] {
 			assert_eq!(call(&internal, "GET", url, "").status, 404, "{url}");
 		}
+	}
+
+	#[test]
+	fn the_status_page_is_this_host_and_what_is_hidden_on_it() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		call(
+			&internal,
+			"POST",
+			"https://example.com/.mach5/hidden",
+			r##"{"selector":"#ad"}"##,
+		);
+		internal.metrics.requests.add(1234);
+
+		for url in [
+			"https://example.com/.mach5/",
+			"https://example.com/.mach5",
+		] {
+			let response = call(&internal, "GET", url, "");
+
+			assert_eq!(response.status, 200, "{url}");
+			assert!(response
+				.headers
+				.iter()
+				.any(|(k, v)| k == "content-type" && v == "text/html; charset=utf-8"));
+			assert!(response
+				.headers
+				.iter()
+				.any(|(k, v)| k == "cache-control" && v == "no-store"));
+
+			let page = body_of(&response);
+
+			assert!(page.contains("example.com"), "{page}");
+			assert!(page.contains("1,234"), "counts are readable: {page}");
+			assert!(page.contains("#ad"), "{page}");
+			assert!(
+				page.contains(r##"data-selector="#ad""##),
+				"each selector gets its own control: {page}"
+			);
+		}
+
+		// Another site's page is about that site, not this one.
+		let other = body_of(&call(&internal, "GET", "https://example.net/.mach5/", ""));
+
+		assert!(other.contains("Nothing is hidden"), "{other}");
+		assert!(!other.contains("#ad"));
+	}
+
+	#[test]
+	fn the_status_page_says_whether_a_bypass_is_running_here() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+		internal
+			.bypasses
+			.allow("staging.example.com", std::time::Duration::from_secs(60));
+
+		let bypassed = body_of(&call(
+			&internal,
+			"GET",
+			"https://staging.example.com/.mach5/",
+			"",
+		));
+		let ordinary = body_of(&call(&internal, "GET", "https://example.com/.mach5/", ""));
+
+		assert!(bypassed.contains("<strong>bypassed</strong>"), "{bypassed}");
+		assert!(ordinary.contains("validated normally"), "{ordinary}");
+	}
+
+	/// A selector is a string a page put in the store, so the page it comes back
+	/// on is where a hostile one would take effect.
+	#[test]
+	fn a_hostile_selector_cannot_write_markup_into_the_status_page() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+		let selector = r#"<script>alert(1)</script>" onclick="alert(2)"#;
+
+		call(
+			&internal,
+			"POST",
+			"https://example.com/.mach5/hidden",
+			&serde_json::json!({ "selector": selector }).to_string(),
+		);
+
+		let page = body_of(&call(&internal, "GET", "https://example.com/.mach5/", ""));
+
+		assert!(!page.contains("<script>alert(1)"), "{page}");
+		assert!(!page.contains(r##"" onclick=""##), "{page}");
+		assert!(page.contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "{page}");
+		assert!(page.contains("&quot; onclick=&quot;"), "{page}");
+	}
+
+	/// A zero that means "nothing was blocked" and a zero that means "there is
+	/// no list" are different answers, and the page must not give the first when
+	/// the second is true.
+	#[test]
+	fn the_page_tells_a_missing_blocklist_from_a_loaded_one() {
+		let dir = TempDir::new().unwrap();
+		let mut internal = internal(&dir);
+
+		let none = body_of(&call(&internal, "GET", "https://example.com/.mach5/", ""));
+
+		assert!(none.contains("no blocklist loaded"), "{none}");
+
+		let file = dir.path().join("hosts.txt");
+		std::fs::write(&file, "0.0.0.0 ads.example.com\n0.0.0.0 ads.example.net\n").unwrap();
+		internal.blocklist = Some(Arc::new(crate::blocklist::Blocklist::load(&[file], &[])));
+		internal.metrics.blocked.add(9);
+
+		let loaded = body_of(&call(&internal, "GET", "https://example.com/.mach5/", ""));
+
+		assert!(loaded.contains("of 2 domains"), "{loaded}");
+		assert!(loaded.contains(">9 "), "{loaded}");
+		assert!(!loaded.contains("no blocklist loaded"));
+	}
+
+	#[test]
+	fn the_counters_are_also_json() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+		internal.metrics.blocked.add(3);
+		internal.metrics.bytes_to_client.add(2048);
+
+		let response = call(
+			&internal,
+			"GET",
+			"https://example.com/.mach5/stats.json",
+			"",
+		);
+
+		assert_eq!(response.status, 200);
+		assert!(response
+			.headers
+			.iter()
+			.any(|(k, v)| k == "content-type" && v == "application/json"));
+		assert!(response
+			.headers
+			.iter()
+			.any(|(k, v)| k == "cache-control" && v == "no-store"));
+
+		let stats: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+
+		assert_eq!(stats["blocked"], 3);
+		assert_eq!(stats["bytes_to_client"], 2048);
+		assert_eq!(stats["internal"], 1, "this very request");
+		assert!(stats["uptime_seconds"].is_u64());
+	}
+
+	#[test]
+	fn everything_answered_here_is_counted() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		call(&internal, "GET", "https://example.com/.mach5/hidden", "");
+		call(&internal, "GET", "https://example.com/.mach5/nope", "");
+
+		assert_eq!(
+			internal.metrics.internal.get(),
+			2,
+			"a 404 under our prefix is still us answering"
+		);
+
+		let mut req = request("GET", "https://example.com/index.html", "");
+		internal.on_request(&mut req);
+
+		assert_eq!(
+			internal.metrics.internal.get(),
+			2,
+			"a request we passed on is not ours"
+		);
+	}
+
+	#[test]
+	fn removing_takes_one_selector_out_and_leaves_the_rest() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		for selector in ["#ad", ".promo"] {
+			call(
+				&internal,
+				"POST",
+				"https://example.com/.mach5/hidden",
+				&format!(r#"{{"selector":"{selector}"}}"#),
+			);
+		}
+
+		let removed = call(
+			&internal,
+			"POST",
+			"https://example.com/.mach5/hidden/remove",
+			r##"{"selector":"#ad"}"##,
+		);
+
+		assert_eq!(removed.status, 204);
+		assert!(removed.body.is_empty());
+		assert_eq!(
+			body_of(&call(&internal, "GET", "https://example.com/.mach5/hidden", "")),
+			r#"{"selectors":[".promo"]}"#
+		);
+		// Persisted the same way adding is: a reload has to agree.
+		assert_eq!(
+			Store::load(dir.path().join("hidden.json")).selectors("example.com"),
+			vec![".promo"]
+		);
+	}
+
+	#[test]
+	fn removing_something_that_is_not_hidden_is_not_an_error() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+		let url = "https://example.com/.mach5/hidden/remove";
+
+		assert_eq!(
+			call(&internal, "POST", url, r##"{"selector":"#ad"}"##).status,
+			204,
+			"nothing hidden here at all"
+		);
+
+		call(
+			&internal,
+			"POST",
+			"https://example.com/.mach5/hidden",
+			r#"{"selector":".promo"}"#,
+		);
+
+		assert_eq!(
+			call(&internal, "POST", url, r##"{"selector":"#ad"}"##).status,
+			204
+		);
+		assert_eq!(
+			call(&internal, "POST", url, r#"{"selector":".promo"}"#).status,
+			204
+		);
+		assert_eq!(
+			call(&internal, "POST", url, r#"{"selector":".promo"}"#).status,
+			204,
+			"removing it twice is the same answer"
+		);
+		assert!(internal.store.selectors("example.com").is_empty());
+	}
+
+	#[test]
+	fn a_remove_that_names_no_selector_is_rejected() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+		let url = "https://example.com/.mach5/hidden/remove";
+
+		for body in ["", "not json", "{}", r#"{"selector":7}"#] {
+			assert_eq!(call(&internal, "POST", url, body).status, 400, "{body:?}");
+		}
+	}
+
+	#[test]
+	fn one_site_cannot_unhide_another() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		for host in ["example.com", "example.net"] {
+			call(
+				&internal,
+				"POST",
+				&format!("https://{host}/.mach5/hidden"),
+				r##"{"selector":"#ad"}"##,
+			);
+		}
+
+		call(
+			&internal,
+			"POST",
+			"https://example.net/.mach5/hidden/remove",
+			r##"{"selector":"#ad"}"##,
+		);
+
+		assert_eq!(internal.store.selectors("example.com"), vec!["#ad"]);
+		assert!(internal.store.selectors("example.net").is_empty());
 	}
 
 	#[test]
@@ -922,6 +1439,8 @@ mod tests {
 		assert_eq!(got.status, 405);
 
 		for url in [
+			"https://example.com/.mach5/",
+			"https://example.com/.mach5/stats.json",
 			"https://example.com/.mach5/hidden.css",
 			"https://example.com/.mach5/mach5.js",
 		] {
@@ -929,3 +1448,4 @@ mod tests {
 		}
 	}
 }
+

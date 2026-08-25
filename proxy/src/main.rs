@@ -15,6 +15,7 @@ mod insecure;
 mod interceptor;
 mod internal;
 mod interstitial;
+mod metrics;
 mod plugin;
 mod tcp;
 mod upstream;
@@ -252,6 +253,9 @@ fn handle_job(
 	results: &Sender<FetchResult>,
 	waker: &mio::Waker,
 ) -> Result<(), ()> {
+	let metrics = metrics::shared();
+	metrics.requests.increment();
+
 	// Ahead of `send`, which borrows the job for the rest of this function.
 	let answer = interceptor.on_request(&mut job.request);
 
@@ -270,6 +274,7 @@ fn handle_job(
 
 	if let Some(response) = answer {
 		log::info!("short-circuited {} {}", job.request.method, job.request.url);
+		metrics.bytes_to_client.add(response.body.len() as u64);
 
 		return send(Payload::Full(response));
 	}
@@ -286,6 +291,7 @@ fn handle_job(
 				}
 				upstream::FetchError::Other(detail) => interstitial::upstream_error(host, detail),
 			};
+			metrics.bytes_to_client.add(page.body.len() as u64);
 
 			return send(Payload::Full(page));
 		}
@@ -301,6 +307,7 @@ fn handle_job(
 		if let Err(e) = resp.into_reader().read_to_end(&mut body) {
 			log::warn!("failed reading upstream body for {}: {e}", job.request.url);
 		}
+		metrics.bytes_from_origin.add(body.len() as u64);
 
 		// Interceptors rewrite plain bytes; the coding goes back on afterwards.
 		let (body, coding) = encoding::decode(&mut head.headers, body);
@@ -311,6 +318,7 @@ fn handle_job(
 		};
 		interceptor.on_response(&job.request, &mut response);
 		response.body = encoding::encode(&mut response.headers, response.body, coding);
+		metrics.bytes_to_client.add(response.body.len() as u64);
 
 		return send(Payload::Full(response));
 	}
@@ -328,6 +336,8 @@ fn handle_job(
 		match reader.read(&mut buf) {
 			Ok(0) => break,
 			Ok(n) => {
+				metrics.bytes_from_origin.add(n as u64);
+
 				let mut chunk = buf[..n].to_vec();
 				if wants_chunks {
 					interceptor.on_response_chunk(&job.request, &mut chunk);
@@ -337,6 +347,7 @@ fn handle_job(
 						continue;
 					}
 				}
+				metrics.bytes_to_client.add(chunk.len() as u64);
 
 				send(Payload::Chunk(chunk))?;
 			}
@@ -350,6 +361,8 @@ fn handle_job(
 
 	if wants_chunks {
 		if let Some(tail) = interceptor.on_response_end(&job.request) {
+			metrics.bytes_to_client.add(tail.len() as u64);
+
 			send(Payload::Chunk(tail))?;
 		}
 	}

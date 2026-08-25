@@ -15,6 +15,7 @@
 //! leaves every other byte exactly where the origin put it, whatever it means.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::config::Config;
 use crate::interceptor::{Interceptor, ProxyRequest, ProxyResponse, ResponseHead};
@@ -36,6 +37,7 @@ const BODY_START: &[u8] = b"<body";
 /// Adds the tags to HTML pages.
 pub struct Inject {
 	exclude: HashSet<String>,
+	metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl Inject {
@@ -48,6 +50,7 @@ impl Inject {
 				.map(|host| host.trim().trim_end_matches('.').to_ascii_lowercase())
 				.filter(|host| !host.is_empty())
 				.collect(),
+			metrics: crate::metrics::shared(),
 		}
 	}
 
@@ -64,8 +67,12 @@ impl Interceptor for Inject {
 			return;
 		}
 
+		// Counted here rather than beside `wants_body`: a page can be buffered,
+		// looked at and left alone, and a count of what we considered injecting
+		// would not be a count of what we injected.
 		if let Some(at) = insertion_point(&resp.body) {
 			resp.body.splice(at..at, TAGS.iter().copied());
+			self.metrics.injected.increment();
 		}
 	}
 
@@ -152,6 +159,7 @@ mod tests {
 	fn inject(exclude: &[&str]) -> Inject {
 		Inject {
 			exclude: exclude.iter().map(|host| host.to_string()).collect(),
+			metrics: Arc::new(crate::metrics::Metrics::default()),
 		}
 	}
 
@@ -339,6 +347,30 @@ mod tests {
 		run(&inject, "https://example.com/", &mut resp);
 
 		assert_eq!(resp.body, b"<html><head></head><body>gone</body></html>");
+	}
+
+	/// The count is of pages that changed, so every reason not to splice — an
+	/// excluded host, a page that already has the tags, a document with nowhere
+	/// to put them — has to leave it alone.
+	#[test]
+	fn only_a_page_that_was_actually_changed_is_counted() {
+		let inject = inject(&["bank.example"]);
+
+		let mut resp = html(200, b"<html><head></head><body></body></html>");
+		run(&inject, "https://example.com/", &mut resp);
+
+		assert_eq!(inject.metrics.injected.get(), 1);
+
+		// Already carrying the tags, so this pass changes nothing.
+		run(&inject, "https://example.com/", &mut resp);
+
+		let mut excluded = html(200, b"<html><head></head><body></body></html>");
+		run(&inject, "https://bank.example/", &mut excluded);
+
+		let mut fragment = html(200, b"<div>no head, no body</div>");
+		run(&inject, "https://example.com/", &mut fragment);
+
+		assert_eq!(inject.metrics.injected.get(), 1);
 	}
 
 	#[test]

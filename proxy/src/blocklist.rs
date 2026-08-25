@@ -42,23 +42,25 @@ const HOUSEKEEPING: [&str; 4] = [
 pub struct Blocklist {
 	blocked: HashSet<String>,
 	allowed: HashSet<String>,
+	metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl Blocklist {
-	fn new(allow: &[String]) -> Self {
+	fn new(allow: &[String], metrics: Arc<crate::metrics::Metrics>) -> Self {
 		Self {
 			blocked: HashSet::new(),
 			allowed: allow
 				.iter()
 				.filter_map(|domain| normalize(domain))
 				.collect(),
+			metrics,
 		}
 	}
 
 	/// Read every list, skipping — with a warning — any that cannot be read. A
 	/// missing list is not worth refusing to start over.
 	pub fn load(files: &[PathBuf], allow: &[String]) -> Self {
-		let mut list = Self::new(allow);
+		let mut list = Self::new(allow, crate::metrics::shared());
 		let mut read = 0;
 
 		for path in files {
@@ -98,6 +100,12 @@ impl Blocklist {
 		self.blocked.is_empty()
 	}
 
+	/// How many domains are loaded. The status page reports it so that a blocked
+	/// count of zero can be told apart from a list that never loaded.
+	pub fn len(&self) -> usize {
+		self.blocked.len()
+	}
+
 	/// True when this host, or any domain it sits under, is listed — so
 	/// `doubleclick.net` covers `ad.g.doubleclick.net`. An allowance wins
 	/// outright, whatever the lists say.
@@ -130,6 +138,7 @@ impl Interceptor for Arc<Blocklist> {
 		}
 
 		log::debug!("blocked {host}");
+		self.metrics.blocked.increment();
 
 		Some(blocked(req))
 	}
@@ -263,7 +272,7 @@ mod tests {
 	use super::*;
 
 	fn list(text: &str) -> Blocklist {
-		let mut list = Blocklist::new(&[]);
+		let mut list = Blocklist::new(&[], Arc::new(crate::metrics::Metrics::default()));
 		list.add(text);
 
 		list
@@ -388,7 +397,10 @@ mod tests {
 
 	#[test]
 	fn configured_allowances_win_over_a_block() {
-		let mut list = Blocklist::new(&["example.com".to_string()]);
+		let mut list = Blocklist::new(
+			&["example.com".to_string()],
+			Arc::new(crate::metrics::Metrics::default()),
+		);
 		list.add("0.0.0.0 ads.example.com\n0.0.0.0 ads.example.net\n");
 
 		assert!(
@@ -445,6 +457,20 @@ mod tests {
 			.headers
 			.iter()
 			.any(|(k, v)| k == "x-mach5" && v == "blocked"));
+	}
+
+	#[test]
+	fn only_a_blocked_request_is_counted() {
+		let list = Arc::new(list("0.0.0.0 ads.example.com\n"));
+
+		list.on_request(&mut request("https://example.org/index.html", "text/html"));
+
+		assert_eq!(list.metrics.blocked.get(), 0);
+
+		list.on_request(&mut request("https://ads.example.com/frame.html", "text/html"));
+		list.on_request(&mut request("https://ads.example.com/pixel.gif", "image/webp"));
+
+		assert_eq!(list.metrics.blocked.get(), 2);
 	}
 
 	#[test]

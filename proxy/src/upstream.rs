@@ -82,6 +82,7 @@ pub struct Agents {
 	/// Used only for a host in [`crate::insecure::bypasses`]. See that module.
 	permissive: ureq::Agent,
 	bypasses: std::sync::Arc<crate::insecure::Bypasses>,
+	metrics: std::sync::Arc<crate::metrics::Metrics>,
 }
 
 /// Builds the shared upstream HTTP agents.
@@ -110,6 +111,7 @@ pub fn agents(config: &Config) -> Agents {
 		strict: builder().build(),
 		permissive,
 		bypasses: crate::insecure::bypasses(),
+		metrics: crate::metrics::shared(),
 	}
 }
 
@@ -124,6 +126,7 @@ impl Agents {
 		// Once per request, not once per bypass: a bypass that has been left on
 		// should be impossible to miss in the log.
 		log::warn!("fetching {host} WITHOUT certificate validation (bypassed)");
+		self.metrics.bypassed.increment();
 
 		&self.permissive
 	}
@@ -183,16 +186,23 @@ pub fn call(agents: &Agents, req: &ProxyRequest) -> Result<ureq::Response, Fetch
 		Ok(resp) => Ok(resp),
 		// An HTTP error status is a perfectly good response to relay.
 		Err(ureq::Error::Status(_, resp)) => Ok(resp),
-		Err(ureq::Error::Transport(t)) => {
-			let message = t.to_string();
-
-			Err(if is_tls_failure(&message) {
-				FetchError::Tls(message)
-			} else {
-				FetchError::Other(message)
-			})
-		}
+		Err(ureq::Error::Transport(t)) => Err(failure(&agents.metrics, t.to_string())),
 	}
+}
+
+/// Sort one transport failure into the two kinds, counting it on the way past.
+/// Counted here rather than at the two call sites because both front ends turn
+/// a [`FetchError`] into a page and neither should have to remember to.
+fn failure(metrics: &crate::metrics::Metrics, message: String) -> FetchError {
+	if is_tls_failure(&message) {
+		metrics.tls_failures.increment();
+
+		return FetchError::Tls(message);
+	}
+
+	metrics.upstream_failures.increment();
+
+	FetchError::Other(message)
 }
 
 pub fn response_headers(resp: &ureq::Response) -> Vec<(String, String)> {
@@ -238,6 +248,49 @@ mod tests {
 
 	fn via(value: &str) -> Vec<(String, String)> {
 		vec![(VIA.to_string(), value.to_string())]
+	}
+
+	/// Built by hand rather than through [`agents`], so the registry and the
+	/// counters belong to this test instead of to the process.
+	fn agents(bypasses: std::sync::Arc<crate::insecure::Bypasses>) -> Agents {
+		Agents {
+			strict: ureq::AgentBuilder::new().build(),
+			permissive: ureq::AgentBuilder::new().build(),
+			bypasses,
+			metrics: std::sync::Arc::new(crate::metrics::Metrics::default()),
+		}
+	}
+
+	#[test]
+	fn only_a_bypassed_host_counts_as_bypassed() {
+		let bypasses = std::sync::Arc::new(crate::insecure::Bypasses::default());
+		bypasses.allow("staging.example.com", Duration::from_secs(60));
+		let agents = agents(bypasses);
+
+		agents.for_host("example.com");
+
+		assert_eq!(
+			agents.metrics.bypassed.get(),
+			0,
+			"a fetch that was validated is not a bypass"
+		);
+
+		agents.for_host("staging.example.com");
+
+		assert_eq!(agents.metrics.bypassed.get(), 1);
+	}
+
+	#[test]
+	fn a_failure_is_counted_as_the_kind_it_is() {
+		let metrics = crate::metrics::Metrics::default();
+
+		let tls = failure(&metrics, "invalid peer certificate: Expired".to_string());
+		let other = failure(&metrics, "connection refused".to_string());
+
+		assert!(matches!(tls, FetchError::Tls(_)));
+		assert!(matches!(other, FetchError::Other(_)));
+		assert_eq!(metrics.tls_failures.get(), 1);
+		assert_eq!(metrics.upstream_failures.get(), 1);
 	}
 
 	#[test]

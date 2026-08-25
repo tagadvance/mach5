@@ -279,6 +279,9 @@ fn fetch_blocking(
 	head_tx: tokio::sync::oneshot::Sender<Outcome>,
 	body_tx: tokio::sync::mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
 ) {
+	let metrics = crate::metrics::shared();
+	metrics.requests.increment();
+
 	let Some(borrowed) = shared.pool.acquire() else {
 		let _ = head_tx.send(Outcome::Buffered(error_body(502, "interceptor pool unavailable")));
 
@@ -289,6 +292,7 @@ fn fetch_blocking(
 	if let Some(mut response) = interceptor.on_request(&mut request) {
 		log::info!("short-circuited {} {}", request.method, request.url);
 		apply_alt_svc(&shared.config, &mut response.headers);
+		metrics.bytes_to_client.add(response.body.len() as u64);
 		let _ = head_tx.send(Outcome::Buffered(response));
 
 		return;
@@ -305,6 +309,7 @@ fn fetch_blocking(
 		Ok(resp) => resp,
 		Err(failure) => {
 			let page = failure_page(&shared.config, &request, &failure);
+			metrics.bytes_to_client.add(page.body.len() as u64);
 			let _ = head_tx.send(Outcome::Buffered(page));
 
 			return;
@@ -321,6 +326,7 @@ fn fetch_blocking(
 		if let Err(e) = resp.into_reader().read_to_end(&mut body) {
 			log::warn!("failed reading upstream body for {}: {e}", request.url);
 		}
+		metrics.bytes_from_origin.add(body.len() as u64);
 
 		// Interceptors rewrite plain bytes; the coding goes back on afterwards.
 		let (body, coding) = encoding::decode(&mut head.headers, body);
@@ -332,6 +338,7 @@ fn fetch_blocking(
 		interceptor.on_response(&request, &mut response);
 		response.body = encoding::encode(&mut response.headers, response.body, coding);
 		apply_alt_svc(&shared.config, &mut response.headers);
+		metrics.bytes_to_client.add(response.body.len() as u64);
 		let _ = head_tx.send(Outcome::Buffered(response));
 
 		return;
@@ -361,6 +368,7 @@ fn fetch_blocking(
 				break;
 			}
 		};
+		metrics.bytes_from_origin.add(read as u64);
 
 		let mut chunk = buf[..read].to_vec();
 		if wants_chunks {
@@ -372,6 +380,8 @@ fn fetch_blocking(
 			}
 		}
 
+		metrics.bytes_to_client.add(chunk.len() as u64);
+
 		if body_tx.blocking_send(Ok(Frame::data(Bytes::from(chunk)))).is_err() {
 			// Client went away.
 			break;
@@ -380,6 +390,7 @@ fn fetch_blocking(
 
 	if wants_chunks {
 		if let Some(tail) = interceptor.on_response_end(&request) {
+			metrics.bytes_to_client.add(tail.len() as u64);
 			let _ = body_tx.blocking_send(Ok(Frame::data(Bytes::from(tail))));
 		}
 	}

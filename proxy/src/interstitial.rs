@@ -242,7 +242,7 @@ fn explain(detail: &str) -> &'static str {
 	}
 }
 
-const STYLE: &str = r#"<style>
+pub(crate) const STYLE: &str = r#"<style>
 :root { color-scheme: light dark; }
 body {
   margin: 0; min-height: 100vh; display: flex; align-items: center;
@@ -276,8 +276,9 @@ button:hover { background: #1867cf; }
 </style>"#;
 
 /// Minimal HTML escaping. The host and the library's message both reach this
-/// page from outside, so neither is trusted markup.
-fn escape(raw: &str) -> String {
+/// page from outside, so neither is trusted markup — nor is a stored selector,
+/// which is why [`crate::internal`] escapes through this one too.
+pub(crate) fn escape(raw: &str) -> String {
 	let mut out = String::with_capacity(raw.len());
 	for c in raw.chars() {
 		match c {

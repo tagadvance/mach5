@@ -79,6 +79,32 @@ enabled = true
 # `<state_dir>/hidden.json`.
 enabled = true
 
+[inject]
+# Puts two same-origin tags into every HTML page just before `</head>` — or
+# just after `<body>` when there is no head:
+#
+#   <link rel="stylesheet" href="/.mach5/hidden.css">
+#   <script src="/.mach5/mach5.js" defer>
+#
+# The stylesheet applies this host's hidden-element list before first paint; the
+# script is the picker that adds to it — Ctrl+Shift+H starts picking, a click
+# hides the element under the pointer, `u` forgets the whole site's list, and
+# Escape stops. Only the one global shortcut, because every other combination is
+# already somebody's: Ctrl+Shift+U never reaches a page on a Linux desktop.
+#
+# Both are `src`/`href` URLs rather than inline tags on purpose: a site whose
+# CSP is `script-src 'self'` still runs them, where inline script would be
+# blocked. A nonce-only or hash-only CSP still blocks them, and mach5 will not
+# rewrite a site's `content-security-policy` to get around that.
+#
+# Only 200 responses whose content-type is text/html are touched; everything
+# else streams through untouched.
+enabled = true
+# Hosts left exactly as the origin sent them. A parent domain covers its
+# subdomains, as in the blocklist. This is where a bank goes: anywhere you would
+# rather mach5 did not modify the page at all.
+# exclude = ["bank.example"]
+
 [tls]
 # Minted certs have no revocation path, so expiry is the only bound on a leaked
 # key. Keep the window short.

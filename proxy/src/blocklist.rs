@@ -175,7 +175,10 @@ fn wants_image(req: &ProxyRequest) -> bool {
 /// Whether the host, or any domain above it, is in the set. Walking the parents
 /// is what makes this label-aware: `notdoubleclick.net` never reaches
 /// `doubleclick.net`, where a substring test would have matched it.
-fn covers(set: &HashSet<String>, host: &str) -> bool {
+///
+/// Shared with [`crate::inject`], so that "a parent domain covers its
+/// subdomains" means the same thing wherever a host is matched against a list.
+pub fn covers(set: &HashSet<String>, host: &str) -> bool {
 	if set.is_empty() {
 		return false;
 	}

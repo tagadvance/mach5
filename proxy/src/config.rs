@@ -29,6 +29,7 @@ pub struct Config {
 	pub plugins: Plugins,
 	pub blocklist: Blocklist,
 	pub internal: Internal,
+	pub inject: Inject,
 	pub tls: Tls,
 	pub limits: Limits,
 	pub quic: Quic,
@@ -160,6 +161,26 @@ pub struct Internal {
 impl Default for Internal {
 	fn default() -> Self {
 		Self { enabled: true }
+	}
+}
+
+/// The tags added to every HTML page: the stylesheet that applies this host's
+/// hidden-element list, and the picker that adds to it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Inject {
+	pub enabled: bool,
+	/// Hosts left exactly as the origin sent them. A parent domain covers its
+	/// subdomains, as in the blocklist.
+	pub exclude: Vec<String>,
+}
+
+impl Default for Inject {
+	fn default() -> Self {
+		Self {
+			enabled: true,
+			exclude: Vec::new(),
+		}
 	}
 }
 
@@ -490,6 +511,16 @@ mod tests {
 			"a wiped cache must not take someone's selectors with it"
 		);
 		assert!(config.internal.enabled, "the endpoints are on by default");
+	}
+
+	#[test]
+	fn injection_is_on_with_nothing_excluded() {
+		let config = Config::from_str("[inject]\nexclude = [\"bank.example\"]\n").unwrap();
+
+		assert!(config.inject.enabled);
+		assert_eq!(config.inject.exclude, vec!["bank.example".to_string()]);
+		assert!(Config::default().inject.enabled);
+		assert!(Config::default().inject.exclude.is_empty());
 	}
 
 	#[test]

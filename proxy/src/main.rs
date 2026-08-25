@@ -10,6 +10,7 @@ mod blocklist;
 mod ca;
 mod config;
 mod encoding;
+mod inject;
 mod interceptor;
 mod internal;
 mod interstitial;

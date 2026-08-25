@@ -69,8 +69,8 @@ pub struct Chain {
 
 impl Chain {
 	/// Build the chain described by the configuration: the blocklist, the
-	/// proxy's own endpoints, then the external plugins in the plugin
-	/// directory, plus the optional response stamp.
+	/// proxy's own endpoints, the page injection, then the external plugins in
+	/// the plugin directory, plus the optional response stamp.
 	pub fn from_config(config: &crate::config::Config) -> Self {
 		let mut links: Vec<Box<dyn Interceptor>> = Vec::new();
 
@@ -86,6 +86,12 @@ impl Chain {
 		// the proxy's own endpoints.
 		if config.internal.enabled {
 			links.push(Box::new(crate::internal::Internal::new(config)));
+		}
+
+		// Before the plugins: a plugin should see the page as the origin wrote
+		// it, not with our tags already spliced into it.
+		if config.inject.enabled {
+			links.push(Box::new(crate::inject::Inject::new(config)));
 		}
 
 		if config.plugins.enabled {

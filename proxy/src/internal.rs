@@ -7,9 +7,10 @@
 //! reach them.
 //!
 //! Everything under `/.mach5/` is answered here and never forwarded upstream.
-//! The one endpoint so far is the per-site list of CSS selectors to hide: a
-//! self-hosted cosmetic filter, where the blocklist deliberately stops at
-//! domain matching.
+//! The endpoints are the per-site list of CSS selectors to hide — a self-hosted
+//! cosmetic filter, where the blocklist deliberately stops at domain matching —
+//! plus the two files [`crate::inject`] points every page at: the stylesheet
+//! that applies the list, and the picker that adds to it.
 //!
 //! Which list a request touches is decided by [`crate::host_of`] on the URL the
 //! client asked for, never by anything in the request itself. Same-origin is
@@ -35,6 +36,22 @@ const PREFIX: &str = "/.mach5/";
 /// without limit.
 const MAX_SELECTOR_BYTES: usize = 512;
 const MAX_SELECTORS_PER_HOST: usize = 500;
+
+/// The picker, compiled into the binary rather than read from disk. A file on
+/// disk would be one more thing to mount into the container — and one more way
+/// for a deployment to serve a script that does not match the proxy running it.
+const SCRIPT: &str = include_str!("mach5.js");
+
+/// Characters that would let a stored selector break out of the rule it is
+/// written into: closing the block, starting an at-rule, ending the declaration,
+/// escaping a character, or closing the `<style>`-shaped context a browser might
+/// parse the response in if it were ever served as something other than CSS.
+///
+/// A selector containing one is dropped from the stylesheet rather than escaped.
+/// Selectors are typed into the store by a page, so this is the boundary where a
+/// hostile one has to stop; and nothing the picker generates contains any of
+/// these, so there is no legitimate selector to preserve by escaping it.
+const CSS_FORBIDDEN: [char; 7] = ['<', '>', '{', '}', '@', ';', '\\'];
 
 /// The hidden-element selectors, per host, kept in memory and mirrored to disk.
 ///
@@ -173,7 +190,15 @@ impl Internal {
 
 				empty(204)
 			}
-			("/.mach5/hidden" | "/.mach5/hidden/clear", _) => empty(405),
+			("/.mach5/hidden.css", "GET") => self.stylesheet(host),
+			("/.mach5/mach5.js", "GET") => script(),
+			(
+				"/.mach5/hidden"
+				| "/.mach5/hidden/clear"
+				| "/.mach5/hidden.css"
+				| "/.mach5/mach5.js",
+				_,
+			) => empty(405),
 			_ => empty(404),
 		}
 	}
@@ -189,6 +214,33 @@ impl Internal {
 			.headers
 			.push(("content-type".to_string(), "application/json".to_string()));
 		response.body = body;
+
+		response
+	}
+
+	/// This host's list as a stylesheet, which is how it actually takes effect:
+	/// the browser applies it before first paint, so nothing flashes on screen
+	/// before the script has had a chance to run. A host with nothing hidden
+	/// gets an empty body rather than a 404 — it is not an error to have hidden
+	/// nothing yet.
+	fn stylesheet(&self, host: &str) -> ProxyResponse {
+		let usable: Vec<String> = self
+			.store
+			.selectors(host)
+			.into_iter()
+			.filter(|selector| !selector.contains(CSS_FORBIDDEN))
+			.collect();
+
+		let mut response = empty(200);
+		response.headers.push((
+			"content-type".to_string(),
+			"text/css; charset=utf-8".to_string(),
+		));
+
+		if !usable.is_empty() {
+			response.body =
+				format!("{} {{ display: none !important }}", usable.join(", ")).into_bytes();
+		}
 
 		response
 	}
@@ -244,6 +296,24 @@ struct Hidden {
 #[derive(Deserialize)]
 struct Hide {
 	selector: String,
+}
+
+/// The picker library. The only endpoint here that is the same for every host,
+/// and so the only one worth caching — briefly. Five minutes is long enough to
+/// keep it off the wire for a browsing session and short enough that a
+/// redeployed proxy is running its own script again almost immediately.
+fn script() -> ProxyResponse {
+	ProxyResponse {
+		status: 200,
+		headers: vec![
+			(
+				"content-type".to_string(),
+				"text/javascript; charset=utf-8".to_string(),
+			),
+			("cache-control".to_string(), "max-age=300".to_string()),
+		],
+		body: SCRIPT.as_bytes().to_vec(),
+	}
 }
 
 /// A bodyless response.
@@ -539,6 +609,112 @@ mod tests {
 	}
 
 	#[test]
+	fn the_stylesheet_applies_this_hosts_list() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		for selector in [".promo", "#ad"] {
+			call(
+				&internal,
+				"POST",
+				"https://example.com/.mach5/hidden",
+				&format!(r#"{{"selector":"{selector}"}}"#),
+			);
+		}
+
+		let response = call(&internal, "GET", "https://example.com/.mach5/hidden.css", "");
+
+		assert_eq!(response.status, 200);
+		assert_eq!(
+			body_of(&response),
+			"#ad, .promo { display: none !important }"
+		);
+		assert!(response
+			.headers
+			.iter()
+			.any(|(k, v)| k == "content-type" && v == "text/css; charset=utf-8"));
+		assert!(response
+			.headers
+			.iter()
+			.any(|(k, v)| k == "cache-control" && v == "no-store"));
+	}
+
+	#[test]
+	fn a_host_with_nothing_hidden_gets_an_empty_stylesheet() {
+		let dir = TempDir::new().unwrap();
+		let response = call(
+			&internal(&dir),
+			"GET",
+			"https://example.com/.mach5/hidden.css",
+			"",
+		);
+
+		assert_eq!(response.status, 200);
+		assert!(response.body.is_empty(), "no rule, not an empty rule");
+	}
+
+	#[test]
+	fn a_hostile_selector_never_reaches_the_stylesheet() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+		let url = "https://example.com/.mach5/hidden";
+
+		for selector in [
+			".x } body { display: none",
+			"@import url(https://evil.example/x.css)",
+			".x; color: red",
+			"</style><script>alert(1)</script>",
+			".x > .y",
+			".x\\3c ",
+		] {
+			let stored = call(
+				&internal,
+				"POST",
+				url,
+				&serde_json::json!({ "selector": selector }).to_string(),
+			);
+
+			assert_eq!(stored.status, 204, "the store itself takes anything");
+		}
+
+		call(&internal, "POST", url, r##"{"selector":"#ad"}"##);
+
+		let css = body_of(&call(
+			&internal,
+			"GET",
+			"https://example.com/.mach5/hidden.css",
+			"",
+		));
+
+		assert_eq!(
+			css, "#ad { display: none !important }",
+			"only the harmless selector survives"
+		);
+	}
+
+	#[test]
+	fn the_script_is_served_as_javascript() {
+		let dir = TempDir::new().unwrap();
+		let response = call(
+			&internal(&dir),
+			"GET",
+			"https://example.com/.mach5/mach5.js",
+			"",
+		);
+
+		assert_eq!(response.status, 200);
+		assert_eq!(response.body, SCRIPT.as_bytes());
+		assert!(response
+			.headers
+			.iter()
+			.any(|(k, v)| k == "content-type" && v == "text/javascript; charset=utf-8"));
+		assert!(response
+			.headers
+			.iter()
+			.any(|(k, v)| k == "cache-control" && v == "max-age=300"));
+	}
+
+	#[test]
 	fn an_unknown_endpoint_is_not_found() {
 		let dir = TempDir::new().unwrap();
 		let internal = internal(&dir);
@@ -568,5 +744,12 @@ mod tests {
 
 		assert_eq!(deleted.status, 405);
 		assert_eq!(got.status, 405);
+
+		for url in [
+			"https://example.com/.mach5/hidden.css",
+			"https://example.com/.mach5/mach5.js",
+		] {
+			assert_eq!(call(&internal, "POST", url, "").status, 405, "{url}");
+		}
 	}
 }

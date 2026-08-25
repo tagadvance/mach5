@@ -125,6 +125,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 		);
 	}
 
+	// Before the front ends, so the first fetch of every list is already under
+	// way while they come up. One refresher for the process; it returns as soon
+	// as its thread exists, and never waits on the network here.
+	blocklist::spawn_refresh(config.clone());
+
 	let ca = Arc::new(CertAuthority::from_config(&config)?);
 	tcp::spawn(config.clone(), ca.clone())?;
 

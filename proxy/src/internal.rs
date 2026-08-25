@@ -206,9 +206,11 @@ pub struct Internal {
 	/// How long a typed bypass lasts, or `None` when the mechanism is off.
 	bypass_ttl: Option<std::time::Duration>,
 	metrics: Arc<Metrics>,
-	/// The loaded blocklist, or `None` when blocking is switched off. The status
-	/// page needs to tell "nothing was blocked" apart from "there is no list".
-	blocklist: Option<Arc<crate::blocklist::Blocklist>>,
+	/// The blocklist registry, or `None` when blocking is switched off. The
+	/// status page needs to tell "nothing was blocked" apart from "there is no
+	/// list", and — since a refresh replaces the list underneath us — the
+	/// registry rather than the list it held when this was built.
+	blocklist: Option<Arc<crate::blocklist::Blocklists>>,
 }
 
 impl Internal {
@@ -311,8 +313,8 @@ impl Internal {
 			// report as one.
 			self.blocklist
 				.as_ref()
-				.map(|list| list.len())
-				.filter(|domains| *domains > 0),
+				.map(|lists| lists.current().status())
+				.filter(|list| list.domains > 0),
 		);
 
 		let mut response = empty(200);
@@ -510,24 +512,30 @@ addEventListener('click', (e) => {
 
 /// Render the status page.
 ///
-/// `domains` is `None` when no blocklist is loaded, which is not the same thing
-/// as one that has blocked nothing: a bare zero there would read as "this is
+/// `list` is `None` when no blocklist is loaded, which is not the same thing as
+/// one that has blocked nothing: a bare zero there would read as "this is
 /// working and there was nothing to block".
 fn status_page(
 	host: &str,
 	counted: &Snapshot,
 	selectors: &[String],
 	bypassed: bool,
-	domains: Option<usize>,
+	list: Option<crate::blocklist::Status>,
 ) -> String {
 	let host = escape(host);
 	let uptime = metrics::uptime(std::time::Duration::from_secs(counted.uptime_seconds));
 	let requests = metrics::thousands(counted.requests);
-	let blocked = match domains {
-		Some(domains) => format!(
-			r#"<td>{} <span class="note">of {} domains</span></td>"#,
+	// How long ago it was refreshed, and out of how many lists, because a list
+	// that quietly stopped being updated blocks less every week and says
+	// nothing about it.
+	let blocked = match list {
+		Some(list) => format!(
+			r#"<td>{} <span class="note">of {} domains, from {} {}, refreshed {} ago</span></td>"#,
 			metrics::thousands(counted.blocked),
-			metrics::thousands(domains as u64)
+			metrics::thousands(list.domains as u64),
+			list.sources,
+			if list.sources == 1 { "list" } else { "lists" },
+			metrics::uptime(list.age)
 		),
 		None => r#"<td class="note">no blocklist loaded</td>"#.to_string(),
 	};
@@ -1253,13 +1261,16 @@ mod tests {
 
 		let file = dir.path().join("hosts.txt");
 		std::fs::write(&file, "0.0.0.0 ads.example.com\n0.0.0.0 ads.example.net\n").unwrap();
-		internal.blocklist = Some(Arc::new(crate::blocklist::Blocklist::load(&[file], &[])));
+		internal.blocklist = Some(Arc::new(crate::blocklist::Blocklists::new(
+			crate::blocklist::Blocklist::load(&[file], &[]),
+		)));
 		internal.metrics.blocked.add(9);
 
 		let loaded = body_of(&call(&internal, "GET", "https://example.com/.mach5/", ""));
 
 		assert!(loaded.contains("of 2 domains"), "{loaded}");
 		assert!(loaded.contains(">9 "), "{loaded}");
+		assert!(loaded.contains("from 1 list, refreshed 0s ago"), "{loaded}");
 		assert!(!loaded.contains("no blocklist loaded"));
 	}
 

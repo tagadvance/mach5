@@ -47,10 +47,30 @@ stamp_responses = false
 # Adblock-style domain lists (EasyList's `||ads.example.com^` anchors and `@@||`
 # exceptions). Anything beyond a domain match is skipped.
 #
-# The lists are read from inside the container, so mount them in — compose does
-# this the same way it mounts the plugins and the CA.
+# The lists in `files` are read from inside the container, so mount them in —
+# compose does this the same way it mounts the plugins and the CA. The ones in
+# `urls` need no mount at all, which makes them the easier half in a container.
 enabled = true
 # files = ["/etc/mach5/lists/hosts"]
+
+# Lists to fetch rather than read. The obvious one is StevenBlack's unified
+# hosts file, which is rebuilt continuously and needs nothing else:
+# urls = ["https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"]
+#
+# Each fetched list is cached under cache_dir as blocklists/<hash-of-url>.txt,
+# so the cache_dir volume above is what makes a restart come up blocking
+# immediately instead of waiting on the network — without it every restart
+# starts with nothing and refetches the lot. The origin certificate is
+# validated, as it is for everything else mach5 fetches. An etag or
+# last-modified is remembered beside the cache and sent back, so an unchanged
+# list costs a 304 rather than a download — and a fetch that fails falls back to
+# the cached copy and warns, never to an empty list.
+
+# How often the files are re-read and the URLs re-fetched, on one background
+# thread; the container never waits on it, at startup or afterwards. Staleness
+# in a blocker is silent — things quietly stop being blocked and nothing says
+# so — which is why this is on by default. 0 switches refreshing off.
+refresh_hours = 24
 # Never blocked, whatever the lists say. Covers subdomains too.
 # allow = ["example.com"]
 

@@ -138,11 +138,17 @@ impl Default for Plugins {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Blocklist {
-	/// With no files loaded this is a no-op, so it costs nothing to leave on.
+	/// With no lists loaded this is a no-op, so it costs nothing to leave on.
 	pub enabled: bool,
 	pub files: Vec<PathBuf>,
+	/// Lists to fetch rather than read. Each is cached under `cache_dir`, so a
+	/// restart without a network still starts with yesterday's copy.
+	pub urls: Vec<String>,
 	/// Domains never blocked, whatever the lists say.
 	pub allow: Vec<String>,
+	/// How often to re-read the files and re-fetch the URLs. Zero switches
+	/// refreshing off, which leaves every list as stale as the last restart.
+	pub refresh_hours: u32,
 }
 
 impl Default for Blocklist {
@@ -150,7 +156,9 @@ impl Default for Blocklist {
 		Self {
 			enabled: true,
 			files: Vec::new(),
+			urls: Vec::new(),
 			allow: Vec::new(),
+			refresh_hours: 24,
 		}
 	}
 }
@@ -529,6 +537,27 @@ mod tests {
 
 		assert_eq!(config.blocklist.files, vec![home().join("lists/hosts")]);
 		assert!(config.blocklist.enabled, "a list with no files is a no-op");
+		assert!(config.blocklist.urls.is_empty(), "nothing is fetched unasked");
+		assert_eq!(config.blocklist.refresh_hours, 24, "daily by default");
+	}
+
+	#[test]
+	fn a_blocklist_can_be_fetched_as_well_as_read() {
+		let config = Config::from_str(
+			r#"
+			[blocklist]
+			urls = ["https://example.com/hosts"]
+			refresh_hours = 6
+			"#,
+		)
+		.unwrap();
+
+		assert_eq!(
+			config.blocklist.urls,
+			vec!["https://example.com/hosts".to_string()]
+		);
+		assert_eq!(config.blocklist.refresh_hours, 6);
+		assert!(config.blocklist.files.is_empty(), "files stay optional");
 	}
 
 	#[test]

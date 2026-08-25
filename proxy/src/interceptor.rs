@@ -99,12 +99,12 @@ impl Chain {
 		// box falls over.
 		links.push(Box::new(crate::upstream::LoopGuard));
 
-		// First, so a blocked request never reaches a plugin at all.
+		// First, so a blocked request never reaches a plugin at all. Added even
+		// when the list is empty, because a refresh may fill it later and the
+		// chain is built once: an empty set costs one early return in
+		// `blocklist::covers` per request, and nothing else.
 		if config.blocklist.enabled {
-			let blocklist = crate::blocklist::shared(config);
-			if !blocklist.is_empty() {
-				links.push(Box::new(blocklist));
-			}
+			links.push(Box::new(crate::blocklist::shared(config)));
 		}
 
 		// Before the plugins: a plugin has no business seeing — or answering —

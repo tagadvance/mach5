@@ -65,9 +65,30 @@ stamp_responses = false
 # Adblock-style domain lists — EasyList's `||ads.example.com^` anchors and its
 # `@@||` exceptions are both understood. Anything beyond a domain match —
 # cosmetic rules, URL patterns, regexes — is skipped; this is not a filter
-# engine. Nothing is bundled: point this at lists you keep updated yourself.
+# engine. Nothing is bundled: point `files` at lists on disk, `urls` at lists to
+# fetch, or both.
 enabled = true
 # files = ["~/.config/mach5/hosts", "~/.config/mach5/easylist.txt"]
+
+# Lists to fetch rather than read. The obvious one is StevenBlack's unified
+# hosts file, which is rebuilt continuously and needs nothing else:
+# urls = ["https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"]
+#
+# Each fetched list is cached under cache_dir as blocklists/<hash-of-url>.txt,
+# so a restart with no network still comes up with yesterday's copy. The origin
+# certificate is validated, as it is for everything else mach5 fetches: a file
+# that decides what gets blocked is not one to take from whoever is on the wire.
+# An etag or last-modified is remembered beside the cache and sent back, so an
+# unchanged list costs a 304 rather than a download — and a fetch that fails
+# falls back to the cached copy and warns, never to an empty list.
+
+# How often the files are re-read and the URLs re-fetched, on one background
+# thread; the proxy never waits on it, at startup or afterwards. A hosts file
+# downloaded once is stale a month later, and staleness here is silent — things
+# quietly stop being blocked and nothing says so — which is why this is on by
+# default. 0 switches refreshing off: lists are then whatever they were when the
+# proxy last started.
+refresh_hours = 24
 # Never blocked, whatever the lists say. Covers subdomains too.
 # allow = ["example.com"]
 

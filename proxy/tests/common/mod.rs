@@ -1,0 +1,322 @@
+//! Plumbing for the integration tests: a real proxy process to talk to, and
+//! the smallest HTTPS client that can hold a conversation with it.
+//!
+//! Everything here exists so a test can assert on what actually comes back out
+//! of the socket. The unit tests already cover the interceptors in isolation;
+//! what they cannot see is TLS termination, the SNI the origin is deduced
+//! from, hyper's framing, and the headers the TCP front end adds on the way
+//! out — which is exactly where a mistake would strand a real browser.
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use boring::ssl::{SslConnector, SslMethod, SslVerifyMode};
+use tempfile::TempDir;
+
+/// How long to give the binary to be listening. Generous, because it is only
+/// ever waited out on a genuine failure — the happy path returns in the tens
+/// of milliseconds.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A port nothing is listening on, found by letting the kernel pick one and
+/// then letting go of it.
+///
+/// Racy in principle: anything could claim the port between the drop and the
+/// proxy's bind. Fine here — a test machine is not competing for ports, and
+/// the alternative is teaching the binary to accept an inherited socket for
+/// the sake of the tests.
+pub fn free_port() -> u16 {
+	let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
+
+	listener.local_addr().expect("bound address").port()
+}
+
+/// A running `mach5-proxy`, its configuration and state confined to a
+/// temporary directory that goes away with it.
+pub struct Proxy {
+	child: Child,
+	dir: TempDir,
+	tcp_port: u16,
+	alt_svc: String,
+}
+
+impl Proxy {
+	/// Start a proxy with the given blocklist and wait until it answers.
+	///
+	/// Plugins are off: it makes startup immediate, and it keeps the tests
+	/// from needing a Python interpreter to say anything about the blocklist.
+	pub fn start(blocklist: &str) -> Self {
+		let dir = TempDir::new().expect("temporary directory");
+		let tcp_port = free_port();
+		// The QUIC listener wants a port of its own, and refuses to start
+		// without one. A TCP and a UDP port of the same number never collide,
+		// so it does not matter if the two probes hand back the same one.
+		let udp_port = free_port();
+		let alt_svc = format!(r#"h3=":{udp_port}"; ma=86400"#);
+
+		let path = dir.path();
+		std::fs::write(path.join("blocklist.txt"), blocklist).expect("write the blocklist");
+
+		let config = path.join("mach5.toml");
+		std::fs::write(
+			&config,
+			format!(
+				"listen = \"127.0.0.1:{udp_port}\"\n\
+				 listen_tcp = \"127.0.0.1:{tcp_port}\"\n\
+				 \n\
+				 [http]\n\
+				 alt_svc = '{alt_svc}'\n\
+				 \n\
+				 [plugins]\n\
+				 enabled = false\n\
+				 \n\
+				 [blocklist]\n\
+				 files = [\"{blocklist_file}\"]\n\
+				 \n\
+				 [paths]\n\
+				 cache_dir = \"{cache}\"\n\
+				 state_dir = \"{state}\"\n\
+				 \n\
+				 [limits]\n\
+				 worker_threads = 2\n",
+				blocklist_file = path.join("blocklist.txt").display(),
+				cache = path.join("cache").display(),
+				state = path.display(),
+			),
+		)
+		.expect("write the configuration");
+
+		// Captured to a file rather than a pipe: nothing here reads the child
+		// while a test runs, and a pipe nobody drains eventually blocks the
+		// process that is filling it.
+		let log = std::fs::File::create(path.join("proxy.log")).expect("create the log");
+		let stderr = log.try_clone().expect("share the log");
+
+		let child = Command::new(env!("CARGO_BIN_EXE_mach5-proxy"))
+			.env("MACH5_CONFIG", &config)
+			.env("RUST_LOG", "info")
+			.stdin(Stdio::null())
+			.stdout(Stdio::from(log))
+			.stderr(Stdio::from(stderr))
+			.spawn()
+			.expect("spawn the proxy");
+
+		let mut proxy = Self {
+			child,
+			dir,
+			tcp_port,
+			alt_svc,
+		};
+		proxy.await_ready();
+
+		proxy
+	}
+
+	/// The `alt-svc` value this instance was configured to advertise, so a test
+	/// can assert on the exact string rather than merely on its presence.
+	pub fn alt_svc(&self) -> &str {
+		&self.alt_svc
+	}
+
+	/// Where the hidden-element store is mirrored to disk.
+	pub fn hidden_json(&self) -> PathBuf {
+		self.dir.path().join("hidden.json")
+	}
+
+	pub fn get(&self, host: &str, path: &str) -> Response {
+		self.send("GET", host, path, &[], "")
+	}
+
+	pub fn post(&self, host: &str, path: &str, body: &str) -> Response {
+		self.send(
+			"POST",
+			host,
+			path,
+			&[("content-type", "application/json")],
+			body,
+		)
+	}
+
+	/// One request over one fresh TLS connection.
+	pub fn send(
+		&self,
+		method: &str,
+		host: &str,
+		path: &str,
+		headers: &[(&str, &str)],
+		body: &str,
+	) -> Response {
+		let mut connector = SslConnector::builder(SslMethod::tls()).expect("a tls client");
+		// The proxy is running an ephemeral in-memory dev CA, so there is no
+		// root to check its leaves against and nothing to be gained by
+		// pretending otherwise. This is the *test client* being permissive; it
+		// says nothing about the proxy's own upstream validation, which stays
+		// strict and has its own interstitial when it fails.
+		connector.set_verify(SslVerifyMode::NONE);
+		// Ask for HTTP/1.1 outright: the proxy offers h2 first, and these
+		// requests are written by hand.
+		connector
+			.set_alpn_protos(b"\x08http/1.1")
+			.expect("advertise http/1.1");
+		let connector = connector.build();
+
+		let tcp = TcpStream::connect(("127.0.0.1", self.tcp_port)).expect("connect to the proxy");
+		tcp.set_read_timeout(Some(Duration::from_secs(30)))
+			.expect("a read timeout");
+
+		// The SNI is how the proxy learns which origin was wanted — in a
+		// transparent deployment it has no other clue — so the host under test
+		// goes here, not only in the `Host` header.
+		let mut stream = connector
+			.configure()
+			.expect("a tls configuration")
+			.use_server_name_indication(true)
+			.verify_hostname(false)
+			.connect(host, tcp)
+			.expect("tls handshake");
+
+		let mut request =
+			format!("{method} {path} HTTP/1.1\r\nhost: {host}\r\nconnection: close\r\n");
+		for (name, value) in headers {
+			request.push_str(&format!("{name}: {value}\r\n"));
+		}
+		request.push_str(&format!("content-length: {}\r\n\r\n{body}", body.len()));
+
+		stream
+			.write_all(request.as_bytes())
+			.expect("write the request");
+		stream.flush().expect("flush the request");
+
+		read_response(&mut stream)
+	}
+
+	fn await_ready(&mut self) {
+		let deadline = Instant::now() + STARTUP_TIMEOUT;
+
+		while Instant::now() < deadline {
+			if TcpStream::connect(("127.0.0.1", self.tcp_port)).is_ok() {
+				return;
+			}
+
+			if let Ok(Some(status)) = self.child.try_wait() {
+				panic!("proxy exited during startup ({status})\n{}", self.log());
+			}
+
+			std::thread::sleep(Duration::from_millis(25));
+		}
+
+		panic!(
+			"proxy never listened on 127.0.0.1:{}\n{}",
+			self.tcp_port,
+			self.log()
+		);
+	}
+
+	fn log(&self) -> String {
+		std::fs::read_to_string(self.dir.path().join("proxy.log")).unwrap_or_default()
+	}
+}
+
+impl Drop for Proxy {
+	/// Kill the child here rather than at the end of each test: a failing
+	/// assertion unwinds, and a proxy left holding its ports would outlive the
+	/// run that started it.
+	fn drop(&mut self) {
+		let _ = self.child.kill();
+		let _ = self.child.wait();
+	}
+}
+
+pub struct Response {
+	pub status: u16,
+	pub headers: Vec<(String, String)>,
+	pub body: Vec<u8>,
+}
+
+impl Response {
+	/// Header names are lowercased on the way in, so callers ask in lowercase.
+	pub fn header(&self, name: &str) -> Option<&str> {
+		self.headers
+			.iter()
+			.find(|(header, _)| header == name)
+			.map(|(_, value)| value.as_str())
+	}
+
+	pub fn text(&self) -> String {
+		String::from_utf8(self.body.clone()).expect("a textual response")
+	}
+}
+
+struct Head {
+	status: u16,
+	headers: Vec<(String, String)>,
+	/// Bytes of the buffer the head consumed; the rest is already body.
+	len: usize,
+}
+
+fn read_response(stream: &mut impl Read) -> Response {
+	let mut buf = Vec::new();
+	let mut chunk = [0u8; 4096];
+
+	let head = loop {
+		if let Some(head) = parse_head(&buf) {
+			break head;
+		}
+
+		let read = stream.read(&mut chunk).expect("read the response");
+		assert!(read > 0, "connection closed before the response head");
+		buf.extend_from_slice(&chunk[..read]);
+	};
+
+	// Every response asserted on here declares a length, or has no body at all.
+	// Nothing under test streams, so there is no chunked decoding to do.
+	let length: usize = head
+		.headers
+		.iter()
+		.find(|(name, _)| name == "content-length")
+		.map(|(_, value)| value.parse().expect("a numeric content-length"))
+		.unwrap_or(0);
+
+	let mut body = buf[head.len..].to_vec();
+	while body.len() < length {
+		let read = stream.read(&mut chunk).expect("read the body");
+		assert!(read > 0, "connection closed mid-body");
+		body.extend_from_slice(&chunk[..read]);
+	}
+	body.truncate(length);
+
+	Response {
+		status: head.status,
+		headers: head.headers,
+		body,
+	}
+}
+
+/// `None` while the blank line ending the head has not arrived yet.
+fn parse_head(buf: &[u8]) -> Option<Head> {
+	let mut headers = [httparse::EMPTY_HEADER; 64];
+	let mut response = httparse::Response::new(&mut headers);
+
+	let httparse::Status::Complete(len) = response.parse(buf).expect("a well-formed response")
+	else {
+		return None;
+	};
+
+	Some(Head {
+		status: response.code.expect("a complete response has a status"),
+		headers: response
+			.headers
+			.iter()
+			.map(|header| {
+				(
+					header.name.to_ascii_lowercase(),
+					String::from_utf8_lossy(header.value).into_owned(),
+				)
+			})
+			.collect(),
+		len,
+	})
+}

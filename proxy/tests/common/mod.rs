@@ -7,7 +7,7 @@
 //! from, hyper's framing, and the headers the TCP front end adds on the way
 //! out — which is exactly where a mistake would strand a real browser.
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -81,7 +81,8 @@ impl Proxy {
 				 state_dir = \"{state}\"\n\
 				 \n\
 				 [limits]\n\
-				 worker_threads = 2\n",
+				 worker_threads = 2\n\
+				 max_request_body_mb = 1\n",
 				blocklist_file = path.join("blocklist.txt").display(),
 				cache = path.join("cache").display(),
 				state = path.display(),
@@ -185,10 +186,17 @@ impl Proxy {
 		}
 		request.push_str(&format!("content-length: {}\r\n\r\n{body}", body.len()));
 
-		stream
-			.write_all(request.as_bytes())
-			.expect("write the request");
-		stream.flush().expect("flush the request");
+		// A short write is not a failure here. The proxy answers a blocked
+		// upload without reading the rest of it, so a client still pushing the
+		// body gets a broken pipe — which is the point, and which a real client
+		// handles by going on to read the response it was already sent.
+		match stream.write_all(request.as_bytes()) {
+			Ok(()) => {
+				let _ = stream.flush();
+			}
+			Err(e) if matches!(e.kind(), ErrorKind::BrokenPipe | ErrorKind::ConnectionReset) => {}
+			Err(e) => panic!("write the request: {e}"),
+		}
 
 		read_response(&mut stream)
 	}

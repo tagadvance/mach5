@@ -33,6 +33,8 @@ you exchanges that match, and only buffers bodies you actually asked for.
 - Reply `{}` (or ignore the hook) to see everything.
 - Add `"chunks": true` to take streaming bodies a chunk at a time instead of
   whole — see [Chunk hooks](#chunk-hooks).
+- Add `"request_body": true` to be given what was **uploaded** — see
+  [Uploaded bodies](#uploaded-bodies).
 
 **This is also how you avoid buffering large media.** A response whose body no
 plugin has claimed streams straight through to the client, never held whole in
@@ -66,6 +68,35 @@ Anything you omit is left as-is, so `{}` means "no change":
 | `status` | response | Replace the status code |
 | `headers` | both | Replace the whole header list |
 | `body_b64` | both | Replace the body (base64, so binary is safe) |
+
+### Uploaded bodies
+
+By default an upload streams past you: the `request` hook still fires, with the
+method, URL and headers, but no `body_b64` and `"streaming": true`.
+
+```json
+{"hook":"request","method":"PUT","url":"https://example.com/f","headers":[],"streaming":true}
+```
+
+That default exists because an upload has no size limit — someone putting a
+2GB file through the proxy is not something to hold in memory on the chance a
+plugin is interested. Ask for it and you get it:
+
+```json
+{"request_body": true}
+```
+
+Then the body arrives as `body_b64` like any other, and `max_request_body_mb`
+applies: an upload past that is refused with a `413` rather than buffered. So
+narrow your `match` if you ask for this — a filter of `{}` means every upload
+through the proxy is held in memory for you, and anything over the limit stops
+working.
+
+> A request the proxy answers itself — a blocked host, or one of its own
+> `/.mach5/` endpoints — is refused *before* the body is read, so you will not
+> see a hook for it at all. That ordering is deliberate: it is what lets a
+> blocked upload be turned away after a few kilobytes instead of after all of
+> it.
 
 ### Answering a request yourself
 

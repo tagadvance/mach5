@@ -38,11 +38,18 @@ def on_init(_msg):
     Adding `"chunks": True` here would swap the buffered `response` hook for the
     per-chunk one below. We do not, because this plugin rewrites HTML and a
     chunk arrives still `content-encoding`d.
+
+    `"request_body": True` would additionally hand us whatever was uploaded.
+    We do not ask: this plugin only needs the URL, and asking would mean every
+    upload through the proxy was held in memory for us and capped at
+    `max_request_body_mb`.
     """
     return {"match": {"response": {"content-type": "text/html"}}}
 
 
 def on_request(msg):
+    # `msg["streaming"]` is True here: we did not ask for the body, so it is on
+    # its way upstream while we look at the URL.
     url = msg.get("url", "")
     host = url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
 

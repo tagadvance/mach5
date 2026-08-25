@@ -163,3 +163,47 @@ fn an_unknown_endpoint_or_method_is_refused() {
 		405
 	);
 }
+
+/// An upload only has to fit in memory when something asked to see it, and
+/// `/.mach5/hidden` is the one endpoint here that does. The harness caps that
+/// at a megabyte, so this is the cap doing its job rather than a limit on what
+/// can be uploaded at all.
+#[test]
+fn a_body_something_wants_to_read_is_capped() {
+	let proxy = Proxy::start(BLOCKLIST);
+	let huge = "x".repeat(2 * 1024 * 1024);
+	let body = format!("{{\"selector\":\"{huge}\"}}");
+
+	let response = proxy.send(
+		"POST",
+		"example.com",
+		"/.mach5/hidden",
+		&[("content-type", "application/json")],
+		&body,
+	);
+
+	assert_eq!(response.status, 413);
+}
+
+/// The upload nobody wants to read is the whole point: a blocked host is
+/// answered without the body being assembled, and — because the blocklist runs
+/// before anything that could ask for it — without being read at all.
+#[test]
+fn a_blocked_upload_is_refused_rather_than_read() {
+	let proxy = Proxy::start(BLOCKLIST);
+	let body = "x".repeat(4 * 1024 * 1024);
+
+	let response = proxy.send(
+		"POST",
+		"ads.example.com",
+		"/upload",
+		&[("content-type", "application/octet-stream")],
+		&body,
+	);
+
+	assert_eq!(
+		response.status, 204,
+		"four megabytes past a one megabyte cap, and still the blocklist's answer"
+	);
+	assert_eq!(response.header("x-mach5"), Some("blocked"));
+}

@@ -1064,6 +1064,7 @@ dependencies = [
  "mio",
  "quiche",
  "rcgen",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",

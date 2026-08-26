@@ -51,6 +51,12 @@ const WAKER: mio::Token = mio::Token(1);
 
 /// Prefix identifying an address-validation token as ours.
 const TOKEN_MARKER: &[u8] = b"mach5";
+/// A Retry token is answered within a round trip or two. Anything older is a
+/// replay, and a replayed one mints connections for as long as it is kept.
+const TOKEN_TTL_SECONDS: u64 = 30;
+const EXPIRY_BYTES: usize = 8;
+/// HMAC-SHA256.
+const TAG_BYTES: usize = 32;
 
 /// How much of a streaming body to relay per chunk.
 const STREAM_CHUNK_SIZE: usize = 64 * 1024;
@@ -183,6 +189,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 	let config = Arc::new(Config::load()?);
 	// Before anything has a URL to log.
 	redact::init(config.log.urls);
+	// Taken here so that a machine with no usable random source refuses to
+	// start, rather than panicking in the event loop on the first Retry.
+	let _ = token_key();
 	let listen = config.listen.0;
 
 	if let Err(e) = std::fs::create_dir_all(&config.paths.cache_dir) {
@@ -807,7 +816,7 @@ fn recv_packet(
 			// handshake bytes at a spoofed victim.
 			let token = hdr.token.as_deref().unwrap_or_default();
 			if token.is_empty() {
-				let new_token = mint_token(&hdr, &from);
+				let new_token = mint_token(&hdr.dcid, &from);
 				let len = quiche::retry(
 					&hdr.scid,
 					&hdr.dcid,
@@ -1367,33 +1376,91 @@ pub(crate) fn authority_host(authority: &str) -> &str {
 		.map_or(authority, |(host, _port)| host)
 }
 
-/// Build an address-validation token: a marker, the client's address, and the
-/// connection id it originally chose (which we must echo back at handshake).
+/// The secret this process signs address-validation tokens with.
 ///
-/// The token is not authenticated, so it proves only that the bearer received
-/// our Retry at this address — which is exactly the amplification defence we
-/// want. It is not a substitute for a signed token if this ever faces a
-/// hostile network.
-fn mint_token(hdr: &quiche::Header, from: &SocketAddr) -> Vec<u8> {
+/// Per process and never written down. A token is handed back within a round
+/// trip or two, so a restart invalidating every outstanding one costs a client
+/// one extra exchange and nothing else.
+fn token_key() -> &'static ring::hmac::Key {
+	static KEY: std::sync::OnceLock<ring::hmac::Key> = std::sync::OnceLock::new();
+
+	KEY.get_or_init(|| {
+		let mut secret = [0u8; 32];
+		// Taken at startup by `main`, so this is a refusal to start rather than
+		// a panic in the event loop. There is nothing to fall back to: an
+		// unsigned token is the reflection attack described below.
+		boring::rand::rand_bytes(&mut secret)
+			.expect("no random bytes for the address-validation key");
+
+		ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &secret)
+	})
+}
+
+/// What the tag covers: who asked, until when, and which connection id.
+///
+/// The address is signed rather than carried. Nothing needs to read it back —
+/// the check is only ever "does this token belong to the address it arrived
+/// from" — and a field nobody parses is a field nobody can get wrong.
+fn token_body(from: &SocketAddr, expiry: &[u8], dcid: &[u8]) -> Vec<u8> {
+	let mut body = address_bytes(from);
+	body.extend_from_slice(expiry);
+	body.extend_from_slice(dcid);
+
+	body
+}
+
+/// Build an address-validation token: a marker, when it stops being good for
+/// anything, the connection id the client originally chose (which we must echo
+/// back at handshake), and a tag over all of it.
+///
+/// The tag is the point. Without one every byte was derivable by whoever sent
+/// the packet, so a forged token validated and `quiche::accept` was told the
+/// address was verified — which lifts the 3× amplification cap. One spoofed
+/// 1200-byte Initial then bought several kilobytes of server flight, leaf
+/// certificate included, aimed at whatever address the attacker claimed to be.
+/// Retry exists to prevent exactly that, and an unauthenticated token does not
+/// prevent it at all.
+fn mint_token(dcid: &quiche::ConnectionId, from: &SocketAddr) -> Vec<u8> {
+	let expiry = (unix_now() + TOKEN_TTL_SECONDS).to_be_bytes();
+	let tag = ring::hmac::sign(token_key(), &token_body(from, &expiry, dcid));
+
 	let mut token = Vec::from(TOKEN_MARKER);
-	token.extend_from_slice(&address_bytes(from));
-	token.extend_from_slice(&hdr.dcid);
+	token.extend_from_slice(&expiry);
+	token.extend_from_slice(dcid);
+	token.extend_from_slice(tag.as_ref());
 
 	token
 }
 
-/// Recover the original connection id from a token, rejecting anything that did
-/// not come from us or arrived from a different address.
+/// Recover the original connection id from a token, rejecting anything we did
+/// not sign, that arrived from another address, or that has expired.
 fn validate_token(from: &SocketAddr, token: &[u8]) -> Option<quiche::ConnectionId<'static>> {
 	let rest = token.strip_prefix(TOKEN_MARKER)?;
-
-	let addr = address_bytes(from);
-	let rest = rest.strip_prefix(addr.as_slice())?;
-	if rest.is_empty() {
+	// An expiry, at least one byte of connection id, and a tag.
+	if rest.len() <= EXPIRY_BYTES + TAG_BYTES {
 		return None;
 	}
 
-	Some(quiche::ConnectionId::from_ref(rest).into_owned())
+	let (body, tag) = rest.split_at(rest.len() - TAG_BYTES);
+	let (expiry, dcid) = body.split_at(EXPIRY_BYTES);
+
+	// Constant time, and it is what binds the token to `from`: the address is
+	// signed rather than carried, so a token minted for anyone else fails here.
+	ring::hmac::verify(token_key(), &token_body(from, expiry, dcid), tag).ok()?;
+
+	let until = u64::from_be_bytes(expiry.try_into().ok()?);
+	if unix_now() > until {
+		return None;
+	}
+
+	Some(quiche::ConnectionId::from_ref(dcid).into_owned())
+}
+
+fn unix_now() -> u64 {
+	std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|since| since.as_secs())
+		.unwrap_or(0)
 }
 
 fn address_bytes(addr: &SocketAddr) -> Vec<u8> {
@@ -1474,32 +1541,80 @@ mod tests {
 		assert_eq!(req.headers, vec![("user-agent".to_string(), "curl".to_string())]);
 	}
 
+	/// Minted through the real function, because the tests it replaces
+	/// assembled tokens by hand and so encoded the very assumption that made
+	/// them forgeable.
+	fn mint(dcid: &[u8], from: &SocketAddr) -> Vec<u8> {
+		mint_token(&quiche::ConnectionId::from_ref(dcid), from)
+	}
+
 	#[test]
 	fn token_round_trips_the_original_connection_id() {
 		let from: SocketAddr = "192.0.2.10:5555".parse().unwrap();
-		let odcid = quiche::ConnectionId::from_ref(b"originalcid");
-
-		let mut token = Vec::from(TOKEN_MARKER);
-		token.extend_from_slice(&address_bytes(&from));
-		token.extend_from_slice(&odcid);
+		let token = mint(b"originalcid", &from);
 
 		let recovered = validate_token(&from, &token).expect("our own token must validate");
 
-		assert_eq!(recovered.as_ref(), odcid.as_ref());
+		assert_eq!(recovered.as_ref(), b"originalcid");
 	}
 
 	#[test]
 	fn token_is_rejected_from_another_address() {
 		let minted_for: SocketAddr = "192.0.2.10:5555".parse().unwrap();
-		let attacker: SocketAddr = "198.51.100.7:5555".parse().unwrap();
+		let token = mint(b"originalcid", &minted_for);
 
+		for other in ["198.51.100.7:5555", "192.0.2.10:5556", "[2001:db8::a]:5555"] {
+			let attacker: SocketAddr = other.parse().unwrap();
+
+			assert!(
+				validate_token(&attacker, &token).is_none(),
+				"a token replayed from {other} must not validate"
+			);
+		}
+	}
+
+	/// The whole point of the tag. Every field of the old token was derivable
+	/// by whoever sent the packet, so a token could simply be written out for
+	/// any address at all — and a validated token tells quiche the address is
+	/// verified, which lifts the amplification cap and turns this into a
+	/// reflector.
+	#[test]
+	fn a_token_nobody_signed_is_rejected() {
+		let victim: SocketAddr = "192.0.2.10:5555".parse().unwrap();
+
+		// Exactly what an attacker can build unaided: our marker, a plausible
+		// expiry, a connection id of its choosing.
+		let mut forged = Vec::from(TOKEN_MARKER);
+		forged.extend_from_slice(&(unix_now() + 10).to_be_bytes());
+		forged.extend_from_slice(b"originalcid");
+		forged.extend_from_slice(&[0u8; TAG_BYTES]);
+
+		assert!(validate_token(&victim, &forged).is_none());
+
+		// And one of ours with a single bit turned over.
+		let mut tampered = mint(b"originalcid", &victim);
+		let last = tampered.len() - 1;
+		tampered[last] ^= 1;
+
+		assert!(validate_token(&victim, &tampered).is_none());
+	}
+
+	#[test]
+	fn an_expired_token_is_rejected() {
+		let from: SocketAddr = "192.0.2.10:5555".parse().unwrap();
+		let expiry = (unix_now() - 1).to_be_bytes();
+		let dcid = b"originalcid";
+
+		// Signed properly, so only the clock refuses it.
+		let tag = ring::hmac::sign(token_key(), &token_body(&from, &expiry, dcid));
 		let mut token = Vec::from(TOKEN_MARKER);
-		token.extend_from_slice(&address_bytes(&minted_for));
-		token.extend_from_slice(b"originalcid");
+		token.extend_from_slice(&expiry);
+		token.extend_from_slice(dcid);
+		token.extend_from_slice(tag.as_ref());
 
 		assert!(
-			validate_token(&attacker, &token).is_none(),
-			"a token replayed from a different address must not validate"
+			validate_token(&from, &token).is_none(),
+			"a token kept past its expiry mints connections for as long as it is held"
 		);
 	}
 
@@ -1507,8 +1622,7 @@ mod tests {
 	fn token_without_our_marker_is_rejected() {
 		let from: SocketAddr = "192.0.2.10:5555".parse().unwrap();
 		let mut token = Vec::from(b"other".as_slice());
-		token.extend_from_slice(&address_bytes(&from));
-		token.extend_from_slice(b"originalcid");
+		token.extend_from_slice(&mint(b"originalcid", &from)[5..]);
 
 		assert!(validate_token(&from, &token).is_none());
 		assert!(validate_token(&from, b"").is_none(), "empty token is invalid");
@@ -1517,8 +1631,12 @@ mod tests {
 	#[test]
 	fn token_with_no_connection_id_is_rejected() {
 		let from: SocketAddr = "192.0.2.10:5555".parse().unwrap();
+		let expiry = (unix_now() + 10).to_be_bytes();
+		let tag = ring::hmac::sign(token_key(), &token_body(&from, &expiry, b""));
+
 		let mut token = Vec::from(TOKEN_MARKER);
-		token.extend_from_slice(&address_bytes(&from));
+		token.extend_from_slice(&expiry);
+		token.extend_from_slice(tag.as_ref());
 
 		assert!(
 			validate_token(&from, &token).is_none(),

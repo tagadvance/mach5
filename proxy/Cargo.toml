@@ -5,6 +5,9 @@ edition = "2021"
 publish = false
 
 [dependencies]
+# Already in the tree behind rustls; taken directly for its HMAC, which is
+# what signs the QUIC address-validation token.
+ring = "0.17"
 quiche = { version = "0.29.3", features = ["boringssl-boring-crate"] }
 boring = "4.3"
 rcgen = { version = "0.14", features = ["x509-parser"] }

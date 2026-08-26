@@ -29,6 +29,7 @@ pub struct Config {
 	pub plugins: Plugins,
 	pub blocklist: Blocklist,
 	pub log: Log,
+	pub passthrough: Passthrough,
 	pub cosmetic: Cosmetic,
 	pub internal: Internal,
 	pub inject: Inject,
@@ -80,6 +81,29 @@ impl Default for Http {
 			keep_alive: true,
 			idle_timeout_seconds: 60,
 			compress: true,
+		}
+	}
+}
+
+/// Hosts mach5 must not decrypt at all.
+///
+/// Distinct from `[inject] exclude`, which only stops mach5 changing a page it
+/// has already read. This stops it reading one.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Passthrough {
+	pub hosts: Vec<String>,
+	/// The port a passed-through connection is carried to. 443 unless mach5 is
+	/// listening somewhere unusual — a transparent deployment cannot recover a
+	/// nonstandard port without `SO_ORIGINAL_DST`, so this is the one knob.
+	pub port: u16,
+}
+
+impl Default for Passthrough {
+	fn default() -> Self {
+		Self {
+			hosts: Vec::new(),
+			port: 443,
 		}
 	}
 }

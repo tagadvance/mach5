@@ -49,6 +49,12 @@ impl Proxy {
 	/// Plugins are off: it makes startup immediate, and it keeps the tests
 	/// from needing a Python interpreter to say anything about the blocklist.
 	pub fn start(blocklist: &str) -> Self {
+		Self::start_with(blocklist, "")
+	}
+
+	/// As [`Self::start`], with extra configuration appended — which is how a
+	/// test says something the shared configuration does not.
+	pub fn start_with(blocklist: &str, extra: &str) -> Self {
 		let dir = TempDir::new().expect("temporary directory");
 		let tcp_port = free_port();
 		// The QUIC listener wants a port of its own, and refuses to start
@@ -82,7 +88,8 @@ impl Proxy {
 				 \n\
 				 [limits]\n\
 				 worker_threads = 2\n\
-				 max_request_body_mb = 1\n",
+				 max_request_body_mb = 1\n\
+				 {extra}\n",
 				blocklist_file = path.join("blocklist.txt").display(),
 				cache = path.join("cache").display(),
 				state = path.display(),
@@ -118,6 +125,10 @@ impl Proxy {
 
 	/// The `alt-svc` value this instance was configured to advertise, so a test
 	/// can assert on the exact string rather than merely on its presence.
+	pub fn tcp_port(&self) -> u16 {
+		self.tcp_port
+	}
+
 	pub fn alt_svc(&self) -> &str {
 		&self.alt_svc
 	}
@@ -327,4 +338,44 @@ fn parse_head(buf: &[u8]) -> Option<Head> {
 			.collect(),
 		len,
 	})
+}
+
+/// A minimal TLS ClientHello carrying one server name.
+///
+/// Hand-built because the point is to control exactly what mach5 reads: a real
+/// TLS client would be doing a handshake, and a passed-through connection never
+/// completes one with mach5 at all.
+pub fn client_hello(host: &[u8]) -> Vec<u8> {
+	let mut names = vec![0u8];
+	names.extend_from_slice(&(host.len() as u16).to_be_bytes());
+	names.extend_from_slice(host);
+
+	let mut server_name = Vec::new();
+	server_name.extend_from_slice(&(names.len() as u16).to_be_bytes());
+	server_name.extend_from_slice(&names);
+
+	let mut extensions = Vec::new();
+	extensions.extend_from_slice(&0u16.to_be_bytes());
+	extensions.extend_from_slice(&(server_name.len() as u16).to_be_bytes());
+	extensions.extend_from_slice(&server_name);
+
+	let mut hello = vec![0x03, 0x03];
+	hello.extend_from_slice(&[0u8; 32]);
+	hello.push(0);
+	hello.extend_from_slice(&2u16.to_be_bytes());
+	hello.extend_from_slice(&[0x13, 0x01]);
+	hello.push(1);
+	hello.push(0);
+	hello.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+	hello.extend_from_slice(&extensions);
+
+	let mut handshake = vec![0x01];
+	handshake.extend_from_slice(&(hello.len() as u32).to_be_bytes()[1..]);
+	handshake.extend_from_slice(&hello);
+
+	let mut record = vec![0x16, 0x03, 0x01];
+	record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+	record.extend_from_slice(&handshake);
+
+	record
 }

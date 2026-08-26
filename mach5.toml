@@ -187,6 +187,35 @@ enabled = true
 # rather mach5 did not modify the page at all.
 # exclude = ["bank.example"]
 
+[passthrough]
+# Hosts mach5 must never decrypt.
+#
+# Everywhere else mach5 terminates TLS, which means it holds the plaintext of
+# everything it carries. For most of the web that is the point. For a bank it is
+# the wrong guarantee, and `[inject] exclude` does not give the right one — that
+# only stops mach5 *changing* a page it has already read.
+#
+# A listed host is answered by nobody here. mach5 reads the name out of the
+# ClientHello without replying to it, opens a socket to the real origin, and
+# copies bytes between the two. It never has the keys, never sees a byte of
+# plaintext, and your browser checks the origin's own certificate — which is
+# also the only arrangement a certificate-pinning app will accept.
+#
+# A parent covers its subdomains, as in the blocklist: `example-bank.com` covers
+# `secure.example-bank.com`, which is what anyone writing that line meant.
+#
+# Two things worth knowing. A passed-through host gets none of mach5 — no
+# blocking, no cosmetic filtering, no picker, no compression — because none of
+# that is possible without reading the page; that is the trade. And a client
+# that already knows about HTTP/3 for such a host has its h3 handshake refused
+# on purpose, so it falls back to TCP where passthrough works.
+# hosts = ["example-bank.com", "myhealthprovider.example"]
+
+# Where a passed-through connection is carried to. 443 unless mach5 is
+# listening somewhere unusual; a transparent deployment cannot recover a
+# nonstandard port without SO_ORIGINAL_DST.
+port = 443
+
 [log]
 # How much of a URL is written to the log.
 #

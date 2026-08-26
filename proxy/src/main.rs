@@ -19,6 +19,7 @@ mod interceptor;
 mod internal;
 mod interstitial;
 mod metrics;
+mod passthrough;
 mod plugin;
 mod redact;
 mod tcp;
@@ -544,9 +545,25 @@ fn build_quic_config(
 
 	// Dynamic per-SNI certificate: mint a leaf for the requested host and install
 	// it before the handshake picks a certificate.
-	builder.set_servername_callback(move |ssl, _alert| {
+	let passthrough = passthrough::shared(config);
+	builder.set_servername_callback(move |ssl, alert| {
 		if let Some(sni) = ssl.servername(boring::ssl::NameType::HOST_NAME) {
 			let sni = sni.to_string();
+
+			// A host mach5 must not decrypt cannot be served here at all. There
+			// is no splicing a QUIC connection without reading its encrypted
+			// Initial, so the handshake is refused instead and the client falls
+			// back to TCP, where passthrough works. It will not have been told
+			// about h3 for this host by us in the first place — we never see its
+			// responses — so this only catches a client that learned about h3
+			// somewhere else.
+			if passthrough.covers(&sni) {
+				log::info!("refusing h3 for {sni} so it can be passed through over tcp");
+				*alert = boring::ssl::SslAlert::HANDSHAKE_FAILURE;
+
+				return Err(boring::ssl::SniError::ALERT_FATAL);
+			}
+
 			if !ca.install(ssl, &sni) {
 				log::warn!("serving default certificate for {sni}");
 			}

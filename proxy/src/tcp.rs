@@ -102,6 +102,7 @@ struct HttpSettings {
 /// Everything a request handler needs, shared across connections.
 struct Shared {
 	config: Arc<Config>,
+	passthrough: Arc<crate::passthrough::Passthrough>,
 	pool: ChainPool,
 	agents: upstream::Agents,
 }
@@ -112,6 +113,7 @@ pub fn spawn(config: Arc<Config>, ca: Arc<CertAuthority>) -> std::io::Result<()>
 	let addr = config.listen_tcp.0;
 
 	let shared = Arc::new(Shared {
+		passthrough: crate::passthrough::shared(&config),
 		pool: ChainPool::new(config.worker_threads(), &config, &ca),
 		agents: upstream::agents(&config),
 		config,
@@ -193,9 +195,20 @@ fn build_acceptor(ca: &Arc<CertAuthority>) -> std::io::Result<SslAcceptor> {
 async fn serve(
 	acceptor: Arc<SslAcceptor>,
 	shared: Arc<Shared>,
-	stream: tokio::net::TcpStream,
+	mut stream: tokio::net::TcpStream,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 	stream.set_nodelay(true)?;
+
+	// Before anything is answered: the name is in the ClientHello, and a listed
+	// host must not be answered at all. Skipped entirely when nothing is
+	// listed, so the common case does not pay for a peek it cannot use.
+	if !shared.passthrough.is_empty() {
+		if let Some(host) = peek_server_name(&mut stream).await {
+			if shared.passthrough.covers(&host) {
+				return splice(stream, &host, shared.passthrough.port()).await;
+			}
+		}
+	}
 
 	let tls = tokio_boring::accept(&acceptor, stream)
 		.await
@@ -549,6 +562,61 @@ fn apply_alt_svc(config: &Config, headers: &mut Vec<(String, String)>) {
 	if !config.http.alt_svc.is_empty() {
 		headers.push(("alt-svc".to_string(), config.http.alt_svc.clone()));
 	}
+}
+
+/// The name the client asked for, read without answering it.
+///
+/// `peek` rather than `read`: the bytes stay in the socket, so whichever way
+/// this goes the ClientHello is still there to be handled — by the TLS
+/// acceptor, or by the origin at the far end of a splice. Nothing has to be
+/// stitched back on.
+async fn peek_server_name(stream: &mut tokio::net::TcpStream) -> Option<String> {
+	let mut buf = [0u8; crate::passthrough::PEEK_BYTES];
+
+	// One peek. A ClientHello arrives in the first packet in practice, and a
+	// client that dribbles one out is terminated as usual — which is the safe
+	// direction for this to be wrong in.
+	let read = stream.peek(&mut buf).await.ok()?;
+
+	crate::passthrough::server_name(&buf[..read])
+}
+
+/// Carry a connection to its origin without decrypting it.
+///
+/// mach5 is a pair of sockets here and nothing else: no certificate, no keys,
+/// no plaintext, no interceptors, no plugins. The client is speaking TLS to the
+/// real origin and checking the real certificate, which is the whole point —
+/// and is also the only arrangement a certificate-pinning app will accept.
+async fn splice(
+	mut client: tokio::net::TcpStream,
+	host: &str,
+	port: u16,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+	let arrived_at = client.local_addr()?;
+	let mut origin = tokio::net::TcpStream::connect((host, port))
+		.await
+		.map_err(|e| format!("cannot reach {host} to pass it through: {e}"))?;
+
+	// The wildcard DNS that points every name here would otherwise have mach5
+	// splice to itself, each connection begetting the next.
+	if origin.peer_addr()? == arrived_at {
+		return Err(format!("{host} resolves to mach5 itself; refusing to splice").into());
+	}
+
+	origin.set_nodelay(true)?;
+	let metrics = crate::metrics::shared();
+	metrics.passed_through.increment();
+	metrics.requests.increment();
+	log::info!("passing {host} through without decrypting it");
+
+	// Both directions until either end closes. The counts are of ciphertext:
+	// what came back is exactly what went to the client, because mach5 did not
+	// touch it.
+	let (_uploaded, returned) = tokio::io::copy_bidirectional(&mut client, &mut origin).await?;
+	metrics.bytes_from_origin.add(returned);
+	metrics.bytes_to_client.add(returned);
+
+	Ok(())
 }
 
 /// Serve a response an interceptor produced instead of fetching the origin.

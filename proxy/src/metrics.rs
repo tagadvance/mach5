@@ -58,6 +58,8 @@ pub struct Metrics {
 	pub requests: Counter,
 	/// Requests the blocklist answered instead of the origin.
 	pub blocked: Counter,
+	/// Connections spliced to the origin without ever being decrypted.
+	pub passed_through: Counter,
 	/// Requests answered by the proxy's own endpoints under `/.mach5/`.
 	pub internal: Counter,
 	/// Pages that actually had the tags spliced into them.
@@ -95,6 +97,7 @@ impl Default for Metrics {
 			started: Instant::now(),
 			requests: Counter::default(),
 			blocked: Counter::default(),
+			passed_through: Counter::default(),
 			internal: Counter::default(),
 			injected: Counter::default(),
 			bypassed: Counter::default(),
@@ -132,6 +135,7 @@ impl Metrics {
 			uptime_seconds: self.uptime().as_secs(),
 			requests: self.requests.get(),
 			blocked: self.blocked.get(),
+			passed_through: self.passed_through.get(),
 			internal: self.internal.get(),
 			injected: self.injected.get(),
 			bypassed: self.bypassed.get(),
@@ -185,6 +189,7 @@ pub struct Snapshot {
 	pub uptime_seconds: u64,
 	pub requests: u64,
 	pub blocked: u64,
+	pub passed_through: u64,
 	pub internal: u64,
 	pub injected: u64,
 	pub bypassed: u64,

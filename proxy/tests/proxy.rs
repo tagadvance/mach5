@@ -207,3 +207,58 @@ fn a_blocked_upload_is_refused_rather_than_read() {
 	);
 	assert_eq!(response.header("x-mach5"), Some("blocked"));
 }
+
+/// The one guarantee that cannot be given by declining to modify a page: mach5
+/// never holds the plaintext at all.
+///
+/// A plain TCP listener stands in for the origin. If mach5 had terminated TLS
+/// it would have answered the ClientHello itself with a minted certificate and
+/// this listener would never have seen those bytes; getting them back means the
+/// two sockets were spliced and nothing in between read them.
+#[test]
+fn a_passthrough_host_is_never_decrypted() {
+	use std::io::{Read, Write};
+	use std::net::{TcpListener, TcpStream};
+
+	let origin = TcpListener::bind("127.0.0.1:0").expect("an origin to splice to");
+	let origin_port = origin.local_addr().unwrap().port();
+
+	// Echoes one buffer, so the test can prove the bytes made the round trip.
+	let echoing = std::thread::spawn(move || {
+		let (mut peer, _) = origin.accept().expect("mach5 connects");
+		let mut buf = [0u8; 512];
+		let read = peer.read(&mut buf).expect("the client's bytes arrive here");
+		peer.write_all(&buf[..read]).expect("echo them back");
+		peer.flush().ok();
+
+		buf[..read].to_vec()
+	});
+
+	let proxy = Proxy::start_with(
+		BLOCKLIST,
+		&format!("[passthrough]\nhosts = [\"localhost\"]\nport = {origin_port}"),
+	);
+
+	// Deliberately not a TLS client: whatever is written here should arrive at
+	// the origin untouched, which is easier to assert on than a handshake.
+	let mut client = TcpStream::connect(("127.0.0.1", proxy.tcp_port())).expect("reach mach5");
+	// A ClientHello for `localhost`, which is what makes mach5 splice at all.
+	client.write_all(&common::client_hello(b"localhost")).expect("send a hello");
+	client.flush().unwrap();
+
+	let mut back = [0u8; 512];
+	let read = client.read(&mut back).expect("the origin's answer comes back");
+
+	let at_origin = echoing.join().expect("the origin thread");
+
+	assert_eq!(
+		at_origin,
+		common::client_hello(b"localhost"),
+		"the origin sees the client's own bytes, not mach5's"
+	);
+	assert_eq!(
+		&back[..read],
+		&at_origin[..read],
+		"and the client sees the origin's, both ways through the splice"
+	);
+}

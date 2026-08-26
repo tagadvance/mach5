@@ -88,3 +88,4 @@ Temporary Items
 
 # node, for the client-side tests
 node_modules/
+.env

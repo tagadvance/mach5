@@ -326,6 +326,13 @@ fn lookup(agents: &Agents, req: &ProxyRequest) -> Option<Cached> {
 		return None;
 	}
 
+	// RFC 9111 §3.5. `eligible` refuses to *store* one of these; refusing to
+	// serve one is the other half, or a signed-in visitor is handed the public
+	// answer an anonymous one caused to be stored.
+	if crate::httpcache::carries_credentials(req) {
+		return None;
+	}
+
 	// A hard refresh is a client saying it does not trust what anyone has
 	// stored, and it is right to be able to say so.
 	let wants = crate::httpcache::client_wants(req);

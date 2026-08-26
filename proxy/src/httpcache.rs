@@ -79,7 +79,7 @@ pub fn eligible(req: &ProxyRequest, status: u16, headers: &[(String, String)]) -
 	}
 
 	// Whose request this was, rather than what came back.
-	if header(&req.headers, "authorization").is_some() {
+	if carries_credentials(req) {
 		return false;
 	}
 
@@ -265,6 +265,17 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 		.map(|(_, value)| value.as_str())
 }
 
+/// Whether this request was made as somebody in particular.
+///
+/// RFC 9111 §3.5: a shared cache must not reuse a stored response for a request
+/// carrying `Authorization` unless the origin explicitly allowed it. Refusing
+/// to *store* one is only half of that — a signed-in visitor asking for a URL
+/// an anonymous one caused to be stored has to miss too, or it is handed the
+/// public answer to a private question.
+pub fn carries_credentials(req: &ProxyRequest) -> bool {
+	header(&req.headers, "authorization").is_some()
+}
+
 /// Every value for a header, combined the way RFC 9110 §5.3 says a recipient
 /// may: a list-valued field sent as several lines means exactly what one line
 /// with the values joined by commas would.
@@ -342,11 +353,23 @@ pub fn key(req: &ProxyRequest) -> String {
 pub struct Cache {
 	dir: PathBuf,
 	budget: u64,
-	since_sweep: std::sync::atomic::AtomicUsize,
+	unswept: std::sync::atomic::AtomicU64,
 	metrics: Arc<crate::metrics::Metrics>,
 }
 
-const SWEEP_EVERY: usize = 200;
+/// How much may be written between checks that the budget still holds.
+///
+/// The image cache counts inserts and can afford to: an image is a few tens of
+/// kilobytes, so two hundred of them overshoot by a rounding error. This one
+/// was given the same number and stores anything up to `max_cacheable_mb` —
+/// eight megabytes by default — so two hundred inserts is up to 1.6GB on disk
+/// before the budget is consulted once, against a default budget of 256MB. On
+/// the small container this exists for, that is the disk full and then almost
+/// all of it deleted again.
+///
+/// Counting bytes bounds the overshoot to a fraction of the budget whatever the
+/// entries turn out to look like.
+const SWEEP_FRACTION: u64 = 8;
 
 impl Cache {
 	pub fn new(config: &Config) -> Option<Self> {
@@ -365,7 +388,7 @@ impl Cache {
 		let cache = Self {
 			dir,
 			budget,
-			since_sweep: std::sync::atomic::AtomicUsize::new(0),
+			unswept: std::sync::atomic::AtomicU64::new(0),
 			metrics: crate::metrics::shared(),
 		};
 		crate::disk::sweep(&cache.dir, cache.budget);
@@ -405,8 +428,10 @@ impl Cache {
 		}
 
 		use std::sync::atomic::Ordering;
-		if self.since_sweep.fetch_add(1, Ordering::Relaxed) + 1 >= SWEEP_EVERY {
-			self.since_sweep.store(0, Ordering::Relaxed);
+		let written = (body.len() + meta.len()) as u64;
+		let limit = (self.budget / SWEEP_FRACTION).max(1);
+		if self.unswept.fetch_add(written, Ordering::Relaxed) + written >= limit {
+			self.unswept.store(0, Ordering::Relaxed);
 			crate::disk::sweep(&self.dir, self.budget);
 		}
 	}
@@ -683,6 +708,58 @@ mod tests {
 	/// The case Tag pushed back on: a small site that sets no cache headers at
 	/// all is exactly the one mach5 is for, and demanding `max-age` everywhere
 	/// would cache nothing for it.
+	/// Refusing to store an authorized request's response is only half of RFC
+	/// 9111 §3.5. Without the other half a signed-in visitor asking for a URL
+	/// an anonymous one caused to be stored gets the public answer to a private
+	/// question — the safe direction as leaks go, but the wrong response.
+	#[test]
+	fn a_request_made_as_somebody_is_neither_stored_nor_served() {
+		let public = headers(&[
+			("content-type", "image/png"),
+			("cache-control", "max-age=600"),
+		]);
+
+		assert!(!carries_credentials(&request(&[])));
+		assert!(eligible(&request(&[]), 200, &public));
+
+		let signed_in = request(&[("authorization", "Bearer abc")]);
+		assert!(carries_credentials(&signed_in));
+		assert!(!eligible(&signed_in, 200, &public));
+	}
+
+	/// The budget is consulted per byte written rather than per insert, because
+	/// entries here run to megabytes: two hundred of them at the default
+	/// `max_cacheable_mb` is 1.6GB written against a 256MB budget, all of it on
+	/// disk before anything looked.
+	#[test]
+	fn the_budget_is_checked_often_enough_to_mean_something() {
+		let dir = tempfile::TempDir::new().unwrap();
+		let budget = 4 * 1024 * 1024;
+		let cache = Cache {
+			dir: dir.path().to_path_buf(),
+			budget,
+			unswept: std::sync::atomic::AtomicU64::new(0),
+			metrics: crate::metrics::shared(),
+		};
+
+		let entry = entry_for(200, &headers(&[("cache-control", "max-age=600")]), now());
+		let body = vec![0u8; 512 * 1024];
+		for n in 0..40 {
+			cache.put(&format!("{n:032x}"), &entry, &body);
+		}
+
+		let held: u64 = std::fs::read_dir(dir.path())
+			.unwrap()
+			.filter_map(|e| e.ok()?.metadata().ok())
+			.map(|m| m.len())
+			.sum();
+
+		assert!(
+			held <= budget + budget / SWEEP_FRACTION + body.len() as u64,
+			"{held} bytes held against a {budget} byte budget"
+		);
+	}
+
 	/// RFC 9110 §5.3: a list-valued header sent as several lines means what one
 	/// joined line would. Reading only the first put the whole eligibility
 	/// decision at the mercy of which line the origin happened to send first —

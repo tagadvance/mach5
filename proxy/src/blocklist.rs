@@ -47,9 +47,14 @@ const HOUSEKEEPING: [&str; 4] = [
 /// Where fetched lists are kept, under the configured cache directory.
 const CACHE: crate::fetch::Cache = crate::fetch::Cache::new("blocklists", "blocklist");
 
-/// Two sets of domains: what to block, and what to never block.
+/// Three sets of domains: what to block outright, what to block only when
+/// something else embedded it, and what to never block.
 pub struct Blocklist {
 	blocked: HashSet<String>,
+	/// `||host^$third-party`. The commonest option in a real filter list by a
+	/// wide margin, and the one this proxy can actually answer: a browser says
+	/// which it is in `sec-fetch-site`.
+	blocked_embedded: HashSet<String>,
 	allowed: HashSet<String>,
 	metrics: Arc<crate::metrics::Metrics>,
 	/// How many of the configured sources actually gave us something.
@@ -63,6 +68,7 @@ impl Blocklist {
 	fn new(allow: &[String], metrics: Arc<crate::metrics::Metrics>) -> Self {
 		Self {
 			blocked: HashSet::new(),
+			blocked_embedded: HashSet::new(),
 			allowed: allow
 				.iter()
 				.filter_map(|domain| normalize(domain))
@@ -98,6 +104,9 @@ impl Blocklist {
 					Rule::Block(domain) => {
 						self.blocked.insert(domain);
 					}
+					Rule::BlockEmbedded(domain) => {
+						self.blocked_embedded.insert(domain);
+					}
 					Rule::Allow(domain) => {
 						self.allowed.insert(domain);
 					}
@@ -107,20 +116,20 @@ impl Blocklist {
 	}
 
 	pub fn is_empty(&self) -> bool {
-		self.blocked.is_empty()
+		self.blocked.is_empty() && self.blocked_embedded.is_empty()
 	}
 
 	/// How many domains are loaded. The status page reports it so that a blocked
 	/// count of zero can be told apart from a list that never loaded.
 	pub fn len(&self) -> usize {
-		self.blocked.len()
+		self.blocked.len() + self.blocked_embedded.len()
 	}
 
 	/// What the status page needs to tell a list that is being kept up to date
 	/// from one that quietly stopped.
 	pub fn status(&self) -> Status {
 		Status {
-			domains: self.blocked.len(),
+			domains: self.blocked.len() + self.blocked_embedded.len(),
 			sources: self.sources,
 			age: self.built.elapsed(),
 		}
@@ -135,6 +144,20 @@ impl Blocklist {
 	/// True when this host, or any domain it sits under, is listed — so
 	/// `doubleclick.net` covers `ad.g.doubleclick.net`. An allowance wins
 	/// outright, whatever the lists say.
+	/// Whether this request is blocked, which depends on the request and not
+	/// only on the host: a `$third-party` rule applies to a subresource and not
+	/// to the page it is on.
+	fn blocks_request(&self, req: &ProxyRequest, host: &str) -> bool {
+		if covers(&self.allowed, host) {
+			return false;
+		}
+
+		covers(&self.blocked, host) || (embedded(req) && covers(&self.blocked_embedded, host))
+	}
+
+	/// Whether this host is blocked outright, for callers with no request in
+	/// hand — the tests, and anything asking about a name rather than a fetch.
+	#[cfg(test)]
 	pub fn blocks(&self, host: &str) -> bool {
 		!covers(&self.allowed, host) && covers(&self.blocked, host)
 	}
@@ -206,7 +229,7 @@ impl Interceptor for Arc<Blocklists> {
 	fn on_request(&self, req: &mut ProxyRequest) -> Option<ProxyResponse> {
 		let list = self.current();
 		let host = crate::host_of(&req.url);
-		if !list.blocks(host) {
+		if !list.blocks_request(req, host) {
 			return None;
 		}
 
@@ -376,7 +399,25 @@ fn fetched(config: &Config, agent: &ureq::Agent) -> Vec<String> {
 
 enum Rule {
 	Block(String),
+	/// Blocked only where the page did not go looking for it itself.
+	BlockEmbedded(String),
 	Allow(String),
+}
+
+/// Whether this request is the page itself, or something the page pulled in
+/// from somewhere else.
+///
+/// `sec-fetch-site` is the browser answering exactly this question, which is
+/// why `$third-party` is the one Adblock option mach5 can honour. A client that
+/// does not send it — curl, an app, an old browser — is treated as first-party,
+/// because being wrong that way skips an advert and being wrong the other way
+/// blocks the page somebody asked for.
+fn embedded(req: &ProxyRequest) -> bool {
+	req.headers
+		.iter()
+		.find(|(name, _)| name.eq_ignore_ascii_case("sec-fetch-site"))
+		.map(|(_, value)| value.trim().to_ascii_lowercase())
+		.is_some_and(|site| site == "cross-site" || site == "same-site")
 }
 
 /// Parse one line of a list in whichever of the three formats it happens to be.
@@ -399,11 +440,21 @@ fn parse(line: &str) -> Vec<Rule> {
 	};
 
 	if let Some(rule) = line.strip_prefix("@@") {
-		return one(anchored(rule).and_then(normalize).map(Rule::Allow));
+		// An exception is never narrowed to third-party here: honouring
+		// `@@||x^$third-party` as an unconditional allowance is the fail-open
+		// case this whole function exists to avoid.
+		return one(match anchored(rule) {
+			Anchored::Plain(domain) => normalize(domain).map(Rule::Allow),
+			_ => None,
+		});
 	}
 
 	if line.starts_with("||") {
-		return one(anchored(line).and_then(normalize).map(Rule::Block));
+		return one(match anchored(line) {
+			Anchored::Plain(domain) => normalize(domain).map(Rule::Block),
+			Anchored::ThirdParty(domain) => normalize(domain).map(Rule::BlockEmbedded),
+			Anchored::Unreadable => None,
+		});
 	}
 
 	// A hosts file line: an address, then the names being pointed at it — of
@@ -424,30 +475,54 @@ fn one(rule: Option<Rule>) -> Vec<Rule> {
 	rule.into_iter().collect()
 }
 
-/// The domain of an Adblock anchor rule, `||ads.example.com^`.
+/// What an Adblock anchor rule turned out to say.
+enum Anchored<'a> {
+	/// `||ads.example.com^` — a plain domain match.
+	Plain(&'a str),
+	/// `||cdn.example^$third-party` — only where something else embedded it.
+	ThirdParty(&'a str),
+	/// Scoped by something this proxy cannot evaluate.
+	Unreadable,
+}
+
+/// Read an Adblock anchor rule, options included.
 ///
-/// A rule carrying `$` options is **refused**, not stripped of them. The
-/// options are what scopes it: `||cdn.example^$third-party` blocks that host
-/// only when something else embeds it, and honouring the domain alone blocks
-/// the site you typed into the address bar. The mirror case is worse, because
-/// it fails open — `@@||tracker.example^$document` became a blanket allowance
-/// that quietly defeated a hosts-file block of the same name from another list.
+/// The options after `$` are what scopes a rule, and stripping them widens it:
+/// `||cdn.example^$third-party` means block that host only when something else
+/// embeds it, and honouring the domain alone blocks the site you typed into the
+/// address bar. The mirror case fails open — `@@||tracker.example^$document`
+/// as an unconditional allowance quietly defeats a hosts-file block of the same
+/// name from another list.
 ///
-/// mach5 has no notion of request context, so neither scope can be evaluated,
-/// and a rule whose scope cannot be read is not ours to honour — the same rule
-/// `cosmetic` already follows for domains it cannot fully parse. The cost is
-/// that a chunk of a real EasyList is skipped; the alternative is a rule
-/// applying far more widely than it was written to.
-fn anchored(rule: &str) -> Option<&str> {
-	let rest = rule.strip_prefix("||")?;
-	if rest.contains('$') {
-		return None;
+/// `$third-party` is honoured because a browser answers it directly in
+/// `sec-fetch-site`; it is also much the commonest option in a real list, so
+/// refusing it outright cost about two thousand domains against StevenBlack
+/// plus EasyList. Everything else is refused, which is the rule `cosmetic`
+/// already follows for domains it cannot fully parse: a rule whose scope cannot
+/// be read is not ours to honour.
+fn anchored(rule: &str) -> Anchored<'_> {
+	let Some(rest) = rule.strip_prefix("||") else {
+		return Anchored::Unreadable;
+	};
+
+	let (pattern, options) = match rest.split_once('$') {
+		Some((pattern, options)) => (pattern, Some(options)),
+		None => (rest, None),
+	};
+
+	let domain = pattern.split('^').next().unwrap_or(pattern);
+	// A wildcard or a path means the rule is more than a domain match.
+	if domain.contains(['*', '/']) {
+		return Anchored::Unreadable;
 	}
 
-	let domain = rest.split('^').next().unwrap_or(rest);
-
-	// A wildcard or a path means the rule is more than a domain match.
-	(!domain.contains(['*', '/'])).then_some(domain)
+	match options {
+		None => Anchored::Plain(domain),
+		// Only on its own. `$third-party,script` is still scoped by something
+		// unreadable, and `~third-party` is the negation.
+		Some("third-party") => Anchored::ThirdParty(domain),
+		Some(_) => Anchored::Unreadable,
+	}
 }
 
 /// A name a hosts file points at loopback for its own sake, not to block it.
@@ -540,13 +615,18 @@ mod tests {
 	fn a_rule_whose_scope_cannot_be_read_is_not_honoured() {
 		let scoped = list(
 			"0.0.0.0 tracker.example\n\
-			 ||cdn.example^$third-party\n\
+			 ||cdn.example^$third-party,script\n\
 			 @@||tracker.example^$document\n",
 		);
 
 		assert!(
 			!scoped.blocks("cdn.example"),
 			"a conditional block must not become an unconditional one"
+		);
+		assert!(
+			!scoped.blocked_embedded.contains("cdn.example"),
+			"nor is `$third-party,script` a third-party rule: it is scoped by \
+			 something else as well"
 		);
 		assert!(
 			scoped.blocks("tracker.example"),
@@ -557,6 +637,42 @@ mod tests {
 		let plain = list("0.0.0.0 tracker.example\n@@||tracker.example^\n||cdn.example^\n");
 		assert!(plain.blocks("cdn.example"));
 		assert!(!plain.blocks("tracker.example"));
+	}
+
+	/// `$third-party` is the one option this proxy can answer, because a browser
+	/// says which it is in `sec-fetch-site` — and it is much the commonest in a
+	/// real list, so refusing it outright cost about two thousand domains
+	/// against StevenBlack plus EasyList.
+	#[test]
+	fn a_third_party_rule_blocks_a_subresource_and_not_the_page() {
+		let scoped = list("||cdn.example^$third-party\n");
+		let ask = |site: Option<&str>| {
+			let mut req = request("https://cdn.example/x.js", "*/*");
+			if let Some(site) = site {
+				req.headers
+					.push(("sec-fetch-site".to_string(), site.to_string()));
+			}
+
+			scoped.blocks_request(&req, "cdn.example")
+		};
+
+		assert!(ask(Some("cross-site")), "embedded by another origin");
+		assert!(ask(Some("same-site")), "and by a sibling of one");
+		assert!(!ask(Some("none")), "typed into the address bar");
+		assert!(!ask(Some("same-origin")), "or fetched by its own page");
+		assert!(
+			!ask(None),
+			"a client that says nothing is treated as the page itself: being \
+			 wrong that way skips an advert, and being wrong the other way \
+			 blocks a site somebody asked for"
+		);
+
+		// A plain rule still applies whatever the context.
+		let plain = list("||cdn.example^\n");
+		let mut req = request("https://cdn.example/x.js", "*/*");
+		req.headers
+			.push(("sec-fetch-site".to_string(), "none".to_string()));
+		assert!(plain.blocks_request(&req, "cdn.example"));
 	}
 
 	#[test]

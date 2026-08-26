@@ -85,3 +85,6 @@ Icon
 Network Trash Folder
 Temporary Items
 .apdisk
+
+# node, for the client-side tests
+node_modules/

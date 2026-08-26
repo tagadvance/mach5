@@ -525,19 +525,29 @@ fn fetch_blocking(
 		}
 	}
 
-	if let Some(streamer) = rewriting.take() {
-		let tail = streamer.finish();
-		if !tail.is_empty() {
-			metrics.bytes_to_client.add(tail.len() as u64);
-			let _ = body_tx.blocking_send(Ok(Frame::data(Bytes::from(tail))));
-		}
+	// The plugin flushes first, and through the streamer, because its tail is
+	// more body: bytes in the origin's coding, exactly like the chunks it was
+	// given. Sending it after `finish()` put it outside the coding the head
+	// declared and after the encoder had already been closed.
+	let mut tail = if wants_chunks {
+		interceptor.on_response_end(&request).unwrap_or_default()
+	} else {
+		Vec::new()
+	};
+
+	if let Some(mut streamer) = rewriting.take() {
+		let mut through = if tail.is_empty() {
+			Vec::new()
+		} else {
+			streamer.push(&tail)
+		};
+		through.extend(streamer.finish());
+		tail = through;
 	}
 
-	if wants_chunks {
-		if let Some(tail) = interceptor.on_response_end(&request) {
-			metrics.bytes_to_client.add(tail.len() as u64);
-			let _ = body_tx.blocking_send(Ok(Frame::data(Bytes::from(tail))));
-		}
+	if !tail.is_empty() {
+		metrics.bytes_to_client.add(tail.len() as u64);
+		let _ = body_tx.blocking_send(Ok(Frame::data(Bytes::from(tail))));
 	}
 }
 

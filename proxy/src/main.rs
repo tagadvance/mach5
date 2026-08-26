@@ -308,12 +308,13 @@ fn handle_job(
 	// blocked upload is refused rather than read.
 	let early = interceptor.before_body(&mut job.request);
 	let resume = match early {
-		interceptor::BeforeBody::Answered(response) => {
+		interceptor::BeforeBody::Answered(mut response) => {
 			log::info!(
 				"short-circuited {} {}",
 				job.request.method,
 				redact::url(&job.request.url)
 			);
+			compress_own(config, &job.request, &mut response);
 			metrics.bytes_to_client.add(response.body.len() as u64);
 
 			return send_full(results, waker, &job, response);
@@ -355,12 +356,13 @@ fn handle_job(
 		}
 	};
 
-	if let Some(response) = answer {
+	if let Some(mut response) = answer {
 		log::info!(
 			"short-circuited {} {}",
 			job.request.method,
 			redact::url(&job.request.url)
 		);
+		compress_own(config, &job.request, &mut response);
 		metrics.bytes_to_client.add(response.body.len() as u64);
 
 		return send(Payload::Full(response));
@@ -886,6 +888,29 @@ fn dispatch(
 	if jobs.send(job).is_err() {
 		log::error!("worker pool is gone; cannot dispatch request");
 	}
+}
+
+/// Compress a response mach5 wrote itself.
+///
+/// One never went near the upstream path, which is where everything else is
+/// compressed — and the picker mach5 injects into every page is the largest
+/// thing it serves, so leaving these uncompressed is the one that shows up.
+fn compress_own(config: &Config, request: &ProxyRequest, response: &mut ProxyResponse) {
+	if !config.http.compress {
+		return;
+	}
+
+	let plain = response.body.len();
+	response.body = encoding::ensure_compressed(
+		&request.headers,
+		response.status,
+		&mut response.headers,
+		std::mem::take(&mut response.body),
+		None,
+	);
+	metrics::shared()
+		.bytes_saved_by_compression
+		.add(plain.saturating_sub(response.body.len()) as u64);
 }
 
 /// A plain refusal, for a request that never reaches an origin.

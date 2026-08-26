@@ -563,6 +563,22 @@ fn short_circuit(
 		request.method,
 		crate::redact::url(&request.url)
 	);
+	// A response we wrote ourselves never went near the upstream path, so this
+	// is where it gets compressed. The picker is several kilobytes of
+	// JavaScript on every page — by far the largest thing mach5 serves.
+	if shared.config.http.compress {
+		let plain = response.body.len();
+		response.body = crate::encoding::ensure_compressed(
+			&request.headers,
+			response.status,
+			&mut response.headers,
+			response.body,
+			None,
+		);
+		crate::metrics::shared()
+			.bytes_saved_by_compression
+			.add(plain.saturating_sub(response.body.len()) as u64);
+	}
 	apply_alt_svc(&shared.config, &mut response.headers);
 	crate::metrics::shared()
 		.bytes_to_client

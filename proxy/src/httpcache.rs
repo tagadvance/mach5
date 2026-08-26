@@ -68,6 +68,16 @@ pub fn eligible(req: &ProxyRequest, status: u16, headers: &[(String, String)]) -
 		return false;
 	}
 
+	// GET or nothing. A HEAD carries the same headers as the GET it stands in
+	// for — content-type, etag, a freshness lifetime — and every test below
+	// passes on them, but its body is empty by definition. Stored under a key
+	// that does not mention the method, that empty body is what the next GET
+	// for the same URL is served. One `curl -I` was enough to blank an asset
+	// for as long as the origin said to keep it.
+	if !req.method.eq_ignore_ascii_case("GET") {
+		return false;
+	}
+
 	// Whose request this was, rather than what came back.
 	if header(&req.headers, "authorization").is_some() {
 		return false;
@@ -451,6 +461,27 @@ mod tests {
 	#[test]
 	fn a_plainly_public_image_is_eligible() {
 		assert!(eligible(&request(&[]), 200, &public_image()));
+	}
+
+	/// A HEAD answers with the GET's headers and none of its body, and the key
+	/// does not mention the method — so storing one files an empty body where
+	/// the next GET will look for it. Verified against a real origin before the
+	/// guard existed: `curl -I` then `curl` returned 0 bytes for a 6,868-byte
+	/// stylesheet, and kept doing so.
+	#[test]
+	fn only_a_get_may_be_stored() {
+		for method in ["HEAD", "POST", "PUT", "DELETE", "OPTIONS", "head"] {
+			let mut req = request(&[]);
+			req.method = method.to_string();
+
+			assert_eq!(
+				eligible(&req, 200, &public_image()),
+				method.eq_ignore_ascii_case("GET"),
+				"{method} must not be stored under a key that does not name it"
+			);
+		}
+
+		assert!(eligible(&request(&[]), 200, &public_image()), "and GET still is");
 	}
 
 	#[test]

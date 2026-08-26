@@ -279,6 +279,14 @@ enum Cached {
 fn lookup(agents: &Agents, req: &ProxyRequest) -> Option<Cached> {
 	let cache = agents.cache.as_ref()?;
 
+	// The other half of the rule in `httpcache::eligible`: nothing but a GET
+	// stores, and nothing but a GET is served from what was stored. Answering
+	// a HEAD out of the cache would attach a body to a response that must not
+	// have one.
+	if !req.method.eq_ignore_ascii_case("GET") {
+		return None;
+	}
+
 	// A hard refresh is a client saying it does not trust what anyone has
 	// stored, and it is right to be able to say so.
 	let wants = crate::httpcache::client_wants(req);

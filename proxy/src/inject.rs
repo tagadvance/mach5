@@ -42,6 +42,9 @@ const TAGS: &str =
 /// re-proxied page grow a tag per hop.
 const MARKER: &[u8] = b"/.mach5/mach5.js";
 
+#[cfg(test)]
+const MARKER_STR: &str = "/.mach5/mach5.js";
+
 /// Adds the tags to HTML pages.
 pub struct Inject {
 	exclude: HashSet<String>,
@@ -319,9 +322,26 @@ pub struct Streamer {
 	encoder: Option<crate::encoding::Encoder>,
 	rewriter: HtmlRewriter<'static, Sink>,
 	out: Rc<RefCell<Vec<u8>>>,
-	/// A parser that has given up. Its bytes still have to reach the client, so
-	/// from here on they are passed through untouched.
-	broken: bool,
+	state: State,
+}
+
+/// What is still working.
+///
+/// The distinction that matters: the *rewriter* giving up is recoverable, and
+/// the *decoder* giving up is not. The head has already gone out declaring a
+/// coding, so every byte after it must be under that coding — which means a
+/// give-up may stop rewriting but must never stop encoding.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum State {
+	Rewriting,
+	/// The parser gave up. Bytes are still decoded and re-encoded, so the
+	/// coding the head promised stays true; they are simply not rewritten.
+	PassingThrough,
+	/// The decoder gave up. Nothing further can be decoded, so nothing further
+	/// can be re-encoded, so the body ends here — with the coding closed
+	/// properly, which is the difference between a short page and an
+	/// unreadable one.
+	Stopped,
 }
 
 /// Where `lol_html` puts what it has finished with.
@@ -394,69 +414,79 @@ impl Streamer {
 				Box::new(move |chunk: &[u8]| sink.borrow_mut().extend_from_slice(chunk)) as Sink,
 			),
 			out,
-			broken: false,
+			state: State::Rewriting,
 		})
 	}
 
 	/// One chunk in, whatever is ready to send out.
 	pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
-		if self.broken {
-			return chunk.to_vec();
+		if self.state == State::Stopped {
+			return Vec::new();
 		}
 
 		let plain = match self.decoder.as_mut() {
 			Some(decoder) => match decoder.push(chunk) {
 				Ok(plain) => plain,
-				Err(e) => return self.give_up(chunk, &e.to_string()),
+				Err(e) => {
+					log::debug!("no longer reading this page: {e}");
+					self.state = State::Stopped;
+
+					return Vec::new();
+				}
 			},
 			None => chunk.to_vec(),
 		};
 
-		if self.rewriter.write(&plain).is_err() {
-			return self.give_up(chunk, "the parser refused the document");
+		if self.state == State::Rewriting {
+			if self.rewriter.write(&plain).is_err() {
+				log::debug!("no longer rewriting this page: the parser refused the document");
+				self.state = State::PassingThrough;
+				// Whatever this chunk left in the sink is a prefix of the very
+				// bytes about to be sent in full, so it goes in the bin rather
+				// than out twice. What is lost is only what the parser was
+				// still holding back from earlier chunks — at most a partial
+				// token, and never the rest of the document.
+				self.out.borrow_mut().clear();
+
+				return self.encode(&plain);
+			}
+
+			let rewritten = std::mem::take(&mut *self.out.borrow_mut());
+
+			return self.encode(&rewritten);
 		}
 
-		self.drain()
+		self.encode(&plain)
 	}
 
 	/// The end of the body: flush the parser and close the coding.
 	pub fn finish(self) -> Vec<u8> {
-		if self.broken {
-			return Vec::new();
-		}
+		let plain = if self.state == State::Rewriting {
+			let _ = self.rewriter.end();
 
-		let _ = self.rewriter.end();
-		let rewritten = std::mem::take(&mut *self.out.borrow_mut());
-
-		let Some(encoder) = self.encoder else {
-			return rewritten;
+			std::mem::take(&mut *self.out.borrow_mut())
+		} else {
+			Vec::new()
 		};
 
-		let mut encoder = encoder;
-		let mut out = encoder.push(&rewritten).unwrap_or_default();
+		// Reached even when nothing is left to send: an encoder that is never
+		// finished leaves the client a stream it cannot inflate, whatever the
+		// reason it stopped early.
+		let Some(mut encoder) = self.encoder else {
+			return plain;
+		};
+
+		let mut out = encoder.push(&plain).unwrap_or_default();
 		out.extend(encoder.finish().unwrap_or_default());
 
 		out
 	}
 
-	fn drain(&mut self) -> Vec<u8> {
-		let rewritten = std::mem::take(&mut *self.out.borrow_mut());
-
+	fn encode(&mut self, plain: &[u8]) -> Vec<u8> {
 		match self.encoder.as_mut() {
-			Some(encoder) => encoder.push(&rewritten).unwrap_or_default(),
-			None => rewritten,
+			Some(encoder) => encoder.push(plain).unwrap_or_default(),
+			None => plain.to_vec(),
 		}
-	}
-
-	/// Stop rewriting and let the rest of the body past untouched.
-	///
-	/// Whatever went wrong, the client is mid-response and the only thing worse
-	/// than an un-injected page is half a page.
-	fn give_up(&mut self, chunk: &[u8], why: &str) -> Vec<u8> {
-		log::debug!("no longer rewriting this page: {why}");
-		self.broken = true;
-
-		chunk.to_vec()
 	}
 }
 
@@ -754,6 +784,137 @@ mod tests {
 			enabled: true,
 			eager: 2,
 		}
+	}
+
+	fn gzipped(plain: &[u8]) -> Vec<u8> {
+		use std::io::Write;
+
+		let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+		e.write_all(plain).expect("gzip");
+
+		e.finish().expect("gzip")
+	}
+
+	/// One gzip stream, handed over in two pieces with a flush between them so
+	/// the first piece decodes on its own — which is what arriving over a
+	/// network looks like, and what two separate members would not be.
+	fn gzipped_in_two(first: &[u8], rest: &[u8]) -> (Vec<u8>, Vec<u8>) {
+		use std::io::Write;
+
+		let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+		e.write_all(first).expect("gzip");
+		e.flush().expect("gzip");
+		let head = std::mem::take(e.get_mut());
+		e.write_all(rest).expect("gzip");
+
+		(head, e.finish().expect("gzip"))
+	}
+
+	fn gunzip(coded: &[u8]) -> Vec<u8> {
+		use std::io::Read;
+
+		let mut out = Vec::new();
+		flate2::read::GzDecoder::new(coded)
+			.read_to_end(&mut out)
+			.expect("the client has to be able to inflate what it was sent");
+
+		out
+	}
+
+	/// A streamer that decodes gzip in and re-encodes gzip out, which is what
+	/// every real origin negotiates.
+	fn coded_streamer() -> Streamer {
+		Streamer::new(
+			&headers(&[
+				("content-type", "text/html"),
+				("content-encoding", "gzip"),
+			]),
+			lazily(),
+			Some(crate::encoding::Coding::Gzip),
+		)
+		.expect("a page")
+	}
+
+	/// The head went out saying `content-encoding: gzip`, so every byte after
+	/// it is gzip whatever happens next. Handing the client plaintext because
+	/// the parser gave up is a page it cannot read at all — strictly worse than
+	/// the un-injected page the give-up was trying to save.
+	#[test]
+	fn a_page_the_parser_gives_up_on_stays_under_the_declared_coding() {
+		let mut streamer = coded_streamer();
+
+		// `<script>` inside `<select>` is the documented case lol_html refuses
+		// to guess at: it cannot tell whether what follows is markup or text.
+		let (first, rest) = gzipped_in_two(
+			b"<html><head></head><body><p>before</p>",
+			b"<select><script>x</script></select><p>after</p></body></html>",
+		);
+
+		let mut out = streamer.push(&first);
+		out.extend(streamer.push(&rest));
+		out.extend(streamer.finish());
+
+		let page = String::from_utf8(gunzip(&out)).expect("utf-8");
+		assert!(
+			page.contains(MARKER_STR),
+			"what was injected before the give-up still stands: {page}"
+		);
+		assert!(
+			page.contains("<p>before</p>"),
+			"and so does the document up to it: {page}"
+		);
+		assert!(
+			page.contains("<p>after</p>"),
+			"the rest of the page still reaches the client: {page}"
+		);
+		assert_eq!(
+			page.matches("<p>after</p>").count(),
+			1,
+			"exactly once — a give-up must not send the same bytes twice: {page}"
+		);
+	}
+
+	/// A body that stops decoding cannot be re-encoded, so it ends there. What
+	/// it must not do is end *open*: an unfinished gzip stream is a page the
+	/// client throws away entirely, rather than a short one it renders.
+	#[test]
+	fn a_body_that_stops_decoding_still_closes_the_coding() {
+		let mut streamer = coded_streamer();
+
+		let mut out = streamer.push(&gzipped(b"<html><head></head><body><p>all there is</p>"));
+		// A second member that is not one. Trailing bytes after a complete
+		// member are the real-world shape of this.
+		out.extend(streamer.push(b"\x1f\x8b\x08not gzip at all"));
+		out.extend(streamer.push(&gzipped(b"<p>never seen</p>")));
+		out.extend(streamer.finish());
+
+		let page = String::from_utf8(gunzip(&out)).expect("utf-8");
+		assert!(
+			page.contains(MARKER_STR),
+			"what decoded is intact and injected: {page}"
+		);
+		assert!(
+			page.contains("<p>all there is</p>"),
+			"and complete up to the failure: {page}"
+		);
+		assert!(
+			!page.contains("never seen"),
+			"nothing after it can be trusted to be html: {page}"
+		);
+	}
+
+	/// The plain case, kept honest alongside the two failure ones: nothing goes
+	/// wrong, and the coding still closes.
+	#[test]
+	fn a_coded_page_that_parses_is_rewritten_and_re_encoded() {
+		let mut streamer = coded_streamer();
+
+		let mut out = streamer.push(&gzipped(b"<html><head></head><body><p>hi</p></body></html>"));
+		out.extend(streamer.finish());
+
+		let page = String::from_utf8(gunzip(&out)).expect("utf-8");
+		assert!(page.contains(MARKER_STR), "{page}");
+		assert!(page.contains("<p>hi</p>"), "{page}");
 	}
 
 	#[test]

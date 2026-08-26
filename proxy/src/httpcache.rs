@@ -411,6 +411,16 @@ impl Cache {
 		}
 	}
 
+	/// Forget one entry outright.
+	///
+	/// The metadata goes first: an entry whose body is missing is a miss, so
+	/// the window between the two removals never serves anything, while the
+	/// other order would leave metadata pointing at nothing.
+	pub fn forget(&self, key: &str) {
+		let _ = std::fs::remove_file(self.dir.join(format!("{key}.meta")));
+		let _ = std::fs::remove_file(self.dir.join(format!("{key}.body")));
+	}
+
 	pub fn metrics(&self) -> &crate::metrics::Metrics {
 		&self.metrics
 	}
@@ -425,13 +435,72 @@ pub fn shared(config: &Config) -> Option<Arc<Cache>> {
 
 /// Build what to store from a response that [`eligible`] has already approved.
 pub fn entry_for(status: u16, headers: &[(String, String)], stored: u64) -> Entry {
+	// `max-age` counts from when the response was *generated*, not from when it
+	// got here, and `age` is the hop count in seconds that says how far apart
+	// those are (RFC 9111 §4.2.3). Ignoring it gave a CDN object that arrived
+	// with `max-age=300, age=295` a fresh 300 seconds here — nearly twice the
+	// life the origin allowed, and doubling again for anything downstream that
+	// reads the same frozen `age` back out of the stored headers.
+	let lifetime = freshness(headers)
+		.map(|d| d.as_secs().saturating_sub(age(headers)))
+		.unwrap_or(0);
+
 	Entry {
 		status,
-		fresh_until: stored + freshness(headers).map(|d| d.as_secs()).unwrap_or(0),
+		fresh_until: stored.saturating_add(lifetime),
 		etag: header(headers, "etag").map(str::to_string),
 		last_modified: header(headers, "last-modified").map(str::to_string),
 		headers: headers.to_vec(),
 	}
+}
+
+/// How long this response had already been alive when it arrived, in seconds.
+fn age(headers: &[(String, String)]) -> u64 {
+	header(headers, "age")
+		.and_then(|value| value.trim().parse::<u64>().ok())
+		.unwrap_or(0)
+}
+
+/// Fold a 304's headers into the ones already stored, as RFC 9111 §4.3.4
+/// requires.
+///
+/// This is the only way an origin can change its mind about something it has
+/// already handed out: shorten a lifetime, add a `vary`, or take back
+/// permission to store it at all. Re-applying the stored headers instead — as
+/// this did — meant an entry could never be withdrawn and its clock was reset
+/// to a full lifetime on every revalidation, so a URL that became personal
+/// went on being served to everybody, indefinitely.
+///
+/// A 304 carries no body, so anything describing one is not the origin's to
+/// update here and would only contradict the bytes on disk.
+pub fn refreshed_headers(
+	stored: &[(String, String)],
+	fresh: &[(String, String)],
+) -> Vec<(String, String)> {
+	let updating: Vec<&(String, String)> = fresh
+		.iter()
+		.filter(|(name, _)| !describes_the_body(name))
+		.collect();
+
+	let mut merged: Vec<(String, String)> = stored
+		.iter()
+		.filter(|(name, _)| {
+			!updating
+				.iter()
+				.any(|(fresh, _)| fresh.eq_ignore_ascii_case(name))
+		})
+		.cloned()
+		.collect();
+	merged.extend(updating.into_iter().cloned());
+
+	merged
+}
+
+fn describes_the_body(name: &str) -> bool {
+	matches!(
+		name.to_ascii_lowercase().as_str(),
+		"content-length" | "content-encoding" | "content-range" | "content-type"
+	)
 }
 
 /// The stored response, as something to serve.
@@ -655,6 +724,72 @@ mod tests {
 			("cache-control", "max-age=42"),
 		]);
 		assert_eq!(freshness(&split), Some(Duration::from_secs(42)));
+	}
+
+	/// `max-age` counts from when the response was generated, not from when it
+	/// arrived. A CDN object handed over with most of its life already spent
+	/// was getting a full lifetime again here.
+	#[test]
+	fn an_entry_is_only_as_fresh_as_it_arrived() {
+		let aged = headers(&[
+			("content-type", "image/png"),
+			("cache-control", "max-age=300"),
+			("age", "295"),
+		]);
+
+		assert_eq!(entry_for(200, &aged, 1_000).fresh_until, 1_005);
+
+		// An `age` past the lifetime is stale on arrival, not fresh forever.
+		let expired = headers(&[("cache-control", "max-age=300"), ("age", "9000")]);
+		assert_eq!(entry_for(200, &expired, 1_000).fresh_until, 1_000);
+
+		let plain = headers(&[("cache-control", "max-age=300")]);
+		assert_eq!(entry_for(200, &plain, 1_000).fresh_until, 1_300);
+	}
+
+	/// A 304 is the origin's chance to change its mind about something it has
+	/// already handed out. Re-applying the stored headers took that away: an
+	/// entry could never be withdrawn, and its clock was reset to a full
+	/// lifetime every time the origin tried.
+	#[test]
+	fn a_304_replaces_what_was_stored_header_by_header() {
+		let stored = headers(&[
+			("content-type", "text/css"),
+			("cache-control", "max-age=86400"),
+			("etag", "\"v1\""),
+			("x-origin-note", "kept"),
+		]);
+		let fresh = headers(&[
+			("cache-control", "max-age=60"),
+			("vary", "cookie"),
+			("date", "then"),
+		]);
+
+		let merged = refreshed_headers(&stored, &fresh);
+		let value = |name: &str| -> Option<&str> { header(&merged, name) };
+
+		assert_eq!(value("cache-control"), Some("max-age=60"), "shortened");
+		assert_eq!(value("vary"), Some("cookie"), "and newly per-user");
+		assert_eq!(value("date"), Some("then"), "and added");
+		assert_eq!(
+			value("x-origin-note"),
+			Some("kept"),
+			"what the 304 did not mention survives"
+		);
+		assert_eq!(
+			value("etag"),
+			Some("\"v1\""),
+			"including the validator the request was made with"
+		);
+		assert_eq!(
+			value("content-type"),
+			Some("text/css"),
+			"and anything describing the body, which a 304 does not carry"
+		);
+
+		// Which is the point: the merged headers no longer pass the wall, so
+		// the caller drops the entry instead of refreshing it.
+		assert!(!eligible(&request(&[]), 200, &merged));
 	}
 
 	#[test]

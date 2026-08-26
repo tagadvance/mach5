@@ -667,6 +667,23 @@ fn drain_results(results: &Receiver<FetchResult>, clients: &mut ClientMap) {
 			continue;
 		};
 
+		// One stream, one response. A second request on a stream that already
+		// has one — see `poll_requests` — would otherwise queue a second
+		// `Pending` beside the first, and `find_pending` answers with the
+		// first: every chunk of one response is appended to the body of the
+		// other, past a `content-length` already sent.
+		if matches!(result.payload, Payload::Full(_) | Payload::Head(_))
+			&& find_pending(client, result.stream_id).is_some()
+		{
+			log::warn!(
+				"refusing a second response on stream {}; one is already in flight",
+				result.stream_id
+			);
+			result.budget.close();
+
+			continue;
+		}
+
 		match result.payload {
 			Payload::Full(response) => client.pending.push(Pending {
 				stream_id: result.stream_id,
@@ -917,6 +934,18 @@ fn poll_requests(
 	loop {
 		match http3.poll(conn) {
 			Ok((stream_id, quiche::h3::Event::Headers { list, more_frames })) => {
+				// quiche allows a client two HEADERS frames on a request stream
+				// — the second is meant to be trailers — and validates no
+				// pseudo-headers, so a crafted one produces a whole second
+				// request on a stream that already has one. Refused here, where
+				// the first request's upload would otherwise be dropped
+				// mid-body by the insert below.
+				if uploads.contains_key(&stream_id) {
+					log::warn!("stream={stream_id} sent a second request; ignoring it");
+
+					continue;
+				}
+
 				match build_request(conn.server_name(), &list) {
 					Some((request, _)) if !more_frames => {
 						// No body to wait for.

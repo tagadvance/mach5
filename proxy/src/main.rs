@@ -474,6 +474,9 @@ fn handle_job(
 	// Asked once, before the head is handed off: the answer holds for the whole
 	// stream, and re-asking per chunk would cost a plugin round trip each time.
 	let wants_chunks = interceptor.wants_chunks(&job.request, &head);
+	// Rewritten on the way past rather than held whole, so the client starts
+	// receiving a page while the origin is still writing it.
+	let mut rewriting = inject::streamer_for(config, &job.request, &head);
 	send(Payload::Head(head))?;
 
 	let mut reader = resp.into_reader();
@@ -493,6 +496,17 @@ fn handle_job(
 						continue;
 					}
 				}
+
+				// Injection happens here, on the way past. A parser mid-document
+				// may have nothing to emit yet, which is not the same as having
+				// nothing to send later.
+				if let Some(streamer) = rewriting.as_mut() {
+					chunk = streamer.push(&chunk);
+					if chunk.is_empty() {
+						continue;
+					}
+				}
+
 				metrics.bytes_to_client.add(chunk.len() as u64);
 
 				send(Payload::Chunk(chunk))?;
@@ -505,6 +519,15 @@ fn handle_job(
 
 				break;
 			}
+		}
+	}
+
+	if let Some(streamer) = rewriting.take() {
+		let tail = streamer.finish();
+		if !tail.is_empty() {
+			metrics.bytes_to_client.add(tail.len() as u64);
+
+			send(Payload::Chunk(tail))?;
 		}
 	}
 

@@ -20,7 +20,7 @@
 //! that names something it cannot handle — a UTF-16 page, say — the body is
 //! handed back exactly as it arrived rather than mangled into UTF-8.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -89,11 +89,13 @@ impl Interceptor for Inject {
 		}
 	}
 
-	/// The one hook that has to be exact. Anything this says yes to stops
-	/// streaming and is held in memory whole, so it says yes to HTML pages and
-	/// nothing else — not a 304, not a redirect, not a video.
-	fn wants_body(&self, req: &ProxyRequest, head: &ResponseHead) -> bool {
-		claims(head.status, &head.headers) && !self.excluded(req)
+	/// Nothing any more. Injection used to hold every HTML page in memory to
+	/// splice into it, which cost the client the whole of the origin's
+	/// generation time before it saw a byte. The rewriting now happens on the
+	/// way past — see [`Streamer`] — so this claims nothing and `on_response`
+	/// above only runs when something *else* wanted the body buffered.
+	fn wants_body(&self, _req: &ProxyRequest, _head: &ResponseHead) -> bool {
+		false
 	}
 }
 
@@ -203,6 +205,177 @@ fn find_ascii(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 		.position(|window| window.eq_ignore_ascii_case(needle))
 }
 
+/// Whether this response should be rewritten as it streams, and the thing to
+/// do it with.
+///
+/// A free function because the front ends reach it from the streaming path,
+/// where they hold a configuration and not a chain. The exclusion list is
+/// worked out once per process rather than per response.
+pub fn streamer_for(
+	config: &Config,
+	req: &ProxyRequest,
+	head: &ResponseHead,
+) -> Option<Streamer> {
+	if !config.inject.enabled {
+		return None;
+	}
+
+	let inject = shared(config);
+	if !claims(head.status, &head.headers) || inject.excluded(req) {
+		return None;
+	}
+
+	Streamer::new(&head.headers)
+}
+
+/// One set of exclusions for the process, as with everything else built per
+/// chain.
+pub fn shared(config: &Config) -> Arc<Inject> {
+	static SHARED: std::sync::OnceLock<Arc<Inject>> = std::sync::OnceLock::new();
+
+	SHARED.get_or_init(|| Arc::new(Inject::new(config))).clone()
+}
+
+/// Rewriting a page as it arrives, rather than after it has all arrived.
+///
+/// The reason this exists: buffering an HTML page means the client waits for
+/// the origin to finish generating it before receiving a single byte. Measured
+/// against an origin taking 1.2 seconds to produce a page, that moved
+/// time-to-first-byte from 46ms to 1,258ms — the browser cannot start parsing,
+/// cannot start fetching subresources, and shows nothing.
+///
+/// `lol_html` is a streaming parser, so the whole path can be push-based:
+/// encoded bytes in, decoded, rewritten, re-encoded, out. The cost is a flush
+/// per chunk on the encoder, which gives up a little ratio for the whole of the
+/// latency.
+pub struct Streamer {
+	decoder: Option<crate::encoding::Decoder>,
+	encoder: Option<crate::encoding::Encoder>,
+	rewriter: HtmlRewriter<'static, Sink>,
+	out: Rc<RefCell<Vec<u8>>>,
+	/// A parser that has given up. Its bytes still have to reach the client, so
+	/// from here on they are passed through untouched.
+	broken: bool,
+}
+
+/// Where `lol_html` puts what it has finished with.
+type Sink = Box<dyn FnMut(&[u8])>;
+
+impl Streamer {
+	/// `None` when this response is not one to rewrite on the fly, in which
+	/// case the caller relays it as it always did.
+	pub fn new(response_headers: &[(String, String)]) -> Option<Self> {
+		let coding = crate::encoding::coding_of(response_headers);
+		// A coding named but not understood cannot be decoded, so the bytes
+		// cannot be parsed, so there is nothing to do but pass them through.
+		if coding.is_none() && has_content_encoding(response_headers) {
+			return None;
+		}
+
+		let encoding = encoding_for(charset(response_headers))?;
+		let out = Rc::new(RefCell::new(Vec::new()));
+		let injected = Rc::new(Cell::new(false));
+		let into_head = injected.clone();
+		let into_body = injected;
+
+		let sink = out.clone();
+		let settings = Settings::new()
+			.with_encoding(encoding)
+			.append_element_content_handler(element!("head", move |el| {
+				el.append(TAGS, ContentType::Html);
+				into_head.set(true);
+
+				Ok(())
+			}))
+			.append_element_content_handler(element!("body", move |el| {
+				if !into_body.get() {
+					el.prepend(TAGS, ContentType::Html);
+					into_body.set(true);
+				}
+
+				Ok(())
+			}));
+
+		Some(Self {
+			decoder: coding.map(crate::encoding::Decoder::new),
+			encoder: coding.map(crate::encoding::Encoder::new),
+			rewriter: HtmlRewriter::new(
+				settings,
+				Box::new(move |chunk: &[u8]| sink.borrow_mut().extend_from_slice(chunk)) as Sink,
+			),
+			out,
+			broken: false,
+		})
+	}
+
+	/// One chunk in, whatever is ready to send out.
+	pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+		if self.broken {
+			return chunk.to_vec();
+		}
+
+		let plain = match self.decoder.as_mut() {
+			Some(decoder) => match decoder.push(chunk) {
+				Ok(plain) => plain,
+				Err(e) => return self.give_up(chunk, &e.to_string()),
+			},
+			None => chunk.to_vec(),
+		};
+
+		if self.rewriter.write(&plain).is_err() {
+			return self.give_up(chunk, "the parser refused the document");
+		}
+
+		self.drain()
+	}
+
+	/// The end of the body: flush the parser and close the coding.
+	pub fn finish(self) -> Vec<u8> {
+		if self.broken {
+			return Vec::new();
+		}
+
+		let _ = self.rewriter.end();
+		let rewritten = std::mem::take(&mut *self.out.borrow_mut());
+
+		let Some(encoder) = self.encoder else {
+			return rewritten;
+		};
+
+		let mut encoder = encoder;
+		let mut out = encoder.push(&rewritten).unwrap_or_default();
+		out.extend(encoder.finish().unwrap_or_default());
+
+		out
+	}
+
+	fn drain(&mut self) -> Vec<u8> {
+		let rewritten = std::mem::take(&mut *self.out.borrow_mut());
+
+		match self.encoder.as_mut() {
+			Some(encoder) => encoder.push(&rewritten).unwrap_or_default(),
+			None => rewritten,
+		}
+	}
+
+	/// Stop rewriting and let the rest of the body past untouched.
+	///
+	/// Whatever went wrong, the client is mid-response and the only thing worse
+	/// than an un-injected page is half a page.
+	fn give_up(&mut self, chunk: &[u8], why: &str) -> Vec<u8> {
+		log::debug!("no longer rewriting this page: {why}");
+		self.broken = true;
+
+		chunk.to_vec()
+	}
+}
+
+fn has_content_encoding(headers: &[(String, String)]) -> bool {
+	headers
+		.iter()
+		.any(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -239,6 +412,13 @@ mod tests {
 
 	fn run(inject: &Inject, url: &str, resp: &mut ProxyResponse) {
 		inject.on_response(&request(url), resp);
+	}
+
+	fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+		pairs
+			.iter()
+			.map(|(k, v)| (k.to_string(), v.to_string()))
+			.collect()
 	}
 
 	fn head(status: u16, content_type: &str) -> ResponseHead {
@@ -469,13 +649,16 @@ mod tests {
 	}
 
 	#[test]
-	fn only_a_html_page_is_claimed() {
-		let inject = inject(&[]);
-		let req = request("https://example.com/");
+	fn only_a_html_page_is_rewritten() {
+		for content_type in ["text/html; charset=utf-8", "TEXT/HTML"] {
+			assert!(
+				Streamer::new(&headers(&[("content-type", content_type)])).is_some(),
+				"{content_type} is a page"
+			);
+		}
 
-		assert!(inject.wants_body(&req, &head(200, "text/html; charset=utf-8")));
-		assert!(inject.wants_body(&req, &head(200, "TEXT/HTML")));
-
+		// Not a raster, not a page, and in one case a document type this does
+		// not claim to understand.
 		for content_type in [
 			"application/json",
 			"video/mp4",
@@ -483,20 +666,27 @@ mod tests {
 			"application/xhtml+xml",
 		] {
 			assert!(
-				!inject.wants_body(&req, &head(200, content_type)),
-				"{content_type} must keep streaming"
+				!claims(200, &headers(&[("content-type", content_type)])),
+				"{content_type} must pass through untouched"
 			);
 		}
 
 		assert!(
-			!inject.wants_body(
-				&req,
-				&ResponseHead {
-					status: 200,
-					headers: Vec::new(),
-				}
-			),
+			!claims(200, &[]),
 			"no content-type at all is not a page"
+		);
+	}
+
+	/// Injection stopped holding pages in memory: that is what cost the client
+	/// the origin's whole generation time before it saw a byte.
+	#[test]
+	fn nothing_is_held_in_memory_to_inject_into_it() {
+		let inject = inject(&[]);
+		let req = request("https://example.com/");
+
+		assert!(
+			!inject.wants_body(&req, &head(200, "text/html")),
+			"a page is rewritten on the way past now"
 		);
 	}
 
@@ -507,10 +697,11 @@ mod tests {
 
 		for status in [204, 301, 304, 404, 500] {
 			assert!(
-				!inject.wants_body(&req, &head(status, "text/html")),
-				"{status} must keep streaming"
+				!claims(status, &headers(&[("content-type", "text/html")])),
+				"{status} must pass through untouched"
 			);
 		}
+		let _ = &req;
 
 		// And an error page is not rewritten even when it is buffered anyway.
 		let mut resp = html(404, b"<html><head></head><body>gone</body></html>");

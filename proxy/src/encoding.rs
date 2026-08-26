@@ -305,6 +305,105 @@ fn vary_on(headers: &mut Vec<(String, String)>, header: &str) {
 	value.push_str(header);
 }
 
+/// A content coding applied a piece at a time, for a body that is being
+/// rewritten as it arrives rather than held whole.
+///
+/// Push-based rather than wrapping a reader, because the front ends already
+/// have the chunks in hand and neither wants to invert its loop.
+pub enum Decoder {
+	Gzip(Box<flate2::write::GzDecoder<Vec<u8>>>),
+	Brotli(Box<brotli::DecompressorWriter<Vec<u8>>>),
+}
+
+pub enum Encoder {
+	Gzip(Box<flate2::write::GzEncoder<Vec<u8>>>),
+	Brotli(Box<brotli::CompressorWriter<Vec<u8>>>),
+}
+
+impl Decoder {
+	pub fn new(coding: Coding) -> Self {
+		match coding {
+			Coding::Gzip => Self::Gzip(Box::new(flate2::write::GzDecoder::new(Vec::new()))),
+			Coding::Brotli => Self::Brotli(Box::new(brotli::DecompressorWriter::new(
+				Vec::new(),
+				BUFFER_SIZE,
+			))),
+		}
+	}
+
+	/// Feed encoded bytes in, take whatever plain bytes came out.
+	pub fn push(&mut self, chunk: &[u8]) -> std::io::Result<Vec<u8>> {
+		match self {
+			Self::Gzip(inner) => {
+				inner.write_all(chunk)?;
+				inner.flush()?;
+
+				Ok(std::mem::take(inner.get_mut()))
+			}
+			Self::Brotli(inner) => {
+				inner.write_all(chunk)?;
+				inner.flush()?;
+
+				Ok(std::mem::take(inner.get_mut()))
+			}
+		}
+	}
+
+}
+
+impl Encoder {
+	pub fn new(coding: Coding) -> Self {
+		match coding {
+			Coding::Gzip => Self::Gzip(Box::new(flate2::write::GzEncoder::new(
+				Vec::new(),
+				flate2::Compression::default(),
+			))),
+			Coding::Brotli => Self::Brotli(Box::new(brotli::CompressorWriter::new(
+				Vec::new(),
+				BUFFER_SIZE,
+				QUALITY,
+				WINDOW_BITS,
+			))),
+		}
+	}
+
+	/// Feed plain bytes in, take whatever encoded bytes are ready.
+	///
+	/// Flushed per chunk, which costs a little compression against holding the
+	/// whole body — and holding the whole body is the thing being avoided.
+	pub fn push(&mut self, chunk: &[u8]) -> std::io::Result<Vec<u8>> {
+		match self {
+			Self::Gzip(inner) => {
+				inner.write_all(chunk)?;
+				inner.flush()?;
+
+				Ok(std::mem::take(inner.get_mut()))
+			}
+			Self::Brotli(inner) => {
+				inner.write_all(chunk)?;
+				inner.flush()?;
+
+				Ok(std::mem::take(inner.get_mut()))
+			}
+		}
+	}
+
+	pub fn finish(self) -> std::io::Result<Vec<u8>> {
+		match self {
+			Self::Gzip(inner) => inner.finish(),
+			Self::Brotli(inner) => Ok(inner.into_inner()),
+		}
+	}
+}
+
+/// The coding named by a `content-encoding`, if it is one we can work in.
+pub fn coding_of(headers: &[(String, String)]) -> Option<Coding> {
+	headers
+		.iter()
+		.find(|(name, _)| name.eq_ignore_ascii_case(CONTENT_ENCODING))
+		.and_then(|(_, value)| Coding::parse(value))
+}
+
 fn decompress(coding: Coding, body: &[u8]) -> std::io::Result<Vec<u8>> {
 	let mut out = Vec::new();
 	match coding {

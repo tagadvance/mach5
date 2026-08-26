@@ -455,6 +455,9 @@ fn fetch_blocking(
 	// Asked once, before the head is handed off: the answer holds for the whole
 	// stream, and re-asking per chunk would cost a plugin round trip each time.
 	let wants_chunks = interceptor.wants_chunks(&request, &head);
+	// A page is rewritten on its way past rather than held whole, so the client
+	// starts receiving it while the origin is still writing it.
+	let mut rewriting = crate::inject::streamer_for(&shared.config, &request, &head);
 	if head_tx.send(Outcome::Streaming(head)).is_err() {
 		return;
 	}
@@ -486,11 +489,29 @@ fn fetch_blocking(
 			}
 		}
 
+		// Injection happens here, on the way past. A parser mid-document may
+		// have nothing to emit yet, which is not the same as having nothing to
+		// send later.
+		if let Some(streamer) = rewriting.as_mut() {
+			chunk = streamer.push(&chunk);
+			if chunk.is_empty() {
+				continue;
+			}
+		}
+
 		metrics.bytes_to_client.add(chunk.len() as u64);
 
 		if body_tx.blocking_send(Ok(Frame::data(Bytes::from(chunk)))).is_err() {
 			// Client went away.
 			break;
+		}
+	}
+
+	if let Some(streamer) = rewriting.take() {
+		let tail = streamer.finish();
+		if !tail.is_empty() {
+			metrics.bytes_to_client.add(tail.len() as u64);
+			let _ = body_tx.blocking_send(Ok(Frame::data(Bytes::from(tail))));
 		}
 	}
 

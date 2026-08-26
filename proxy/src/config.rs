@@ -131,6 +131,15 @@ pub struct Images {
 	/// WebP quality, 0-100. 80 is the usual "indistinguishable at a glance"
 	/// setting and is what the measurements behind this were taken at.
 	pub quality: u8,
+	/// The most pixels an image may have before it is passed through rather
+	/// than converted.
+	///
+	/// The bound has to be on pixels, not on bytes: a decoded frame costs
+	/// width × height × 4 whatever the file compressed to, so two megabytes of
+	/// flat-colour PNG is nearly half a gigabyte of memory and several seconds
+	/// of a worker. 16 is a 4000×4000 image, which is past anything anyone puts
+	/// on a page.
+	pub max_megapixels: u32,
 }
 
 impl Default for Images {
@@ -138,6 +147,7 @@ impl Default for Images {
 		Self {
 			enabled: true,
 			quality: 80,
+			max_megapixels: 16,
 			cache_mb: 512,
 			origin_cache_mb: 256,
 			max_cacheable_mb: 8,

@@ -30,7 +30,11 @@ use crate::interceptor::{Interceptor, ProxyRequest, ProxyResponse, ResponseHead}
 /// What we can decode, and what is worth the attempt. Anything else — WebP,
 /// AVIF, SVG, an icon — is either already better than we would manage or not a
 /// raster image.
-const CONVERTIBLE: [&str; 4] = ["image/jpeg", "image/jpg", "image/png", "image/bmp"];
+/// Exactly what the `image` dependency is built to decode — see its `features`
+/// in Cargo.toml. `image/bmp` was listed here and is not among them, so a BMP
+/// was buffered whole in memory and then always failed to convert: the cost of
+/// claiming it with none of the benefit.
+const CONVERTIBLE: [&str; 3] = ["image/jpeg", "image/jpg", "image/png"];
 
 /// Below this there is nothing to win, and the WebP container has overheads of
 /// its own. Tracking pixels and spacers live down here.
@@ -44,6 +48,8 @@ pub struct Images {
 	settings: Arc<crate::settings::Store>,
 	/// Absent when switched off, and then every request pays the conversion.
 	cache: Option<Arc<crate::imagecache::Cache>>,
+	/// What `[images] max_megapixels` comes to, in pixels.
+	max_pixels: u64,
 	metrics: Arc<crate::metrics::Metrics>,
 }
 
@@ -53,6 +59,7 @@ impl Images {
 			configured: config.images.quality,
 			settings: crate::settings::shared(config),
 			cache: crate::imagecache::shared(config),
+			max_pixels: u64::from(config.images.max_megapixels) * 1_000_000,
 			metrics: crate::metrics::shared(),
 		}
 	}
@@ -87,7 +94,7 @@ impl Interceptor for Images {
 		let webp = match cached {
 			Some(webp) => webp,
 			None => {
-				let Some(webp) = to_webp(&resp.body, quality as f32) else {
+				let Some(webp) = to_webp(&resp.body, quality as f32, self.max_pixels) else {
 					return;
 				};
 
@@ -117,6 +124,20 @@ impl Interceptor for Images {
 	/// streaming, so it claims images it can convert for a client that wants
 	/// them and nothing else.
 	fn wants_body(&self, req: &ProxyRequest, head: &ResponseHead) -> bool {
+		// Including whether converting is switched on at all. Without this,
+		// `image_quality: "off"` still bought every JPEG a trip through memory
+		// up to `max_response_body_mb` — the whole cost of the feature, and
+		// none of it, since `on_response` then hands the bytes straight back.
+		if self
+			.settings
+			.get()
+			.image_quality
+			.applied_to(self.configured)
+			.is_none()
+		{
+			return false;
+		}
+
 		claims(req, head.status, &head.headers)
 	}
 }
@@ -159,11 +180,17 @@ const MAX_DIMENSION: u32 = 16383;
 /// A body that will not decode is not an error worth reporting: an origin may
 /// have mislabelled it, or truncated it, and either way the right thing is to
 /// pass on exactly what arrived.
-fn to_webp(body: &[u8], quality: f32) -> Option<Vec<u8>> {
-	let decoded = image::ImageReader::new(Cursor::new(body))
+fn to_webp(body: &[u8], quality: f32, max_pixels: u64) -> Option<Vec<u8>> {
+	// The header, before anything is decoded. A decoded frame costs
+	// width × height × 4 bytes whatever the file compressed to, so the bytes
+	// that arrived are no bound at all: two megabytes of flat-colour PNG is
+	// 11000×11000, which is 484MB of pixels — and there are two worker pools of
+	// these, so a page of twenty such images asks for more memory than the box
+	// has. Deciding from the dimensions costs one pass over the header.
+	let (width, height) = image::ImageReader::new(Cursor::new(body))
 		.with_guessed_format()
 		.ok()?
-		.decode()
+		.into_dimensions()
 		.ok()?;
 
 	// libwebp refuses either dimension above this, and the `webp` crate's
@@ -172,25 +199,43 @@ fn to_webp(body: &[u8], quality: f32) -> Option<Vec<u8>> {
 	// worker down for the lifetime of the process and the listener would
 	// quietly answer fewer and fewer connections. A picture too big to convert
 	// is just a picture we pass through.
-	if decoded.width() > MAX_DIMENSION || decoded.height() > MAX_DIMENSION {
+	if width > MAX_DIMENSION || height > MAX_DIMENSION {
+		log::debug!("not re-encoding a {width}x{height} image: past what webp can hold");
+
+		return None;
+	}
+
+	if u64::from(width) * u64::from(height) > max_pixels {
 		log::debug!(
-			"not re-encoding a {}x{} image: past what webp can hold",
-			decoded.width(),
-			decoded.height()
+			"not re-encoding a {width}x{height} image: more pixels than [images] \
+			 max_megapixels allows"
 		);
 
 		return None;
 	}
 
+	let decoded = image::ImageReader::new(Cursor::new(body))
+		.with_guessed_format()
+		.ok()?
+		.decode()
+		.ok()?;
+
+	// Read before the conversion below consumes it.
+	let has_alpha = decoded.color().has_alpha();
+
 	// Transparency has to survive, or a logo comes out on a black square.
+	//
+	// `into_` rather than `to_`, so the pixels are moved where the layout
+	// already matches instead of copied — the copy doubled the peak for every
+	// image, and the peak is the thing being bounded.
 	//
 	// `encode_simple` rather than `encode` for the same reason as the guard
 	// above: it hands back an error where `encode` unwraps one.
-	let encoded = if decoded.color().has_alpha() {
-		webp::Encoder::from_rgba(&decoded.to_rgba8(), decoded.width(), decoded.height())
+	let encoded = if has_alpha {
+		webp::Encoder::from_rgba(&decoded.into_rgba8(), width, height)
 			.encode_simple(false, quality)
 	} else {
-		webp::Encoder::from_rgb(&decoded.to_rgb8(), decoded.width(), decoded.height())
+		webp::Encoder::from_rgb(&decoded.into_rgb8(), width, height)
 			.encode_simple(false, quality)
 	}
 	.ok()?;
@@ -244,13 +289,25 @@ mod tests {
 		}
 	}
 
+	/// A fresh settings file per call. It used to be a fixed name under the
+	/// system temp directory, so anything another checkout — or another user —
+	/// left there was deserialised into these tests: an `image_quality: "off"`
+	/// in that file turns every assertion below red with no code change.
+	/// For the tests that are about something other than the pixel budget.
+	const NO_PIXEL_LIMIT: u64 = u64::MAX;
+
 	fn images() -> Images {
+		let dir = tempfile::TempDir::new().expect("a settings directory");
+		let store = crate::settings::Store::load(dir.path().join("settings.json"));
+		// The directory only has to outlive the load; the store keeps the path
+		// and writes to it only when something is set, which no test here does.
+		drop(dir);
+
 		Images {
 			configured: 80,
-			settings: Arc::new(crate::settings::Store::load(
-				std::env::temp_dir().join("mach5-images-test-settings.json"),
-			)),
+			settings: Arc::new(store),
 			cache: None,
+			max_pixels: u64::from(crate::config::Images::default().max_megapixels) * 1_000_000,
 			metrics: Arc::new(crate::metrics::Metrics::default()),
 		}
 	}
@@ -375,7 +432,7 @@ mod tests {
 			.write_to(&mut Cursor::new(&mut original), image::ImageFormat::Png)
 			.expect("a png");
 
-		let converted = to_webp(&original, 80.0).expect("it converts");
+		let converted = to_webp(&original, 80.0, NO_PIXEL_LIMIT).expect("it converts");
 		let features = webp::BitstreamFeatures::new(&converted).expect("a webp");
 
 		assert!(
@@ -393,13 +450,40 @@ mod tests {
 	fn an_image_too_wide_for_webp_is_passed_through() {
 		let wide = png(MAX_DIMENSION + 1, 2);
 
-		assert_eq!(to_webp(&wide, 80.0), None, "too wide to convert is not a reason to crash");
+		assert_eq!(
+			to_webp(&wide, 80.0, NO_PIXEL_LIMIT),
+			None,
+			"too wide to convert is not a reason to crash"
+		);
+	}
+
+	/// A decoded frame is width × height × 4 bytes whatever the file compressed
+	/// to, so the bytes that arrived bound nothing: this is a couple of hundred
+	/// kilobytes of flat-colour PNG and forty megabytes of pixels, and there
+	/// are two worker pools that would each hold one.
+	#[test]
+	fn a_picture_with_more_pixels_than_allowed_is_passed_through() {
+		let big = png(1_000, 1_000);
+
+		assert_eq!(
+			to_webp(&big, 80.0, 500_000),
+			None,
+			"a megapixel against a half-megapixel limit"
+		);
+		assert!(
+			to_webp(&big, 80.0, 2 * 1_000_000).is_some(),
+			"and it converts when the limit allows it, so the refusal is the \
+			 limit and not the image"
+		);
 	}
 
 	#[test]
 	fn an_image_at_the_limit_still_converts() {
 		let edge = png(MAX_DIMENSION, 2);
 
-		assert!(to_webp(&edge, 80.0).is_some(), "16383 is allowed, and must stay allowed");
+		assert!(
+			to_webp(&edge, 80.0, NO_PIXEL_LIMIT).is_some(),
+			"16383 is allowed, and must stay allowed"
+		);
 	}
 }

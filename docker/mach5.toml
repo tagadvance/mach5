@@ -214,6 +214,13 @@ enabled = true
 # WebP quality, 0-100. 80 is the usual "indistinguishable at a glance" setting
 # and is what the measurements above were taken at.
 quality = 80
+# The most pixels an image may have before it is passed through rather than
+# converted. The bound has to be on pixels and not on bytes: a decoded frame
+# costs width x height x 4 whatever the file compressed to, so two megabytes of
+# flat-colour PNG is nearly half a gigabyte of memory and several seconds of a
+# worker — and there are two worker pools of them. 16 is a 4000x4000 image,
+# past anything anyone puts on a page.
+max_megapixels = 16
 
 # How much disk the re-encoded images may take, so the conversion is done once
 # rather than per request. A 1600x1200 photograph costs about 2.5 seconds to

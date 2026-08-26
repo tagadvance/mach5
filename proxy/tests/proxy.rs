@@ -107,6 +107,12 @@ fn a_204_is_not_given_a_length() {
 
 	assert_eq!(response.status, 204);
 	assert_eq!(response.header("content-length"), None);
+	assert!(response.body.is_empty(), "and no body to go with it");
+
+	// Ours replaces the origin's rather than joining it. A second one would
+	// mean the strip in `apply_alt_svc` had stopped working, which nothing else
+	// here would notice.
+	assert_eq!(response.values("alt-svc"), [proxy.alt_svc()]);
 }
 
 #[test]

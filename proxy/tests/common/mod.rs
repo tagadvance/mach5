@@ -288,6 +288,20 @@ pub struct Response {
 }
 
 impl Response {
+	/// Every value for a header, in the order they arrived.
+	///
+	/// [`Self::header`] answers with the first, which for a long time was the
+	/// only thing this harness could see — so no test could tell a header sent
+	/// once from the same header sent twice, which is the whole subject of the
+	/// proxy's own multi-value handling.
+	pub fn values(&self, name: &str) -> Vec<&str> {
+		self.headers
+			.iter()
+			.filter(|(header, _)| header == name)
+			.map(|(_, value)| value.as_str())
+			.collect()
+	}
+
 	/// Header names are lowercased on the way in, so callers ask in lowercase.
 	pub fn header(&self, name: &str) -> Option<&str> {
 		self.headers
@@ -322,25 +336,41 @@ fn read_response(stream: &mut impl Read, head_only: bool) -> Response {
 		buf.extend_from_slice(&chunk[..read]);
 	};
 
-	// Every response asserted on here declares a length, or has no body at all.
-	// Nothing under test streams, so there is no chunked decoding to do.
-	let length: usize = if head_only {
-		0
-	} else {
-		head.headers
-			.iter()
-			.find(|(name, _)| name == "content-length")
-			.map(|(_, value)| value.parse().expect("a numeric content-length"))
-			.unwrap_or(0)
-	};
-
+	// Read to the end of the connection rather than to `content-length`, and do
+	// not truncate. Every request here sends `connection: close`, so the end of
+	// the stream is the end of the body.
+	//
+	// This used to stop at the declared length, which made a whole class of
+	// assertion unfalsifiable: a HEAD was read as zero bytes whatever arrived,
+	// and so was any response with no `content-length` — every 204 in the
+	// suite. `assert!(body.is_empty())` then held even when the proxy had sent
+	// a body, which is exactly the framing bug those tests exist to catch.
 	let mut body = buf[head.len..].to_vec();
-	while body.len() < length {
-		let read = stream.read(&mut chunk).expect("read the body");
-		assert!(read > 0, "connection closed mid-body");
-		body.extend_from_slice(&chunk[..read]);
+	loop {
+		match stream.read(&mut chunk) {
+			Ok(0) => break,
+			Ok(read) => body.extend_from_slice(&chunk[..read]),
+			// A TLS peer that closes without a close_notify. The bytes already
+			// read are still the response.
+			Err(_) => break,
+		}
 	}
-	body.truncate(length);
+
+	let declared: Option<usize> = head
+		.headers
+		.iter()
+		.find(|(name, _)| name == "content-length")
+		.map(|(_, value)| value.parse().expect("a numeric content-length"));
+
+	// A HEAD's `content-length` describes the body a GET would have returned,
+	// so it is deliberately not a claim about these bytes.
+	if let Some(declared) = declared.filter(|_| !head_only) {
+		assert_eq!(
+			body.len(),
+			declared,
+			"the body is not the length the response declared"
+		);
+	}
 
 	Response {
 		status: head.status,

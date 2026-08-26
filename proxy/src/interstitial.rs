@@ -23,11 +23,22 @@ const STATUS_LOOP_DETECTED: u16 = 508;
 /// Build the interstitial shown in place of a page whose origin failed
 /// certificate validation.
 ///
-/// `bypass_phrase` is what someone may type on this page to be let through
-/// anyway, or `None` when that is switched off — in which case the page carries
-/// no trace of the mechanism at all.
-pub fn certificate_error(host: &str, detail: &str, bypass_phrase: Option<&str>) -> ProxyResponse {
-	let body = page(host, detail, bypass_phrase);
+/// `bypass` is the phrase someone may type on this page to be let through
+/// anyway together with the single-use token that dismissing it will spend, or
+/// `None` when the mechanism is switched off — in which case the page carries
+/// no trace of it at all.
+///
+/// The token is why this takes a pair rather than a phrase. Typing the phrase
+/// used to navigate to `/.mach5/bypass`, which meant any page anywhere could
+/// reach the same endpoint with an `<img>` tag and turn certificate checking
+/// off for a host nobody had been warned about. The phrase is now what unlocks
+/// a token this page was given, and the token is what the endpoint believes.
+pub fn certificate_error(
+	host: &str,
+	detail: &str,
+	bypass: Option<(&str, &str)>,
+) -> ProxyResponse {
+	let body = page(host, detail, bypass);
 
 	ProxyResponse {
 		status: STATUS_INVALID_CERT,
@@ -74,11 +85,13 @@ pub fn fetch_loop(host: &str) -> ProxyResponse {
 	}
 }
 
-fn page(host: &str, detail: &str, bypass_phrase: Option<&str>) -> String {
+fn page(host: &str, detail: &str, offer: Option<(&str, &str)>) -> String {
 	let host = escape(host);
 	let detail = escape(detail);
 	let explanation = explain(&detail);
-	let bypass = bypass_phrase.map(listener).unwrap_or_default();
+	let bypass = offer
+		.map(|(phrase, token)| listener(phrase, token))
+		.unwrap_or_default();
 
 	format!(
 		r#"<!doctype html>
@@ -124,15 +137,25 @@ fn page(host: &str, detail: &str, bypass_phrase: Option<&str>) -> String {
 /// something you have to already know and type is not something anyone does by
 /// accident. It is also why the markup above says nothing about it: the page
 /// has to remain a refusal, and this is the whole of the mechanism.
-fn listener(phrase: &str) -> String {
-	// Through a JSON string, so a phrase carrying a quote or a backslash cannot
-	// end the literal and become code.
-	let phrase = serde_json::to_string(phrase).unwrap_or_else(|_| "\"\"".to_string());
+fn listener(phrase: &str, token: &str) -> String {
+	// Through a JSON string, so a phrase or a token carrying a quote or a
+	// backslash cannot end the literal and become code.
+	let quoted = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string());
+	let phrase = quoted(phrase);
+	let token = quoted(token);
 
+	// A POST rather than a navigation, and a token rather than nothing: a
+	// cross-origin form can still send this, but it cannot know the token, and
+	// `content-type: application/json` is not a form encoding a browser will
+	// send cross-origin without asking permission first.
+	//
+	// Reloading rather than following a `next` parameter means there is no
+	// redirect target to get wrong — the page you are on is the page you wanted.
 	format!(
 		r#"<script>
 (() => {{
 	const want = {phrase};
+	const token = {token};
 	let typed = '';
 	addEventListener('keypress', (e) => {{
 		typed = (typed + String.fromCharCode(e.charCode || e.keyCode)).slice(-want.length);
@@ -140,8 +163,16 @@ fn listener(phrase: &str) -> String {
 			return;
 		}}
 
-		const next = encodeURIComponent(location.pathname + location.search);
-		location.href = '/.mach5/bypass?next=' + next;
+		fetch('/.mach5/bypass', {{
+			method: 'POST',
+			credentials: 'omit',
+			headers: {{ 'content-type': 'application/json' }},
+			body: JSON.stringify({{ token: token }}),
+		}}).then((r) => {{
+			if (r.ok) {{
+				location.reload();
+			}}
+		}}, () => {{}});
 	}});
 }})();
 </script>"#
@@ -302,7 +333,7 @@ mod tests {
 	/// off. A page that hinted at it would be a page people click through.
 	#[test]
 	fn the_bypass_is_invisible_on_the_page_and_absent_when_off() {
-		let with = certificate_error("example.com", "expired", Some("thisisunsafe"));
+		let with = certificate_error("example.com", "expired", Some(("thisisunsafe", "tok3n")));
 		let body = String::from_utf8(with.body).unwrap();
 
 		assert!(body.contains("/.mach5/bypass"), "the listener has to be there");
@@ -324,7 +355,7 @@ mod tests {
 	/// code — a quote in it must not be able to close the literal.
 	#[test]
 	fn a_phrase_cannot_break_out_of_the_script() {
-		let resp = certificate_error("example.com", "expired", Some("a\"; alert(1); //"));
+		let resp = certificate_error("example.com", "expired", Some(("a\"; alert(1); //", "tok3n")));
 		let body = String::from_utf8(resp.body).unwrap();
 
 		assert!(body.contains(r#"const want = "a\"; alert(1); //";"#), "{body}");

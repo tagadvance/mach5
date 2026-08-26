@@ -272,25 +272,33 @@ impl Internal {
 		}
 	}
 
-	/// Record that whoever is at this host has asked to be let through its
-	/// certificate failure, and send them back where they were going.
+	/// Spend the token this host's warning page was given, and wave it through.
 	///
-	/// Nothing here checks that a failure actually happened. It does not need
-	/// to: the phrase is only on the warning page, and a bypass changes nothing
-	/// for a host whose certificate validates.
-	fn bypass(&self, host: &str, query: &str, ttl: std::time::Duration) -> ProxyResponse {
-		self.bypasses.allow(host, ttl);
+	/// The token is the whole of the check. It used to be that typing the
+	/// phrase navigated here and this method did as it was told, which meant
+	/// `<img src="https://bank.example/.mach5/bypass">` on any page in the
+	/// world turned certificate validation off for a host whose warning nobody
+	/// had seen — for every client behind the proxy, for the full TTL, silently.
+	///
+	/// What still does not need checking is whether the certificate actually
+	/// failed: a bypass changes nothing for a host that validates.
+	fn bypass(&self, host: &str, body: &[u8], ttl: std::time::Duration) -> ProxyResponse {
+		let Ok(asked) = serde_json::from_slice::<Redeem>(body) else {
+			return empty(400);
+		};
+
+		if !self.bypasses.redeem(host, &asked.token, ttl) {
+			log::warn!("refused a certificate bypass for {host}: no such token");
+
+			return empty(403);
+		}
+
 		log::warn!(
 			"certificate validation bypassed for {host} for the next {} minutes",
 			ttl.as_secs() / 60
 		);
 
-		let mut response = empty(303);
-		response
-			.headers
-			.push(("location".to_string(), next_path(query)));
-
-		response
+		empty(204)
 	}
 
 	fn route(
@@ -298,7 +306,6 @@ impl Internal {
 		host: &str,
 		method: &str,
 		path: &str,
-		query: &str,
 		body: &[u8],
 	) -> ProxyResponse {
 		// Handled ahead of the table so that, switched off, it is not in the
@@ -306,7 +313,7 @@ impl Internal {
 		// whether the mechanism exists, and a 405 would answer that question.
 		if path == BYPASS {
 			return match (self.bypass_ttl, method) {
-				(Some(ttl), "GET") => self.bypass(host, query, ttl),
+				(Some(ttl), "POST") => self.bypass(host, body, ttl),
 				(Some(_), _) => empty(405),
 				(None, _) => empty(404),
 			};
@@ -566,12 +573,23 @@ impl Interceptor for Internal {
 			return None;
 		}
 
+		// Everything under `/.mach5/` is same-origin on every site mach5
+		// handles — that is what makes it reachable at all, and it means any
+		// page you visit can post here. `sec-fetch-site` is the browser saying
+		// where the request came from, and it is a forbidden header, so a page
+		// cannot lie about it.
+		if req.method != "GET" && !same_origin(&req.headers) {
+			self.metrics.internal.increment();
+
+			return Some(empty(403));
+		}
+
 		// The host is the one the client asked for, never one the request could
 		// name, so a page can only ever reach its own site's list.
 		let host = crate::host_of(&req.url);
 		self.metrics.internal.increment();
 
-		Some(self.route(host, &req.method, path, query_of(&req.url), &req.body))
+		Some(self.route(host, &req.method, path, &req.body))
 	}
 
 	/// Its `POST` endpoints read what was sent, so the body has to be here
@@ -586,6 +604,12 @@ impl Interceptor for Internal {
 	fn wants_body(&self, _req: &ProxyRequest, _head: &ResponseHead) -> bool {
 		false
 	}
+}
+
+/// The body of a `POST /.mach5/bypass`: the token the warning page was given.
+#[derive(Deserialize)]
+struct Redeem {
+	token: String,
 }
 
 /// The body of a `GET /.mach5/hidden`.
@@ -943,62 +967,26 @@ fn empty(status: u16) -> ProxyResponse {
 /// scheme-relative `//evil.com` written as `%2f%2fevil.com` has to be rejected
 /// as the same thing — and then only a path is allowed through. A backslash is
 /// treated as a slash by enough browsers to count as one here.
-fn next_path(query: &str) -> String {
-	const HOME: &str = "/";
+/// Whether a write may be accepted, according to the browser that sent it.
+///
+/// Absent means it was not a browser — curl, a script, the tests. That is not
+/// a way around this check, because a client that can set its own headers can
+/// equally point itself at any host: the attack this closes is a *page* making
+/// your browser act on your behalf, and every browser that sends requests a
+/// page can trigger sends this header.
+///
+/// `none` is a request nobody linked to: a typed URL or a bookmark. That is the
+/// user themselves, which is the one origin most entitled to be here.
+fn same_origin(headers: &[(String, String)]) -> bool {
+	let site = headers
+		.iter()
+		.find(|(name, _)| name.eq_ignore_ascii_case("sec-fetch-site"))
+		.map(|(_, value)| value.trim());
 
-	let Some(raw) = query
-		.split('&')
-		.find_map(|pair| pair.strip_prefix("next="))
-	else {
-		return HOME.to_string();
-	};
-
-	let next = percent_decode(raw);
-	let mut characters = next.chars();
-
-	match (characters.next(), characters.next()) {
-		(Some('/'), Some('/' | '\\')) => HOME.to_string(),
-		(Some('/'), _) => next,
-		_ => HOME.to_string(),
+	match site {
+		Some(site) => site.eq_ignore_ascii_case("same-origin") || site.eq_ignore_ascii_case("none"),
+		None => true,
 	}
-}
-
-/// Enough percent-decoding for a path that `encodeURIComponent` produced.
-/// Anything malformed is left as the literal characters it is, which cannot
-/// turn a rejected value into an accepted one.
-fn percent_decode(raw: &str) -> String {
-	let bytes = raw.as_bytes();
-	let mut out = Vec::with_capacity(bytes.len());
-	let mut i = 0;
-
-	while i < bytes.len() {
-		let decoded = (bytes[i] == b'%' && i + 2 < bytes.len())
-			.then(|| std::str::from_utf8(&bytes[i + 1..i + 3]).ok())
-			.flatten()
-			.and_then(|hex| u8::from_str_radix(hex, 16).ok());
-
-		match decoded {
-			Some(byte) => {
-				out.push(byte);
-				i += 3;
-			}
-			None => {
-				out.push(bytes[i]);
-				i += 1;
-			}
-		}
-	}
-
-	String::from_utf8_lossy(&out).into_owned()
-}
-
-/// Query portion of an absolute URL, without the leading `?` or any fragment.
-fn query_of(url: &str) -> &str {
-	let Some((_before, rest)) = url.split_once('?') else {
-		return "";
-	};
-
-	rest.split('#').next().unwrap_or("")
 }
 
 /// Whether this path belongs to the proxy. `/.mach5` on its own counts, so
@@ -1140,31 +1128,147 @@ mod tests {
 	}
 
 	#[test]
-	fn typing_the_phrase_records_a_bypass_and_goes_back() {
+	fn a_bypass_needs_the_token_the_warning_page_was_given() {
 		let dir = TempDir::new().unwrap();
 		let internal = internal(&dir);
 
+		// What the front end does when it builds the warning page.
+		let token = internal.bypasses.offer("staging.example.com");
+
 		let response = call(
 			&internal,
-			"GET",
-			"https://staging.example.com/.mach5/bypass?next=%2Fapp%3Fid%3D7",
-			"",
+			"POST",
+			"https://staging.example.com/.mach5/bypass",
+			&format!(r#"{{"token":"{token}"}}"#),
 		);
 
-		assert_eq!(response.status, 303);
-		assert_eq!(
-			response
-				.headers
-				.iter()
-				.find(|(name, _)| name == "location")
-				.map(|(_, value)| value.as_str()),
-			Some("/app?id=7")
-		);
+		assert_eq!(response.status, 204);
 		assert!(internal.bypasses.allows("staging.example.com"));
 		assert!(
 			!internal.bypasses.allows("other.example.com"),
 			"only the host that was warned about"
 		);
+	}
+
+	/// The hole this replaced: `<img src="https://bank.example/.mach5/bypass">`
+	/// on any page in the world used to be enough.
+	#[test]
+	fn a_bypass_without_a_token_is_refused() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		for (method, body) in [
+			("GET", ""),
+			("POST", ""),
+			("POST", r#"{"token":""}"#),
+			("POST", r#"{"token":"guessed"}"#),
+		] {
+			let response = call(
+				&internal,
+				method,
+				"https://bank.example/.mach5/bypass",
+				body,
+			);
+
+			assert!(
+				response.status >= 400,
+				"{method} {body:?} was answered {}",
+				response.status
+			);
+			assert!(
+				!internal.bypasses.allows("bank.example"),
+				"{method} {body:?} turned certificate validation off"
+			);
+		}
+	}
+
+	#[test]
+	fn a_token_is_good_once_and_only_for_its_own_host() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+		let token = internal.bypasses.offer("staging.example.com");
+		let body = format!(r#"{{"token":"{token}"}}"#);
+
+		// The same token, at a host it was not issued for.
+		let elsewhere = call(&internal, "POST", "https://bank.example/.mach5/bypass", &body);
+		assert_eq!(elsewhere.status, 403);
+		assert!(!internal.bypasses.allows("bank.example"));
+
+		let first = call(
+			&internal,
+			"POST",
+			"https://staging.example.com/.mach5/bypass",
+			&body,
+		);
+		assert_eq!(first.status, 204);
+
+		let again = call(
+			&internal,
+			"POST",
+			"https://staging.example.com/.mach5/bypass",
+			&body,
+		);
+		assert_eq!(again.status, 403, "a token is spent when it is used");
+	}
+
+	#[test]
+	fn a_write_from_another_site_is_refused() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		for site in ["cross-site", "same-site", "Cross-Site"] {
+			let mut req = request("POST", "https://example.com/.mach5/hidden", r##"{"selector":"#ad"}"##);
+			req.headers
+				.push(("sec-fetch-site".to_string(), site.to_string()));
+
+			let response = internal
+				.on_request(&mut req)
+				.expect("an internal path is always answered");
+
+			assert_eq!(response.status, 403, "{site} must not be able to write");
+		}
+
+		assert!(
+			body_of(&call(&internal, "GET", "https://example.com/.mach5/hidden", "")).contains("[]"),
+			"and nothing was stored"
+		);
+	}
+
+	#[test]
+	fn the_page_itself_may_still_write() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		for site in ["same-origin", "none"] {
+			let mut req = request("POST", "https://example.com/.mach5/hidden", r##"{"selector":"#ad"}"##);
+			req.headers
+				.push(("sec-fetch-site".to_string(), site.to_string()));
+
+			let response = internal
+				.on_request(&mut req)
+				.expect("an internal path is always answered");
+
+			assert_eq!(response.status, 204, "{site} is the page doing its own work");
+		}
+	}
+
+	/// A reader may still read cross-origin. The stylesheet is fetched by the
+	/// page itself and the status page is a link somebody follows; neither
+	/// changes anything, and refusing them would break both.
+	#[test]
+	fn reads_are_not_affected() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		let mut req = request("GET", "https://example.com/.mach5/hidden.css", "");
+		req.headers
+			.push(("sec-fetch-site".to_string(), "cross-site".to_string()));
+
+		let response = internal
+			.on_request(&mut req)
+			.expect("an internal path is always answered");
+
+		assert_eq!(response.status, 200);
 	}
 
 	#[test]
@@ -1180,23 +1284,6 @@ mod tests {
 			"a 405 would tell someone the endpoint is there"
 		);
 		assert!(!internal.bypasses.allows("example.com"));
-	}
-
-	/// The one place a value out of the URL becomes a `location` header.
-	#[test]
-	fn only_a_path_survives_the_next_parameter() {
-		assert_eq!(next_path("next=%2Fpath%3Fq%3D1"), "/path?q=1");
-		assert_eq!(next_path("next=/path?q=1"), "/path?q=1");
-		assert_eq!(next_path(""), "/");
-		assert_eq!(next_path("next="), "/");
-		assert_eq!(next_path("other=1"), "/");
-
-		// Every shape of "somewhere that is not this site".
-		assert_eq!(next_path("next=%2F%2Fevil.example"), "/");
-		assert_eq!(next_path("next=//evil.example"), "/");
-		assert_eq!(next_path("next=/\\evil.example"), "/");
-		assert_eq!(next_path("next=https%3A%2F%2Fevil.example"), "/");
-		assert_eq!(next_path("next=javascript%3Aalert(1)"), "/");
 	}
 
 	#[test]

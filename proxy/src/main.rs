@@ -384,7 +384,16 @@ fn handle_job(
 					let logged = redact::detail(detail, &job.request.url);
 					log::warn!("certificate validation failed for {host}: {logged}");
 
-					interstitial::certificate_error(host, detail, config.bypass_phrase())
+					{
+						// Offered only when the phrase is configured, and spent by the page
+						// that carries it — see `insecure::Bypasses::redeem`.
+						let offer = config
+							.bypass_phrase()
+							.map(|phrase| (phrase, crate::insecure::bypasses().offer(host)));
+						let offer = offer.as_ref().map(|(phrase, token)| (*phrase, token.as_str()));
+
+						interstitial::certificate_error(host, detail, offer)
+					}
 				}
 				upstream::FetchError::Other(detail) => interstitial::upstream_error(host, detail),
 			};

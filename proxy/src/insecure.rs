@@ -25,15 +25,28 @@ use std::time::{Duration, Instant};
 use boring::ssl::{SslConnector, SslMethod, SslStream, SslVerifyMode};
 use ureq::{ReadWrite, TlsConnector};
 
-/// The hosts currently waved through, and the moment each stops being.
+/// How long an offered token stays redeemable. Long enough to read a warning
+/// page and decide, short enough that one left open in a background tab is not
+/// a standing invitation.
+const OFFER_TTL: Duration = Duration::from_secs(600);
+
+/// The hosts currently waved through, and the moment each stops being — plus
+/// the tokens offered to hosts whose warning page is currently on screen.
+///
+/// The tokens are what stop `/.mach5/bypass` being a URL any page can point an
+/// `<img>` at. They are minted here rather than anywhere else because this is
+/// the only place that knows what a bypass is, and because a token is only
+/// meaningful next to the registry it unlocks.
 pub struct Bypasses {
 	hosts: Mutex<HashMap<String, Instant>>,
+	offered: Mutex<HashMap<String, (String, Instant)>>,
 }
 
 impl Default for Bypasses {
 	fn default() -> Self {
 		Self {
 			hosts: Mutex::new(HashMap::new()),
+			offered: Mutex::new(HashMap::new()),
 		}
 	}
 }
@@ -60,9 +73,79 @@ impl Bypasses {
 		hosts.contains_key(&key(host))
 	}
 
+	/// Mint a token for this host and put it on the warning page.
+	///
+	/// One per page: a second warning for the same host replaces the first,
+	/// which is what you want when the earlier tab has been abandoned.
+	pub fn offer(&self, host: &str) -> String {
+		let token = token();
+		self.offered
+			.lock()
+			.expect("bypass offers lock")
+			.insert(key(host), (token.clone(), Instant::now() + OFFER_TTL));
+
+		token
+	}
+
+	/// Spend a token: wave the host through if it matches, and never twice.
+	///
+	/// Consuming it is the point. Without that, a token read out of one page
+	/// keeps working, and the thing being protected against is precisely a
+	/// request that arrives without anyone having seen a warning.
+	pub fn redeem(&self, host: &str, token: &str, ttl: Duration) -> bool {
+		let host = key(host);
+		let now = Instant::now();
+
+		let mut offered = self.offered.lock().expect("bypass offers lock");
+		offered.retain(|_, (_, expiry)| *expiry > now);
+
+		let Some((expected, _)) = offered.get(&host) else {
+			return false;
+		};
+		if !same(expected.as_bytes(), token.as_bytes()) {
+			return false;
+		}
+
+		offered.remove(&host);
+		drop(offered);
+
+		self.allow(&host, ttl);
+
+		true
+	}
+
 	fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Instant>> {
 		self.hosts.lock().expect("bypass registry lock")
 	}
+}
+
+/// 256 bits from the CSPRNG BoringSSL is already here for, as hex.
+///
+/// An empty string on failure rather than a panic, and `redeem` refuses one:
+/// a proxy that cannot reach its random source should stop offering bypasses,
+/// not stop.
+fn token() -> String {
+	let mut bytes = [0u8; 32];
+	if boring::rand::rand_bytes(&mut bytes).is_err() {
+		log::error!("no random bytes for a bypass token; the warning page cannot be dismissed");
+
+		return String::new();
+	}
+
+	bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Constant time, and never true for an empty expectation.
+fn same(expected: &[u8], given: &[u8]) -> bool {
+	if expected.is_empty() || expected.len() != given.len() {
+		return false;
+	}
+
+	expected
+		.iter()
+		.zip(given)
+		.fold(0u8, |differences, (a, b)| differences | (a ^ b))
+		== 0
 }
 
 fn key(host: &str) -> String {

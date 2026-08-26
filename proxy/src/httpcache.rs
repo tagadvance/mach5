@@ -42,6 +42,12 @@ pub struct Entry {
 	/// Unix seconds after which this must be revalidated. Equal to `stored` for
 	/// a response with a validator but no freshness of its own.
 	pub fresh_until: u64,
+	/// When this was written here, so the `age` handed to a client can be
+	/// counted forward instead of replayed. `default` rather than required, so
+	/// entries written before this field existed still load — they simply
+	/// report an age of however long they have been here.
+	#[serde(default)]
+	pub stored: u64,
 	pub etag: Option<String>,
 	pub last_modified: Option<String>,
 }
@@ -460,27 +466,43 @@ pub fn shared(config: &Config) -> Option<Arc<Cache>> {
 
 /// Build what to store from a response that [`eligible`] has already approved.
 pub fn entry_for(status: u16, headers: &[(String, String)], stored: u64) -> Entry {
+	// `age` describes the *arriving* response and is not a property of what is
+	// about to be stored, so it does not go on the entry. Keeping it did two
+	// things wrong at once: a 304 rarely carries one, so the stored value
+	// survived every revalidation and was subtracted from `max-age` again each
+	// time — an object that arrived with `age: 295, max-age: 300` was granted
+	// five seconds of life for ever, and one with `age >= max-age` was stale
+	// the instant it was written, so the cache never saved a request again. And
+	// serving the frozen number let a browser make the same subtraction a
+	// second time.
+	let arrived_at = age(headers);
+	let headers: Vec<(String, String)> = headers
+		.iter()
+		.filter(|(name, _)| !name.eq_ignore_ascii_case("age"))
+		.cloned()
+		.collect();
 	// `max-age` counts from when the response was *generated*, not from when it
 	// got here, and `age` is the hop count in seconds that says how far apart
 	// those are (RFC 9111 §4.2.3). Ignoring it gave a CDN object that arrived
 	// with `max-age=300, age=295` a fresh 300 seconds here — nearly twice the
 	// life the origin allowed, and doubling again for anything downstream that
 	// reads the same frozen `age` back out of the stored headers.
-	let lifetime = freshness(headers)
-		.map(|d| d.as_secs().saturating_sub(age(headers)))
+	let lifetime = freshness(&headers)
+		.map(|d| d.as_secs().saturating_sub(arrived_at))
 		.unwrap_or(0);
 
 	Entry {
 		status,
 		fresh_until: stored.saturating_add(lifetime),
-		etag: header(headers, "etag").map(str::to_string),
-		last_modified: header(headers, "last-modified").map(str::to_string),
-		headers: headers.to_vec(),
+		stored,
+		etag: header(&headers, "etag").map(str::to_string),
+		last_modified: header(&headers, "last-modified").map(str::to_string),
+		headers,
 	}
 }
 
 /// How long this response had already been alive when it arrived, in seconds.
-fn age(headers: &[(String, String)]) -> u64 {
+pub fn age(headers: &[(String, String)]) -> u64 {
 	header(headers, "age")
 		.and_then(|value| value.trim().parse::<u64>().ok())
 		.unwrap_or(0)
@@ -529,10 +551,21 @@ fn describes_the_body(name: &str) -> bool {
 }
 
 /// The stored response, as something to serve.
+///
+/// `age` is counted forward from when this was written rather than replayed
+/// from what arrived, which is what RFC 9111 §5.1 asks of a cache and is the
+/// only way a client downstream can compute freshness correctly.
 pub fn as_response(entry: &Entry, body: Vec<u8>) -> ProxyResponse {
+	let mut headers = entry.headers.clone();
+	headers.retain(|(name, _)| !name.eq_ignore_ascii_case("age"));
+	headers.push((
+		"age".to_string(),
+		now().saturating_sub(entry.stored).to_string(),
+	));
+
 	ProxyResponse {
 		status: entry.status,
-		headers: entry.headers.clone(),
+		headers,
 		body,
 	}
 }
@@ -822,6 +855,60 @@ mod tests {
 
 		let plain = headers(&[("cache-control", "max-age=300")]);
 		assert_eq!(entry_for(200, &plain, 1_000).fresh_until, 1_300);
+	}
+
+	/// The `age` that arrives describes the response, not the entry. Storing it
+	/// made two things wrong: a 304 rarely carries one, so the frozen number
+	/// survived every revalidation and was subtracted from `max-age` again each
+	/// time — five seconds of life for ever, or stale on arrival when
+	/// `age >= max-age`, which means the cache never saves a request again.
+	#[test]
+	fn a_revalidated_entry_does_not_keep_subtracting_the_same_age() {
+		let arriving = headers(&[
+			("content-type", "image/png"),
+			("cache-control", "max-age=300"),
+			("age", "295"),
+		]);
+
+		let entry = entry_for(200, &arriving, 1_000);
+		assert_eq!(entry.fresh_until, 1_005, "five seconds left, correctly");
+		assert!(
+			header(&entry.headers, "age").is_none(),
+			"and the arriving age is not kept: it is not a property of what is stored"
+		);
+
+		// The 304 five seconds later carries no `age`, as most do not.
+		let refreshed = refreshed_headers(&entry.headers, &headers(&[("date", "later")]));
+		let again = entry_for(200, &refreshed, 1_005);
+		assert_eq!(
+			again.fresh_until, 1_305,
+			"a full lifetime from now, not five more seconds for ever"
+		);
+	}
+
+	/// What a client is told, which is a different number: how long *this*
+	/// cache has held it. Replaying the origin's frozen age let a browser make
+	/// the same subtraction a second time.
+	#[test]
+	fn what_is_served_reports_how_long_we_have_held_it() {
+		let entry = Entry {
+			status: 200,
+			headers: headers(&[("content-type", "image/png"), ("age", "295")]),
+			fresh_until: now() + 100,
+			stored: now() - 30,
+			etag: None,
+			last_modified: None,
+		};
+
+		let served = as_response(&entry, b"bytes".to_vec());
+		let ages = served
+			.headers
+			.iter()
+			.filter(|(name, _)| name == "age")
+			.count();
+
+		assert_eq!(ages, 1, "exactly one, not ours appended to theirs");
+		assert_eq!(header(&served.headers, "age"), Some("30"));
 	}
 
 	/// A 304 is the origin's chance to change its mind about something it has

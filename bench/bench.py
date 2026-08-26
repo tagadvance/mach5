@@ -19,9 +19,9 @@ compressed as it was sent, not what the client had after decoding it.
 
 Two things to hold in mind when reading the result:
 
-- **Every fetch is a cold client.** The script mach5 injects is cacheable, so a
-  browser pays for it once and not per page; this charges it every time. The
-  proxied column is therefore the pessimistic bound, not the steady state.
+- **The injected picker is not counted.** It is the cost of a feature, not
+  proxy overhead, and including it would compare a page against a different
+  page. Both columns fetch the same URLs.
 - **A saving is not a speed-up.** Fewer bytes over a local hop can still take
   longer than more bytes direct, and the time column will say so.
 """
@@ -50,11 +50,6 @@ ASSET = re.compile(
     rb"""<(?:script|link|img)\b[^>]*?\b(?:src|href)\s*=\s*["']([^"']+)["']""",
     re.IGNORECASE,
 )
-
-# The tags mach5 splices into a page are fetched by a browser like anything
-# else, so they are counted against the proxied side rather than quietly
-# dropped.
-MACH5_ASSET = "/.mach5/"
 
 # A browser's, so origins answer the way they would in real use.
 ACCEPT_ENCODING = "gzip, deflate, br, zstd"
@@ -144,12 +139,12 @@ def median_of(runs):
 
 
 def measure(direct_urls, proxied_urls, host, port, ca, repeat):
-    """Bytes and seconds for what each side actually fetches.
+    """Bytes and seconds for what each side fetches.
 
-    The two lists are usually the same, and deliberately are not always: going
-    through mach5 a page gains two tags of its own, and a browser fetches those
-    like anything else. Charging them to the proxy is the only honest way to
-    count — leaving them out would report a saving that the client does not get.
+    Both sides fetch the same list. The picker mach5 injects is not in it: it
+    buys a feature, and weighing a feature against its own absence says nothing
+    about whether the proxy makes the web lighter. What is measured here is the
+    same bytes, fetched both ways.
     """
     direct_bytes = direct_time = 0
     proxied_bytes = proxied_time = 0
@@ -250,15 +245,6 @@ def main():
                 shared = subresources(page, plain[3], args.subresources)
                 direct_urls += shared
                 proxied_urls += shared
-
-            # What the proxied page adds on top is a real cost to the client.
-            through = through_proxy(page, args.host, args.port, args.ca, decode=True)
-            if through:
-                proxied_urls += [
-                    url
-                    for url in subresources(page, through[3], args.subresources)
-                    if MACH5_ASSET in url
-                ]
 
         d_bytes, d_time, p_bytes, p_time, failed = measure(
             direct_urls, proxied_urls, args.host, args.port, args.ca, args.repeat

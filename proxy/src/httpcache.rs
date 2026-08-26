@@ -94,9 +94,7 @@ pub fn eligible(req: &ProxyRequest, status: u16, headers: &[(String, String)]) -
 		return false;
 	}
 
-	let control = header(headers, "cache-control")
-		.unwrap_or_default()
-		.to_ascii_lowercase();
+	let control = joined(headers, "cache-control").to_ascii_lowercase();
 	if ["private", "no-store", "no-cache"]
 		.iter()
 		.any(|forbidden| control.contains(forbidden))
@@ -108,16 +106,14 @@ pub fn eligible(req: &ProxyRequest, status: u16, headers: &[(String, String)]) -
 	// useful half of "is this a session", and far better than guessing from a
 	// session cookie on the request, since a signed-in visitor still gets the
 	// same public logo as everybody else.
-	if let Some(vary) = header(headers, "vary") {
-		if vary.trim() == "*" {
-			return false;
-		}
-
+	let vary = joined(headers, "vary");
+	if !vary.is_empty() {
 		let all_keyed = vary.split(',').all(|name| {
 			let name = name.trim().to_ascii_lowercase();
 
 			KEYED_ON.contains(&name.as_str())
 		});
+		// `*` is not in KEYED_ON, so this covers it too.
 		if !all_keyed {
 			return false;
 		}
@@ -153,9 +149,7 @@ pub fn eligible(req: &ProxyRequest, status: u16, headers: &[(String, String)]) -
 /// `s-maxage` first, since that is the one addressed to a shared cache, which
 /// is what mach5 is.
 pub fn freshness(headers: &[(String, String)]) -> Option<Duration> {
-	let control = header(headers, "cache-control")
-		.unwrap_or_default()
-		.to_ascii_lowercase();
+	let control = joined(headers, "cache-control").to_ascii_lowercase();
 
 	for directive in ["s-maxage=", "max-age="] {
 		if let Some(seconds) = control
@@ -271,6 +265,23 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 		.map(|(_, value)| value.as_str())
 }
 
+/// Every value for a header, combined the way RFC 9110 §5.3 says a recipient
+/// may: a list-valued field sent as several lines means exactly what one line
+/// with the values joined by commas would.
+///
+/// Reading only the first is how a second `cache-control: private` or a second
+/// `vary: cookie` goes unnoticed — and this is the wall that decides whether a
+/// response belongs to everybody, so it must see all of what the origin said,
+/// not the part of it that happened to be sent first.
+fn joined(headers: &[(String, String)], name: &str) -> String {
+	headers
+		.iter()
+		.filter(|(header, _)| header.eq_ignore_ascii_case(name))
+		.map(|(_, value)| value.trim())
+		.collect::<Vec<_>>()
+		.join(", ")
+}
+
 /// What the *client* asked for, which RFC 9111 gives it a say in and which
 /// nothing about response freshness covers.
 ///
@@ -287,12 +298,8 @@ pub enum ClientWants {
 }
 
 pub fn client_wants(req: &ProxyRequest) -> ClientWants {
-	let control = header(&req.headers, "cache-control")
-		.unwrap_or_default()
-		.to_ascii_lowercase();
-	let pragma = header(&req.headers, "pragma")
-		.unwrap_or_default()
-		.to_ascii_lowercase();
+	let control = joined(&req.headers, "cache-control").to_ascii_lowercase();
+	let pragma = joined(&req.headers, "pragma").to_ascii_lowercase();
 
 	if control.contains("no-store") {
 		return ClientWants::Nothing;
@@ -623,6 +630,49 @@ mod tests {
 	/// The case Tag pushed back on: a small site that sets no cache headers at
 	/// all is exactly the one mach5 is for, and demanding `max-age` everywhere
 	/// would cache nothing for it.
+	/// RFC 9110 §5.3: a list-valued header sent as several lines means what one
+	/// joined line would. Reading only the first put the whole eligibility
+	/// decision at the mercy of which line the origin happened to send first —
+	/// and the second line is exactly where an origin puts the part that says
+	/// "not for everybody".
+	#[test]
+	fn a_second_line_of_a_header_counts_as_much_as_the_first() {
+		let public = headers(&[
+			("content-type", "image/png"),
+			("cache-control", "max-age=600"),
+		]);
+		assert!(
+			eligible(&request(&[]), 200, &public),
+			"the control case: this one really is public"
+		);
+
+		for late in [
+			("vary", "cookie"),
+			("cache-control", "private"),
+			("cache-control", "no-store"),
+			("vary", "*"),
+		] {
+			let mut refused = public.clone();
+			refused.push(("vary".to_string(), "accept-encoding".to_string()));
+			refused.push((late.0.to_string(), late.1.to_string()));
+
+			assert!(
+				!eligible(&request(&[]), 200, &refused),
+				"a late `{}: {}` still refuses it",
+				late.0,
+				late.1
+			);
+		}
+
+		// And the same for freshness, which decides how long rather than
+		// whether: a directive on the second line has to count too.
+		let split = headers(&[
+			("cache-control", "public"),
+			("cache-control", "max-age=42"),
+		]);
+		assert_eq!(freshness(&split), Some(Duration::from_secs(42)));
+	}
+
 	#[test]
 	fn a_stylesheet_or_font_with_only_a_validator_is_still_cached() {
 		for kind in ["text/css", "font/woff2", "application/vnd.ms-fontobject"] {

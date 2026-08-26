@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use boring::pkey::{PKey, Private};
 use boring::x509::X509;
@@ -28,6 +29,23 @@ struct Leaf {
 	not_after: OffsetDateTime,
 }
 
+/// How many minted leaves to keep.
+///
+/// It has to be bounded, and the bound has to be small enough to matter. mach5
+/// is deployed behind a resolver that answers every name with its own address,
+/// so a page can ask for `a1.attacker.test`, `a2.attacker.test` and onwards for
+/// as long as it likes — and each one used to cost a keypair, a signature and a
+/// permanent entry holding both. A thousand is far more distinct hosts than a
+/// browsing session touches, and the cost of being wrong is one re-mint.
+const MAX_LEAVES: usize = 1_024;
+
+/// A cached leaf and when it was last handed out, which is what decides who
+/// goes when the cache is full.
+struct Held {
+	leaf: Leaf,
+	used: Instant,
+}
+
 /// How long minted leaves stay valid, and when to re-mint them.
 struct Validity {
 	ttl: Duration,
@@ -43,7 +61,7 @@ pub struct CertAuthority {
 	root: Vec<u8>,
 	/// Whether the root was generated at startup rather than loaded from disk.
 	ephemeral: bool,
-	cache: Mutex<HashMap<String, Leaf>>,
+	cache: Mutex<HashMap<String, Held>>,
 	validity: Validity,
 }
 
@@ -203,18 +221,67 @@ impl CertAuthority {
 	/// Return a leaf for `sni`, minting and caching on first request and
 	/// re-minting once a cached leaf nears expiry.
 	fn leaf_for(&self, sni: &str) -> Result<Leaf, Box<dyn Error>> {
+		// A name is a name whatever it was capitalised as, and the same one
+		// twice should not cost two keypairs.
+		let key = sni.trim_end_matches('.').to_ascii_lowercase();
+
+		if let Some(leaf) = self.cached(&key) {
+			return Ok(leaf);
+		}
+
+		// Minted with the lock *not* held. A keygen, a signature and two PEM
+		// round trips take long enough that holding it would put every other
+		// handshake on the process behind this one — and one of the threads
+		// waiting is the QUIC event loop, which is every connection at once.
+		// Two callers racing on one name mint twice and one of them throws its
+		// leaf away, which is far cheaper than the alternative.
+		let leaf = self.mint(sni)?;
+		self.remember(key, leaf.clone());
+
+		Ok(leaf)
+	}
+
+	fn cached(&self, key: &str) -> Option<Leaf> {
+		let mut cache = self.cache.lock().unwrap();
+		let leaf = cache.get_mut(key)?;
+
+		if leaf.leaf.not_after - self.validity.refresh_margin <= OffsetDateTime::now_utc() {
+			return None;
+		}
+
+		leaf.used = Instant::now();
+
+		Some(leaf.leaf.clone())
+	}
+
+	fn remember(&self, key: String, leaf: Leaf) {
 		let mut cache = self.cache.lock().unwrap();
 
-		if let Some(leaf) = cache.get(sni) {
-			if leaf.not_after - self.validity.refresh_margin > OffsetDateTime::now_utc() {
-				return Ok(leaf.clone());
+		if cache.len() >= MAX_LEAVES && !cache.contains_key(&key) {
+			// Expired first, since nothing wants those. An O(n) scan over a
+			// thousand entries is nothing beside the keygen that got us here.
+			let now = OffsetDateTime::now_utc();
+			cache.retain(|_, held| held.leaf.not_after > now);
+
+			while cache.len() >= MAX_LEAVES {
+				let Some(oldest) = cache
+					.iter()
+					.min_by_key(|(_, held)| held.used)
+					.map(|(name, _)| name.clone())
+				else {
+					break;
+				};
+				cache.remove(&oldest);
 			}
 		}
 
-		let leaf = self.mint(sni)?;
-		cache.insert(sni.to_string(), leaf.clone());
-
-		Ok(leaf)
+		cache.insert(
+			key,
+			Held {
+				leaf,
+				used: Instant::now(),
+			},
+		);
 	}
 
 	fn mint(&self, sni: &str) -> Result<Leaf, Box<dyn Error>> {
@@ -391,6 +458,41 @@ mod tests {
 		assert_eq!(
 			first.cert.to_der().unwrap(),
 			second.cert.to_der().unwrap()
+		);
+
+		// And a name is a name however it was capitalised, or the same host
+		// costs two keypairs and two permanent entries.
+		let shouted = ca.leaf_for("EXAMPLE.COM.").unwrap();
+		assert_eq!(first.cert.to_der().unwrap(), shouted.cert.to_der().unwrap());
+		assert_eq!(ca.cache.lock().unwrap().len(), 1);
+	}
+
+	/// mach5 sits behind a resolver that answers every name with its own
+	/// address, so a page can ask for a new hostname as fast as it can write
+	/// one down — and each used to cost a keypair, a signature and a permanent
+	/// entry holding both, with nothing ever removing one.
+	#[test]
+	fn the_leaf_cache_cannot_grow_without_end() {
+		let ca = CertAuthority::generate_dev(&Config::default()).unwrap();
+
+		// The one to keep: minted first, and used again at the end.
+		ca.leaf_for("wanted.example").unwrap();
+
+		for n in 0..MAX_LEAVES + 32 {
+			ca.leaf_for(&format!("n{n}.attacker.test")).unwrap();
+			// Touched so it is never the least recently used.
+			ca.leaf_for("wanted.example").unwrap();
+		}
+
+		let held = ca.cache.lock().unwrap();
+		assert!(
+			held.len() <= MAX_LEAVES,
+			"{} leaves held against a cap of {MAX_LEAVES}",
+			held.len()
+		);
+		assert!(
+			held.contains_key("wanted.example"),
+			"the name still in use is not the one to throw away"
 		);
 	}
 }

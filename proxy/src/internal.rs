@@ -52,6 +52,17 @@ const CERTIFICATE_FILENAME: &str = "mach5-root.crt";
 /// without limit.
 const MAX_SELECTOR_BYTES: usize = 512;
 const MAX_SELECTORS_PER_HOST: usize = 500;
+/// And a bound on the *number* of hosts, which the per-host cap says nothing
+/// about. A page can only write its own host's list, which sounds like the
+/// limit — but this proxy is deployed behind a resolver that answers every name
+/// with its own address, so every hostname in the world is one iframe away and
+/// each one is its own origin.
+///
+/// 500 rather than something grander because the file is rewritten whole on
+/// every hide, and because hiding something on five hundred separate sites is
+/// already far past what anyone does. Reaching it costs a 409 and a message,
+/// not a lost list.
+const MAX_HOSTS: usize = 500;
 
 /// The picker, compiled into the binary rather than read from disk. A file on
 /// disk would be one more thing to mount into the container — and one more way
@@ -132,11 +143,19 @@ impl Store {
 			.unwrap_or_default()
 	}
 
-	/// Store one selector. False means this host is already at
-	/// [`MAX_SELECTORS_PER_HOST`] — the caller has already checked the selector
+	/// Store one selector. False means the file is full: this host is at
+	/// [`MAX_SELECTORS_PER_HOST`], or the file is at [`MAX_HOSTS`] and this
+	/// host is not one of them. The caller has already checked the selector
 	/// itself.
 	fn add(&self, host: &str, selector: &str) -> bool {
 		let mut hidden = self.lock();
+
+		// Checked before the entry is created, or asking the question would
+		// answer it.
+		if !hidden.contains_key(host) && hidden.len() >= MAX_HOSTS {
+			return false;
+		}
+
 		let set = hidden.entry(host.to_string()).or_default();
 
 		// Re-hiding something already hidden must never fail, so the cap only
@@ -1515,6 +1534,45 @@ mod tests {
 		// A selector already stored is not growth, so it still succeeds.
 		let repeat = call(&internal, "POST", url, r##"{"selector":"#a0"}"##);
 		assert_eq!(repeat.status, 204);
+	}
+
+	/// The per-host cap looks like the whole bound, because a page can only
+	/// write its own host's list. It is not: this proxy is deployed behind a
+	/// resolver that answers every name with its own address, so a page can
+	/// reach `n1.evil.test`, `n2.evil.test` and so on for as long as it likes,
+	/// each one its own origin with its own 500 selectors.
+	#[test]
+	fn the_file_cannot_grow_a_host_at_a_time_either() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		for n in 0..MAX_HOSTS {
+			let response = call(
+				&internal,
+				"POST",
+				&format!("https://n{n}.example.com/.mach5/hidden"),
+				r##"{"selector":"#ad"}"##,
+			);
+
+			assert_eq!(response.status, 204, "host {n} should fit");
+		}
+
+		let full = call(
+			&internal,
+			"POST",
+			"https://one-too-many.example.com/.mach5/hidden",
+			r##"{"selector":"#ad"}"##,
+		);
+		assert_eq!(full.status, 409);
+
+		// A host already in the file is not growth, so it still succeeds.
+		let known = call(
+			&internal,
+			"POST",
+			"https://n0.example.com/.mach5/hidden",
+			r##"{"selector":"#another"}"##,
+		);
+		assert_eq!(known.status, 204);
 	}
 
 	#[test]

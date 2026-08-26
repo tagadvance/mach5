@@ -107,13 +107,28 @@ impl Cache {
 			last_modified: response.header("last-modified").map(str::to_string),
 		};
 
+		// One byte past the cap, so passing it is something we can see rather
+		// than something that quietly happens. `take` on its own truncated the
+		// list and then stored it *with valid validators*, so every later fetch
+		// answered 304 and the clipped copy became permanent — silently, in the
+		// direction of blocking less.
 		let mut body = Vec::new();
 		if let Err(e) = response
 			.into_reader()
-			.take(MAX_LIST_BYTES)
+			.take(MAX_LIST_BYTES + 1)
 			.read_to_end(&mut body)
 		{
 			log::warn!("cannot read {} {url}: {e}", self.kind);
+
+			return None;
+		}
+
+		if body.len() as u64 > MAX_LIST_BYTES {
+			log::error!(
+				"{} {url} is larger than the {MAX_LIST_BYTES} byte ceiling; \
+				 keeping the copy already on disk rather than half of a new one",
+				self.kind
+			);
 
 			return None;
 		}
@@ -123,8 +138,13 @@ impl Cache {
 		// line fails to parse as a rule anyway.
 		let text = String::from_utf8_lossy(&body).into_owned();
 
+		// Written beside and renamed, like every other store here. A plain
+		// write truncates first, so a disk that fills — or a container killed —
+		// part way through left a *prefix* of the list on disk while the old
+		// validators still matched the origin's unchanged file. Every fetch
+		// after that answered 304, and the half list stayed for good.
 		match std::fs::create_dir_all(path.parent().unwrap_or(path)) {
-			Ok(()) => match std::fs::write(path, &text) {
+			Ok(()) => match crate::disk::replace(path, text.as_bytes()) {
 				Ok(()) => write_validators(&meta_path(path), &validators),
 				Err(e) => log::warn!("cannot cache {} {url}: {e}", self.kind),
 			},
@@ -191,7 +211,7 @@ fn write_validators(path: &Path, validators: &Validators) {
 		return;
 	}
 
-	if let Err(e) = std::fs::write(path, text) {
+	if let Err(e) = crate::disk::replace(path, text.as_bytes()) {
 		log::warn!("cannot record list validators at {}: {e}", path.display());
 	}
 }

@@ -58,9 +58,9 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -176,7 +176,14 @@ pub struct Plugin {
 /// is abandoned.
 struct Io {
 	child: Child,
-	stdin: ChildStdin,
+	/// Hooks handed to a dedicated thread to write, for the same reason the
+	/// replies are read by one: a plugin that stops reading its stdin fills the
+	/// pipe, and `write_all` on a full pipe waits for as long as it takes. The
+	/// hook carrying a response body is routinely larger than a pipe buffer, so
+	/// this is not a corner — and a worker parked in that write is never
+	/// reached by the reply timeout below, which is the only thing that
+	/// abandons a plugin.
+	hooks: SyncSender<Vec<u8>>,
 	/// Lines read by a dedicated thread, so a hung plugin hits a timeout instead
 	/// of blocking a worker forever.
 	lines: Receiver<String>,
@@ -239,8 +246,26 @@ impl Plugin {
 			.stderr(Stdio::inherit())
 			.spawn()?;
 
-		let stdin = child.stdin.take().expect("stdin was piped");
+		let mut stdin = child.stdin.take().expect("stdin was piped");
 		let stdout = child.stdout.take().expect("stdout was piped");
+
+		// One at a time: `call` holds the lock until it has an answer, so a
+		// second hook cannot be queued behind the first. The bound is there to
+		// say so rather than to throttle anything.
+		let (hooks, pending) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+		let writing = path.display().to_string();
+		std::thread::spawn(move || {
+			while let Ok(hook) = pending.recv() {
+				if let Err(e) = stdin.write_all(&hook).and_then(|()| stdin.flush()) {
+					log::error!("plugin {writing} stdin closed: {e}");
+
+					break;
+				}
+			}
+			// Dropping stdin is what tells a well-behaved plugin to exit; a
+			// plugin abandoned mid-write has already been killed, which is what
+			// released this thread.
+		});
 
 		let (tx, lines) = std::sync::mpsc::channel();
 		std::thread::spawn(move || {
@@ -268,7 +293,7 @@ impl Plugin {
 			chunking: AtomicBool::new(false),
 			io: Mutex::new(Some(Io {
 				child,
-				stdin,
+				hooks,
 				lines,
 			})),
 			metrics: crate::metrics::shared(),
@@ -328,8 +353,12 @@ impl Plugin {
 		// measured is the plugin's own round trip rather than our bookkeeping.
 		let started = Instant::now();
 
-		if let Err(e) = io.stdin.write_all(line.as_bytes()).and_then(|()| io.stdin.flush()) {
-			log::error!("plugin {} stdin closed: {e}", self.name);
+		// Handed to the writer thread rather than written here. What is being
+		// bought is that the timeout below bounds the *whole* round trip: a
+		// plugin that has stopped reading its stdin blocks that thread instead
+		// of this worker, and abandoning it kills the child, which releases it.
+		if io.hooks.send(line.into_bytes()).is_err() {
+			log::error!("plugin {} is no longer accepting hooks", self.name);
 			self.abandon(&mut guard);
 
 			return None;
@@ -632,6 +661,49 @@ mod tests {
 		};
 		assert!(chain.on_request(&mut req).is_none());
 		assert_eq!(req.url, "https://example.com/");
+	}
+
+	/// A plugin that answers `init` and then stops reading its stdin. The pipe
+	/// fills, and `write_all` on a full pipe waits for as long as it takes —
+	/// which the reply timeout never gets to see, because the worker is parked
+	/// in the write rather than in the wait. On the TCP side that chain is held
+	/// for the whole of a request, so a few of these took the front end with
+	/// them.
+	#[test]
+	fn a_plugin_that_stops_reading_does_not_take_the_worker_with_it() {
+		let dir = tempfile::TempDir::new().unwrap();
+		let script = dir.path().join("deaf");
+		std::fs::write(
+			&script,
+			"#!/bin/sh\nread -r line\nprintf '{\"filter\":{}}\\n'\nsleep 60\n",
+		)
+		.unwrap();
+
+		use std::os::unix::fs::PermissionsExt;
+		std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+		let plugin = Plugin::start(&script, Duration::from_secs(1)).expect("it starts");
+
+		// Comfortably past a pipe buffer, which is what a response hook
+		// carrying a page looks like anyway.
+		let hook = serde_json::json!({
+			"hook": "response",
+			"body_b64": "A".repeat(512 * 1024),
+		});
+
+		let started = Instant::now();
+		let reply: Option<Reply> = plugin.call(&hook);
+		let took = started.elapsed();
+
+		assert!(reply.is_none(), "a plugin that never answers has no reply");
+		assert!(
+			took < Duration::from_secs(10),
+			"it waited {took:?} — the timeout has to bound the write as well as the wait"
+		);
+		assert!(
+			plugin.io.lock().unwrap().is_none(),
+			"and the plugin is abandoned rather than tried again"
+		);
 	}
 
 	fn constraints(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {

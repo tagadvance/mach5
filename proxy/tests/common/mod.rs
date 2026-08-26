@@ -234,7 +234,11 @@ impl Proxy {
 			Err(e) => panic!("write the request: {e}"),
 		}
 
-		read_response(&mut stream)
+		// A HEAD's response carries the length of the body a GET would have
+		// returned and none of the bytes. Reading to that length would wait for
+		// bytes that are never coming — which is exactly what a client that
+		// ignores the rule does.
+		read_response(&mut stream, method.eq_ignore_ascii_case("HEAD"))
 	}
 
 	/// Whether it came up. `false` means the child died before listening,
@@ -304,7 +308,7 @@ struct Head {
 	len: usize,
 }
 
-fn read_response(stream: &mut impl Read) -> Response {
+fn read_response(stream: &mut impl Read, head_only: bool) -> Response {
 	let mut buf = Vec::new();
 	let mut chunk = [0u8; 4096];
 
@@ -320,12 +324,15 @@ fn read_response(stream: &mut impl Read) -> Response {
 
 	// Every response asserted on here declares a length, or has no body at all.
 	// Nothing under test streams, so there is no chunked decoding to do.
-	let length: usize = head
-		.headers
-		.iter()
-		.find(|(name, _)| name == "content-length")
-		.map(|(_, value)| value.parse().expect("a numeric content-length"))
-		.unwrap_or(0);
+	let length: usize = if head_only {
+		0
+	} else {
+		head.headers
+			.iter()
+			.find(|(name, _)| name == "content-length")
+			.map(|(_, value)| value.parse().expect("a numeric content-length"))
+			.unwrap_or(0)
+	};
 
 	let mut body = buf[head.len..].to_vec();
 	while body.len() < length {

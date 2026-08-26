@@ -341,7 +341,15 @@ fn handle_job(
 		Err(_) => None,
 	};
 
+	// RFC 9110 §9.3.2: a HEAD is answered with the headers a GET would carry
+	// and none of the body. Enforced here, at the one place every response
+	// leaves the worker, rather than at each of the half-dozen that produce
+	// one — including the streamer, which would otherwise inject its tags into
+	// a response that is not allowed to have a body at all.
+	let head_only = job.request.method.eq_ignore_ascii_case("HEAD");
+
 	let send = |payload| {
+		let payload = if head_only { bodyless(payload) } else { payload };
 		results
 			.send(FetchResult {
 				conn: job.conn.clone(),
@@ -498,6 +506,18 @@ fn handle_job(
 	// to compress — the coding here is whatever the origin chose, and we never
 	// hold enough of the body to know what a different one would cost.
 	interceptor.on_response_head(&job.request, &mut head);
+
+	if head_only {
+		// The origin's own length, which is the answer a HEAD was asking for.
+		// Nothing further reads the body, so nothing further can measure it.
+		if let Some(length) = declared {
+			declare_length(&mut head.headers, length);
+		}
+		send(Payload::Head(head))?;
+
+		return send(Payload::End);
+	}
+
 	// Asked once, before the head is handed off: the answer holds for the whole
 	// stream, and re-asking per chunk would cost a plugin round trip each time.
 	let wants_chunks = interceptor.wants_chunks(&job.request, &head);
@@ -1086,7 +1106,17 @@ fn send_pending(
 		let mut headers = vec![quiche::h3::Header::new(b":status", status.as_bytes())];
 		// A buffered response has a known length; a streaming one is delimited
 		// by the stream ending, so it carries no content-length.
-		let content_length = p.complete.then(|| body_len(p).to_string());
+		//
+		// Two responses must not be measured by what is being sent: one that
+		// already declares its own length — a HEAD, whose body was stripped
+		// after being measured — and a 204 or 304, which RFC 9110 §8.6 says
+		// carries no content-length at all. Both would otherwise be told they
+		// are zero bytes long.
+		let framed = p.complete
+			&& !matches!(p.status, 204 | 304)
+			&& p.status >= 200
+			&& !declares_length(&p.headers);
+		let content_length = framed.then(|| body_len(p).to_string());
 		if let Some(length) = &content_length {
 			headers.push(quiche::h3::Header::new(b"content-length", length.as_bytes()));
 		}
@@ -1148,6 +1178,37 @@ fn send_pending(
 
 fn body_len(p: &Pending) -> usize {
 	p.chunks.iter().map(Vec::len).sum()
+}
+
+/// Strip the body a HEAD must not carry, stating its length on the way past.
+///
+/// The length is worth keeping precisely because this is a HEAD: measuring a
+/// body without downloading it is the whole point of the method, and the front
+/// end can only ever measure the zero bytes that are actually sent.
+fn bodyless(payload: Payload) -> Payload {
+	match payload {
+		Payload::Full(mut response) => {
+			declare_length(&mut response.headers, response.body.len() as u64);
+			response.body.clear();
+
+			Payload::Full(response)
+		}
+		// A HEAD never reaches the streaming loop, so a chunk on one is a bug
+		// somewhere else; dropping it is still better than sending it.
+		Payload::Chunk(_) => Payload::Chunk(Vec::new()),
+		other => other,
+	}
+}
+
+fn declare_length(headers: &mut Vec<(String, String)>, length: u64) {
+	headers.retain(|(name, _)| !name.eq_ignore_ascii_case("content-length"));
+	headers.push(("content-length".to_string(), length.to_string()));
+}
+
+fn declares_length(headers: &[(String, String)]) -> bool {
+	headers
+		.iter()
+		.any(|(name, _)| name.eq_ignore_ascii_case("content-length"))
 }
 
 fn flush(socket: &mio::net::UdpSocket, out: &mut [u8], clients: &mut ClientMap) {

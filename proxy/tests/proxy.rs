@@ -56,6 +56,59 @@ fn a_blocked_image_gets_a_pixel() {
 	);
 }
 
+/// RFC 9110 §9.3.2: a HEAD carries the headers a GET would, and no body. The
+/// interesting case is a response mach5 makes up rather than fetches — a
+/// blocked image is a real body it would have sent, so its length is knowable
+/// and worth stating, and sending the bytes is a framing error the client has
+/// to guess its way out of.
+#[test]
+fn a_head_gets_the_headers_and_none_of_the_body() {
+	let proxy = Proxy::start(BLOCKLIST);
+
+	let get = proxy.send(
+		"GET",
+		"ads.example.com",
+		"/pixel.gif",
+		&[("accept", "image/webp,*/*")],
+		"",
+	);
+	let head = proxy.send(
+		"HEAD",
+		"ads.example.com",
+		"/pixel.gif",
+		&[("accept", "image/webp,*/*")],
+		"",
+	);
+
+	assert_eq!(head.status, get.status);
+	assert_eq!(head.header("content-type"), get.header("content-type"));
+	assert!(head.body.is_empty(), "a HEAD must not carry a body");
+	assert_eq!(
+		head.header("content-length"),
+		Some(get.body.len().to_string().as_str()),
+		"and the length it reports is the one a GET would have sent"
+	);
+}
+
+/// A 204 has no body by definition, so RFC 9110 §8.6 forbids the header that
+/// says how long it is. Framing a length nobody can send is how a connection
+/// ends up waiting for bytes that never come.
+#[test]
+fn a_204_is_not_given_a_length() {
+	let proxy = Proxy::start(BLOCKLIST);
+
+	let response = proxy.send(
+		"GET",
+		"ads.example.com",
+		"/frame.html",
+		&[("accept", "text/html")],
+		"",
+	);
+
+	assert_eq!(response.status, 204);
+	assert_eq!(response.header("content-length"), None);
+}
+
 #[test]
 fn an_unlisted_host_is_not_answered_here() {
 	let proxy = Proxy::start(BLOCKLIST);

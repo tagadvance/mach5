@@ -285,6 +285,11 @@ async fn handle(shared: Arc<Shared>, sni: Option<String>, req: Request<Incoming>
 		(chunks_rx, length)
 	});
 
+	// RFC 9110 §9.3.2: a HEAD is answered with the headers a GET would carry
+	// and none of the body. Read before the request is handed to the worker,
+	// which takes ownership of it.
+	let head_only = request.method.eq_ignore_ascii_case("HEAD");
+
 	// Everything past here blocks: plugin subprocesses and the upstream fetch.
 	let (head_tx, head_rx) = tokio::sync::oneshot::channel();
 	let chunk_capacity = shared.config.stream_buffer_chunks(STREAM_CHUNK_SIZE);
@@ -295,16 +300,32 @@ async fn handle(shared: Arc<Shared>, sni: Option<String>, req: Request<Incoming>
 	});
 
 	match head_rx.await {
-		Ok(Outcome::Buffered(response)) => build_response(response),
+		Ok(Outcome::Buffered(mut response)) => {
+			if head_only {
+				// Measured before it is dropped: the length is the answer a
+				// HEAD was asking for, and nothing downstream can measure a
+				// body that is no longer there.
+				crate::declare_length(&mut response.headers, response.body.len() as u64);
+				response.body.clear();
+			}
+
+			build_response(response)
+		}
 		Ok(Outcome::Streaming(head)) => {
-			let body = StreamBody::new(ReceiverStream::new(body_rx));
+			// A HEAD's body is never produced — see `fetch_blocking` — so
+			// there is nothing on the channel to wait for.
+			let body: BoxBody = if head_only {
+				BodyExt::boxed(Full::new(Bytes::new()))
+			} else {
+				BodyExt::boxed(StreamBody::new(ReceiverStream::new(body_rx)))
+			};
 			let mut builder = Response::builder().status(head.status);
 			for (name, value) in &head.headers {
 				builder = builder.header(name, value);
 			}
 
 			builder
-				.body(BodyExt::boxed(body))
+				.body(body)
 				.unwrap_or_else(|_| simple(502, "mach5: malformed upstream headers\n"))
 		}
 		// The blocking task died without reporting; nothing else will answer.
@@ -471,6 +492,20 @@ fn fetch_blocking(
 	// hold enough of the body to know what a different one would cost.
 	interceptor.on_response_head(&request, &mut head);
 	apply_alt_svc(&shared.config, &mut head.headers);
+
+	if request.method.eq_ignore_ascii_case("HEAD") {
+		// The origin's own length, which is what a HEAD asked for. Answered
+		// from the head alone: no chunk hooks, no streamer — which would
+		// otherwise inject its tags into a response not allowed to have a body
+		// — and nothing read off the wire.
+		if let Some(length) = declared {
+			crate::declare_length(&mut head.headers, length);
+		}
+		let _ = head_tx.send(Outcome::Streaming(head));
+
+		return;
+	}
+
 	// Asked once, before the head is handed off: the answer holds for the whole
 	// stream, and re-asking per chunk would cost a plugin round trip each time.
 	let wants_chunks = interceptor.wants_chunks(&request, &head);

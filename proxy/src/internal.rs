@@ -648,6 +648,7 @@ fn status_page(
 	};
 	let internal = metrics::thousands(counted.internal);
 	let injected = metrics::thousands(counted.injected);
+	let passed_through = metrics::thousands(counted.passed_through);
 	let bypasses = metrics::thousands(counted.bypassed);
 	let tls_failures = metrics::thousands(counted.tls_failures);
 	let upstream_failures = metrics::thousands(counted.upstream_failures);
@@ -697,6 +698,7 @@ fn status_page(
     <tr><th>Cosmetic rules</th>{cosmetic}</tr>
     <tr><th>mach5 endpoints</th><td>{internal}</td></tr>
     <tr><th>Pages injected</th><td>{injected}</td></tr>
+    <tr><th>Passed through undecrypted</th><td>{passed_through}</td></tr>
     <tr><th>Fetched unvalidated</th><td>{bypasses}</td></tr>
     <tr><th>Certificate failures</th><td>{tls_failures}</td></tr>
     <tr><th>Other upstream failures</th><td>{upstream_failures}</td></tr>

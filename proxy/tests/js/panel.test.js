@@ -57,6 +57,11 @@ function makePage(html, opts = {}) {
   w.fetch = (path, init = {}) => {
     calls.push({ path, method: init.method || 'GET', body: init.body || null, credentials: init.credentials });
     if (opts.fetchFails) return Promise.reject(new Error('offline'));
+    // A proxy that answers and says no. fetch resolves for this — it rejects
+    // only on a network failure — which is what makes it the interesting case.
+    if (opts.fetchRefuses) {
+      return Promise.resolve({ ok: false, status: opts.fetchRefuses, json: () => Promise.resolve({}) });
+    }
     const echoed = init.body ? JSON.parse(init.body) : (opts.settings || { image_quality: 'auto' });
     return Promise.resolve({ ok: true, json: () => Promise.resolve(echoed) });
   };
@@ -249,6 +254,64 @@ console.log('\n=== 9. hostile and odd pages ===');
   click(r.w, [...rs.querySelectorAll('[data-tier]')][2]);
   await tick();
   ok('nor does a failed settings post', r.errors.length === 0);
+}
+
+console.log('\n=== 9b. a proxy that answers and says no ===');
+{
+  // The one the code got wrong: fetch resolves for a 409, so a refusal used to
+  // be indistinguishable from a save. A selector the proxy threw away looked
+  // exactly like one it kept, and the element stayed hidden until the reload
+  // that brought it back.
+  const badge = (p) => {
+    const el = p.d.querySelector('[data-mach5="badge"]');
+    return el ? el.textContent : '';
+  };
+
+  const p = makePage(NORMAL, { fetchRefuses: 409 });
+  key(p.w, 'KeyH', { ctrlKey: true, shiftKey: true });
+  click(p.w, p.shadow().querySelector('[data-act="pick"]'));
+  await tick();
+  const target = p.d.querySelector('#ad-slot');
+  target.dispatchEvent(new p.w.MouseEvent('click', { bubbles: true, cancelable: true }));
+  await tick();
+  ok('a refused selector does not throw', p.errors.length === 0, p.errors.map(e => e.message).join('; '));
+  ok('and says so', /could not save/.test(badge(p)), `badge said: ${badge(p)}`);
+
+  // The panel has no badge on screen, so a refused quality change reports
+  // itself by putting the button back where it was.
+  const q = makePage(NORMAL, { fetchRefuses: 507 });
+  key(q.w, 'KeyH', { ctrlKey: true, shiftKey: true });
+  await tick();
+  const chosen = (p) => {
+    const on = [...p.shadow().querySelectorAll('[data-tier]')]
+      .find((b) => b.getAttribute('aria-pressed') === 'true');
+    return on ? on.dataset.tier : null;
+  };
+  const before = chosen(q);
+  ok('a tier is marked to begin with', before !== null);
+  const third = [...q.shadow().querySelectorAll('[data-tier]')][2];
+  ok('and it is not the one about to be clicked', third.dataset.tier !== before);
+  click(q.w, third);
+  await tick();
+  ok('a refused quality change puts the choice back', chosen(q) === before, `now: ${chosen(q)}, was: ${before}`);
+
+  // The same click against a proxy that agrees, so the assertion above is
+  // about the refusal and not about the button never moving.
+  const accepted = makePage(NORMAL);
+  key(accepted.w, 'KeyH', { ctrlKey: true, shiftKey: true });
+  await tick();
+  click(accepted.w, [...accepted.shadow().querySelectorAll('[data-tier]')][2]);
+  await tick();
+  ok('an accepted one sticks', chosen(accepted) === third.dataset.tier, `now: ${chosen(accepted)}`);
+
+  const r2 = makePage(NORMAL, { fetchRefuses: 500 });
+  key(r2.w, 'KeyH', { ctrlKey: true, shiftKey: true });
+  click(r2.w, r2.shadow().querySelector('[data-act="pick"]'));
+  await tick();
+  key(r2.w, 'KeyU');
+  await tick();
+  ok('a refused clear does not reload the page', r2.reloads() === 0);
+  ok('and says so', /could not clear/.test(badge(r2)), `badge said: ${badge(r2)}`);
 }
 
 console.log('\n=== 10. runs once, and only in the top frame ===');

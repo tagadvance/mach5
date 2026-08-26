@@ -255,13 +255,27 @@
 	/* `credentials: 'omit'` because these endpoints authenticate nothing: the
 	 * host in the URL decides which list is touched, so there is no reason to
 	 * hand the site's cookies to the proxy. */
+	/* fetch rejects only on a network failure: a refusal — a selector too long,
+	 * a host at its cap, a disk that would not take it — arrives as a resolved
+	 * promise with ok === false. Without this every caller's error handling
+	 * below is dead code: a selector the proxy threw away looks exactly like
+	 * one it stored, and a refused read of the settings parses as `{}` and
+	 * wipes what the panel already knew. */
+	const checked = (response) => {
+		if (!response.ok) {
+			throw new Error('mach5: refused with ' + response.status);
+		}
+
+		return response;
+	};
+
 	const post = (path, body) =>
 		window.fetch(path, {
 			method: 'POST',
 			credentials: 'omit',
 			headers: body ? { 'content-type': 'application/json' } : {},
 			body: body || null
-		});
+		}).then(checked);
 
 	/* The panel, in a shadow root so no site's CSS can reach it. Built once, on
 	 * the first frame after load — early enough to be there when wanted, late
@@ -326,6 +340,7 @@
 			// Read rather than assume: another tab may have changed these.
 			window
 				.fetch('/.mach5/settings', { credentials: 'omit' })
+				.then(checked)
 				.then((r) => r.json())
 				.then((current) => {
 					settings = current;
@@ -349,6 +364,12 @@
 	const onPanelClick = (event) => {
 		const tier = event.target.closest('[data-tier]');
 		if (tier) {
+			// Moved before the proxy has agreed, because a control that waits
+			// for a round trip feels broken. The panel has nowhere to print a
+			// message — the picker's badge is not on screen here — so a refusal
+			// puts the choice back where it was, and the button snapping back
+			// is the message.
+			const previous = settings;
 			settings = Object.assign({}, settings, { image_quality: tier.dataset.tier });
 			refreshTiers();
 			post('/.mach5/settings', JSON.stringify(settings))
@@ -357,7 +378,10 @@
 					settings = current;
 					refreshTiers();
 				})
-				.catch(() => {});
+				.catch(() => {
+					settings = previous;
+					refreshTiers();
+				});
 
 			return;
 		}
@@ -373,7 +397,7 @@
 		} else if (act.dataset.act === 'clear') {
 			post('/.mach5/hidden/clear', null)
 				.then(() => window.location.reload())
-				.catch(() => {});
+				.catch(() => say('mach5: could not clear this site'));
 		}
 	};
 

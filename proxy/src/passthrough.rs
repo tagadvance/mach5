@@ -42,14 +42,34 @@ pub struct Passthrough {
 
 impl Passthrough {
 	pub fn new(config: &Config) -> Self {
+		let hosts = config
+			.passthrough
+			.hosts
+			.iter()
+			.map(|host| host.trim().trim_end_matches('.').to_ascii_lowercase())
+			.filter(|host| !host.is_empty())
+			.filter(|host| {
+				// A name reaches the wire as ASCII: a browser sends the
+				// punycode. So an entry written in unicode matches neither
+				// what arrives nor anything else, and the host it was meant to
+				// protect is quietly intercepted. Said out loud, because the
+				// whole value of this list is that being on it means something.
+				if !host.is_ascii() {
+					log::warn!(
+						"[passthrough] hosts: ignoring {host:?} — a name arrives as \
+						 punycode (xn--...), so this entry can never match. Convert it, \
+						 or the host is intercepted like any other."
+					);
+
+					return false;
+				}
+
+				true
+			})
+			.collect();
+
 		Self {
-			hosts: config
-				.passthrough
-				.hosts
-				.iter()
-				.map(|host| host.trim().trim_end_matches('.').to_ascii_lowercase())
-				.filter(|host| !host.is_empty())
-				.collect(),
+			hosts,
 			port: config.passthrough.port,
 		}
 	}
@@ -241,6 +261,28 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// A name arrives as punycode, so a unicode entry matches nothing at all —
+	/// and the failure is silent in the worst possible direction, since the
+	/// host it was written to protect is intercepted like any other.
+	#[test]
+	fn a_unicode_entry_is_refused_rather_than_kept_useless() {
+		let config = Config::from_str(
+			"[passthrough]\nhosts = [\"münchen-bank.de\", \"xn--mnchen-bank-zhb.de\"]\n",
+		)
+		.unwrap();
+		let passthrough = Passthrough::new(&config);
+
+		assert!(
+			!passthrough.covers("münchen-bank.de"),
+			"an SNI is never unicode either"
+		);
+		assert!(
+			passthrough.covers("xn--mnchen-bank-zhb.de"),
+			"the punycode entry is the one that works"
+		);
+		assert_eq!(passthrough.hosts.len(), 1);
+	}
 
 	/// Whether the whole record has arrived is the question the caller has to
 	/// answer before parsing, because refusing a truncated one means "decrypt

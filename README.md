@@ -1,43 +1,133 @@
 # mach5
 
-An intercepting proxy that terminates a client's TLS with a certificate minted
-on the fly for whatever host the client asked for, signed by a root CA installed
-on the device. That gives it every byte of every page, which is the point: ad
-blocking, cosmetic filtering, JavaScript injection, and on-the-fly rewriting.
+An intercepting proxy that makes the web lighter on slow connections, blocks
+what you tell it to, and lets you rewrite pages with a plugin in any language.
 
-`proxy/` is the implementation, in Rust on Cloudflare's quiche.
+It does that by terminating your TLS connections with certificates it mints on
+the fly, signed by a root certificate authority you generate and install on your
+own devices. **That means it can read everything.** Start with the next section.
+
+## Read this before you run it
+
+mach5 holds the cleartext of every page every device sends through it. That is
+not a side effect, it is the mechanism — none of the features below are possible
+without it. It is the same technique corporate TLS-inspection appliances use,
+and the same one you have been warned about your whole career. The only thing
+separating those two is who is running it and why.
+
+Three rules, and none of them is optional:
+
+- **Do not expose it to the internet.** It binds 443 and answers for every
+  hostname it is asked about. On a public address it is an open proxy and it
+  will be found.
+- **The root private key is total authority** over every device that trusts it.
+  Anyone holding it can impersonate any website to any of those devices, on any
+  network. Generate your own, keep it mode 600, never commit it, never copy it
+  into an image.
+- **Put anything that matters in `[passthrough] hosts`** — banking, health,
+  work. Listed hosts are never decrypted: mach5 reads the name out of the
+  ClientHello without answering it and splices the two sockets, so it holds no
+  key and sees no plaintext, and your client checks the real certificate itself.
+
+[`SECURITY.md`](SECURITY.md) has the full threat model, what mach5 does and does
+not defend against, and where to send a finding.
+
+## When this is worth running
+
+**Bandwidth-constrained and high-latency links.** Hotel and aeroplane wifi, a
+phone on one bar, public wifi, anything metered or capped. This is what it is
+for and where the numbers are real.
+
+**Sites nobody optimised.** Plenty of the web still serves uncompressed HTML and
+full-size JPEGs. mach5 compresses what the origin left plain, re-encodes images
+to WebP, and defers off-screen ones. Benchmarked across a mixed set of pages:
+**−10.2% bytes and −27.2% wall time**, with one uncompressed site at −66%.
+
+**The things that are not about speed at all.** Blocking, cosmetic filtering,
+hiding an element permanently on a site that will not stop showing it to you,
+and rewriting any page with a plugin.
+
+## When it is not
+
+**A modern site behind a CDN.** It is already brotli-compressed, already serving
+WebP or AVIF, already lazy-loading. There is nothing left for mach5 to win and it
+adds a hop. Most of the web is now this.
+
+**A fast wired connection.** Here mach5 is *negative* value: measurable latency
+in exchange for savings you cannot perceive. Fewer bytes over a local hop is not
+the same as faster, and the benchmark reports both columns for that reason.
+
+**Anywhere you cannot accept the trust model.** See above. If installing a root
+CA on your devices makes you uneasy, that instinct is correct and this is not
+the tool for you.
+
+## Alongside pi-hole, not instead of it
+
+Run both. They block different things and neither replaces the other.
+
+**DNS blocks by name.** Earlier, cheaper, for every protocol and every device on
+the network, whether or not it goes through the proxy. If you are only blocking
+domains, pi-hole is the better tool and mach5 has nothing to add.
+
+**A proxy blocks by request.** It sees which page asked, the path, the type and
+the `accept` header — so it can honour a rule scoped to third-party context,
+which DNS structurally cannot. Of the Adblock rules mach5 reads from EasyList,
+1,661 carry `$third-party`: block this host, but only when another site embedded
+it. A resolver must either apply those unconditionally, which blocks the site you
+typed into the address bar, or ignore them.
+
+It also means a blocked image can be answered with a transparent pixel instead
+of a connection error, so pages are not visibly broken.
+
+Point mach5's blocklist at Adblock-style lists and leave the hosts files to
+pi-hole. Two copies of the same list is work for nothing.
 
 ## What it does
 
 - **Three protocols.** HTTP/3 over QUIC, plus HTTP/2 and HTTP/1.1 over TCP. The
   TCP listener is not optional: HTTP/3 cannot bootstrap itself, so a browser
-  starts there and moves itself over once it sees the `Alt-Svc` header.
+  starts there and moves itself across once it sees the `Alt-Svc` header.
 - **Blocks domains.** hosts files, bare domain lists and Adblock `||domain^`
-  anchors, fetched on a schedule and cached. A blocked request is answered
-  locally — 204, or a transparent pixel if an image was expected. `$third-party`
-  is honoured; a rule scoped by anything else mach5 cannot evaluate is skipped
-  rather than applied more widely than it was written.
+  anchors, fetched on a schedule and cached so a restart without network still
+  blocks. `$third-party` is honoured; a rule scoped by anything else mach5
+  cannot evaluate is skipped rather than applied more widely than it was written.
 - **Hides elements.** Adblock cosmetic rules (`domain##selector`) from filter
   lists, plus anything hidden by hand: press `Ctrl+Shift+H` on a page, click an
   element, and it stays hidden on the next visit. Both are served back as a
-  stylesheet that applies before first paint.
+  stylesheet that applies before first paint, so nothing flashes.
+- **Re-encodes images** to WebP when the client accepts it and the result is
+  smaller, cached by content hash so each conversion is paid once.
+- **Compresses what the origin didn't**, and relays what it did untouched.
+- **Caches static assets** — stylesheets, scripts, fonts, images. HTML is
+  deliberately absent and stays absent until mach5 knows who is asking.
 - **Rewrites pages.** Plugins are ordinary executables speaking newline-delimited
   JSON on stdin/stdout, in any language. They can rewrite a request, answer it
   themselves, rewrite a buffered response, or watch a body stream past a chunk
   at a time.
 - **Validates what your browser no longer can.** Once a device trusts mach5, it
-  is the only thing left checking the origin's certificate. A failure gets a
-  page explaining which failure it was, not a blank 502.
-- **Compresses what the origin didn't**, and relays what it did untouched.
+  is the only thing left checking the origin's certificate. A failure gets a page
+  explaining which failure it was, not a blank 502.
+- **Never decrypts what you tell it not to.** `[passthrough] hosts`.
 
 ## Running it
 
 ```sh
-cd proxy && cargo build
-cd .. && MACH5_CONFIG=mach5.toml ./proxy/target/debug/mach5-proxy
+cd proxy && cargo build --release
 ```
 
-`mach5.toml` documents every setting inline; everything in it is optional.
+Generate a root CA and point the configuration at it:
+
+```sh
+MACH5_CA_SUBJECT="/CN=my mach5 root/O=My Homelab/C=GB" bash security/init.sh
+```
+
+Then run it:
+
+```sh
+MACH5_CONFIG=mach5.toml ./proxy/target/release/mach5-proxy
+```
+
+`mach5.toml` documents every setting inline and everything in it is optional.
 `docker compose up --build` runs the same thing on port 443.
 
 Point a client at it by making the host you want resolve to the proxy — mach5
@@ -47,10 +137,12 @@ reads the SNI to learn which origin was meant:
 curl -sS -k --resolve example.com:4443:127.0.0.1 https://example.com:4443/
 ```
 
-With no `[ca]` configured it generates a throwaway CA on startup, so `-k` is
-required and no browser will trust it. For real use, generate a root, point
-`[ca]` at it, and install the certificate on each device — the proxy serves it
-at `/.mach5/ca` for exactly that.
+With no `[ca]` configured it generates a throwaway root at startup and says so
+on the status page. Nothing will trust it and the next restart mints a different
+one; it exists so you can have a look around, not to deploy.
+
+For real use, install the certificate on each device — mach5 serves it at
+`/.mach5/ca` for exactly that.
 
 ## Its own endpoints
 
@@ -66,7 +158,16 @@ Because every name resolves to the proxy, `/.mach5/` is reachable on any host:
 
 ## Building
 
-BoringSSL is compiled from source as part of quiche: it needs cmake, a C
-compiler, perl and libclang at build time, and nothing at runtime.
+Rust, on Cloudflare's [quiche](https://github.com/cloudflare/quiche). BoringSSL
+is compiled from source as part of it: that needs cmake, a C compiler, perl and
+libclang at build time, and nothing at runtime.
 
-Plugins live in `plugins/`; `plugins/README.md` is the protocol.
+Plugins live in `plugins/`; [`plugins/README.md`](plugins/README.md) is the
+protocol.
+
+## Licence
+
+Apache-2.0. See [`LICENSE`](LICENSE), and note that it disclaims warranty and
+limits liability — this is one person's homelab project, it has not been
+independently audited, and you should judge it accordingly before putting it
+between yourself and the web.

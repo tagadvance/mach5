@@ -28,6 +28,8 @@ use crate::config::Config;
 pub const PEEK_BYTES: usize = 4096;
 
 const HANDSHAKE: u8 = 0x16;
+/// Content type, legacy version, and the two-byte record length.
+const RECORD_HEADER: usize = 5;
 const CLIENT_HELLO: u8 = 0x01;
 const EXTENSION_SERVER_NAME: u16 = 0x0000;
 const NAME_TYPE_HOST: u8 = 0x00;
@@ -77,6 +79,48 @@ pub fn shared(config: &Config) -> Arc<Passthrough> {
 	SHARED
 		.get_or_init(|| Arc::new(Passthrough::new(config)))
 		.clone()
+}
+
+/// What a caller holding the first bytes off a socket should do next.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Hello {
+	/// Not the start of a TLS handshake record. Nothing to wait for.
+	NotTls,
+	/// A handshake record, and this many bytes are needed to hold all of it.
+	Want(usize),
+	/// The whole record is here.
+	Complete,
+}
+
+/// Whether the whole first handshake record has arrived yet.
+///
+/// This exists because a ClientHello no longer fits in one TCP segment. A
+/// modern browser offering a post-quantum key share sends about two kilobytes,
+/// so it arrives in two segments — and reading whatever happened to be in the
+/// socket when it was first readable gave [`server_name`] a truncated record,
+/// which it correctly refused to parse. The refusal means "terminate it", so
+/// whether a listed bank was decrypted came down to TCP segmentation.
+pub fn have_hello(bytes: &[u8]) -> Hello {
+	match bytes.first() {
+		Some(&HANDSHAKE) => {}
+		// Nothing yet: a client that has connected and said nothing is still
+		// worth waiting a moment for.
+		None => return Hello::Want(RECORD_HEADER),
+		Some(_) => return Hello::NotTls,
+	}
+
+	if bytes.len() < RECORD_HEADER {
+		return Hello::Want(RECORD_HEADER);
+	}
+
+	let length = u16::from_be_bytes([bytes[3], bytes[4]]) as usize;
+	let whole = RECORD_HEADER + length;
+
+	if bytes.len() >= whole {
+		Hello::Complete
+	} else {
+		Hello::Want(whole)
+	}
 }
 
 /// The server name from a TLS ClientHello, if this is one and it carries a
@@ -197,6 +241,32 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// Whether the whole record has arrived is the question the caller has to
+	/// answer before parsing, because refusing a truncated one means "decrypt
+	/// it" — and a hello that spans two segments is now the ordinary case.
+	#[test]
+	fn a_truncated_hello_asks_for_the_rest_of_itself() {
+		let hello = client_hello(b"bank.example");
+
+		assert_eq!(have_hello(&hello), Hello::Complete);
+		assert_eq!(
+			have_hello(&hello[..hello.len() - 1]),
+			Hello::Want(hello.len()),
+			"one byte short, and it says exactly how many it wants"
+		);
+		assert_eq!(have_hello(&hello[..3]), Hello::Want(5), "not even the header");
+		assert_eq!(have_hello(&[]), Hello::Want(5), "nothing at all yet");
+
+		// Nothing to wait for: this is not a handshake record, so no amount of
+		// patience turns it into one.
+		assert_eq!(have_hello(b"GET / HTTP/1.1\r\n"), Hello::NotTls);
+
+		// And what the caller does with the answer: the truncated record still
+		// parses to nothing, which is why it must not be parsed yet.
+		assert_eq!(server_name(&hello[..hello.len() - 1]), None);
+		assert_eq!(server_name(&hello).as_deref(), Some("bank.example"));
+	}
 
 	/// A real ClientHello, assembled rather than pasted so the shape of one is
 	/// visible in the test that depends on it.

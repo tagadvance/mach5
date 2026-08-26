@@ -381,6 +381,16 @@ fn parse_head(buf: &[u8]) -> Option<Head> {
 /// TLS client would be doing a handshake, and a passed-through connection never
 /// completes one with mach5 at all.
 pub fn client_hello(host: &[u8]) -> Vec<u8> {
+	padded_client_hello(host, 0)
+}
+
+/// The same, plus `pad` bytes of a padding extension.
+///
+/// A real ClientHello is not the sixty bytes the minimal one above comes to. A
+/// browser offering a post-quantum key share sends around two kilobytes, which
+/// is two TCP segments — and that is the case the passthrough peek has to
+/// survive, so a test needs to be able to build one.
+pub fn padded_client_hello(host: &[u8], pad: usize) -> Vec<u8> {
 	let mut names = vec![0u8];
 	names.extend_from_slice(&(host.len() as u16).to_be_bytes());
 	names.extend_from_slice(host);
@@ -393,6 +403,15 @@ pub fn client_hello(host: &[u8]) -> Vec<u8> {
 	extensions.extend_from_slice(&0u16.to_be_bytes());
 	extensions.extend_from_slice(&(server_name.len() as u16).to_be_bytes());
 	extensions.extend_from_slice(&server_name);
+
+	if pad > 0 {
+		// Extension 21 is `padding` (RFC 7685) and is exactly this: bytes that
+		// mean nothing, placed after the name so the parser has to walk past
+		// the interesting part to find the end.
+		extensions.extend_from_slice(&21u16.to_be_bytes());
+		extensions.extend_from_slice(&(pad as u16).to_be_bytes());
+		extensions.extend(std::iter::repeat_n(0u8, pad));
+	}
 
 	let mut hello = vec![0x03, 0x03];
 	hello.extend_from_slice(&[0u8; 32]);

@@ -192,6 +192,10 @@ fn build_acceptor(ca: &Arc<CertAuthority>) -> std::io::Result<SslAcceptor> {
 	Ok(builder.build())
 }
 
+/// How long a client has to produce a ClientHello, and then to finish the
+/// handshake, before it is dropped.
+const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 async fn serve(
 	acceptor: Arc<SslAcceptor>,
 	shared: Arc<Shared>,
@@ -210,8 +214,13 @@ async fn serve(
 		}
 	}
 
-	let tls = tokio_boring::accept(&acceptor, stream)
+	// Bounded, because until the handshake finishes hyper's own
+	// `header_read_timeout` is not armed: a client that opens a socket and says
+	// nothing would otherwise hold a task and a file descriptor for as long as
+	// it liked, and opening a few thousand costs it nothing.
+	let tls = tokio::time::timeout(HELLO_TIMEOUT, tokio_boring::accept(&acceptor, stream))
 		.await
+		.map_err(|_| "tls handshake timed out".to_string())?
 		.map_err(|e| format!("tls handshake failed: {e}"))?;
 
 	// The SNI is the only thing telling us which origin the client wanted: a
@@ -673,14 +682,36 @@ fn apply_alt_svc(config: &Config, headers: &mut Vec<(String, String)>) {
 /// acceptor, or by the origin at the far end of a splice. Nothing has to be
 /// stitched back on.
 async fn peek_server_name(stream: &mut tokio::net::TcpStream) -> Option<String> {
+	use crate::passthrough::Hello;
+
 	let mut buf = [0u8; crate::passthrough::PEEK_BYTES];
+	let deadline = tokio::time::Instant::now() + HELLO_TIMEOUT;
 
-	// One peek. A ClientHello arrives in the first packet in practice, and a
-	// client that dribbles one out is terminated as usual — which is the safe
-	// direction for this to be wrong in.
-	let read = stream.peek(&mut buf).await.ok()?;
+	// Not one peek. A ClientHello no longer fits in one segment — a browser
+	// offering a post-quantum key share sends about two kilobytes — so taking
+	// whatever was in the socket the first time it was readable handed the
+	// parser a truncated record. It refused it, correctly, and the refusal
+	// means "terminate it": whether a listed bank was decrypted came down to
+	// TCP segmentation.
+	loop {
+		let read = tokio::time::timeout_at(deadline, stream.peek(&mut buf))
+			.await
+			.ok()?
+			.ok()?;
 
-	crate::passthrough::server_name(&buf[..read])
+		match crate::passthrough::have_hello(&buf[..read]) {
+			Hello::Complete => return crate::passthrough::server_name(&buf[..read]),
+			// Not TLS, or a hello larger than we will ever read. Either way
+			// there is nothing to wait for.
+			Hello::NotTls => return None,
+			Hello::Want(whole) if whole > buf.len() => return None,
+			Hello::Want(_) => {}
+		}
+
+		// `peek` does not wait once anything at all is buffered, so without
+		// this the loop spins on the same truncated bytes until the deadline.
+		tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+	}
 }
 
 /// Carry a connection to its origin without decrypting it.

@@ -315,3 +315,67 @@ fn a_passthrough_host_is_never_decrypted() {
 		"and the client sees the origin's, both ways through the splice"
 	);
 }
+
+/// The peek used to take whatever was in the socket the first time it was
+/// readable. A real ClientHello no longer fits in one segment — a browser
+/// offering a post-quantum key share sends about two kilobytes — so the parser
+/// was handed a truncated record, refused it, and the refusal means terminate
+/// it. Whether a listed bank was decrypted came down to TCP segmentation.
+#[test]
+fn a_hello_split_across_segments_is_still_passed_through() {
+	use std::io::{Read, Write};
+	use std::net::{TcpListener, TcpStream};
+
+	let origin = TcpListener::bind("127.0.0.1:0").expect("an origin to splice to");
+	let origin_port = origin.local_addr().unwrap().port();
+
+	let hello = common::padded_client_hello(b"localhost", 1800);
+	assert!(hello.len() > 1500, "the point is that it does not fit in one");
+
+	let expected = hello.clone();
+	// Reported over a channel rather than joined: when this regresses, mach5
+	// terminates the connection instead of splicing it and nothing ever
+	// arrives here, so a join would hang the run rather than fail it.
+	let (arrived, at_origin) = std::sync::mpsc::channel();
+	std::thread::spawn(move || {
+		let Ok((mut peer, _)) = origin.accept() else {
+			return;
+		};
+		let mut seen = Vec::new();
+		let mut buf = [0u8; 4096];
+		while seen.len() < expected.len() {
+			match peer.read(&mut buf) {
+				Ok(0) | Err(_) => break,
+				Ok(read) => seen.extend_from_slice(&buf[..read]),
+			}
+		}
+		let _ = arrived.send(seen);
+	});
+
+	let proxy = Proxy::start_with(
+		BLOCKLIST,
+		&format!("[passthrough]\nhosts = [\"localhost\"]\nport = {origin_port}"),
+	);
+
+	let mut client = TcpStream::connect(("127.0.0.1", proxy.tcp_port())).expect("reach mach5");
+	let (first, rest) = hello.split_at(1400);
+	client.write_all(first).expect("the first segment");
+	client.flush().unwrap();
+	// Long enough that mach5 has certainly been woken by the first segment and
+	// had to decide what to do with a partial record.
+	std::thread::sleep(std::time::Duration::from_millis(150));
+	client.write_all(rest).expect("the rest of it");
+	client.flush().unwrap();
+
+	let seen = at_origin
+		.recv_timeout(std::time::Duration::from_secs(10))
+		.expect(
+			"nothing reached the origin: mach5 decided from a partial record and \
+			 terminated a host it was told never to decrypt",
+		);
+	assert_eq!(
+		seen, hello,
+		"the origin sees the whole hello, so mach5 waited for it rather than \
+		 answering with a certificate of its own"
+	);
+}

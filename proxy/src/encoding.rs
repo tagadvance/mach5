@@ -134,10 +134,15 @@ fn accepts(offered: &[(String, bool)], coding: &str) -> bool {
 /// Decompress the body and strip `content-encoding`, returning the coding so it
 /// can be put back afterwards.
 ///
-/// A coding we do not implement, or a body that will not decompress, is left
-/// exactly as it arrived: a truncated response should reach the client as the
-/// origin sent it rather than becoming a crash.
-pub fn decode(headers: &mut Vec<(String, String)>, body: Vec<u8>) -> (Vec<u8>, Option<Coding>) {
+/// A coding we do not implement, a body that will not decompress, and a body
+/// that inflates past `limit` are all left exactly as they arrived: a response
+/// we cannot read should reach the client as the origin sent it rather than
+/// becoming a crash.
+pub fn decode(
+	headers: &mut Vec<(String, String)>,
+	body: Vec<u8>,
+	limit: usize,
+) -> (Vec<u8>, Option<Coding>) {
 	let Some(value) = headers
 		.iter()
 		.find(|(name, _)| name.eq_ignore_ascii_case(CONTENT_ENCODING))
@@ -150,7 +155,7 @@ pub fn decode(headers: &mut Vec<(String, String)>, body: Vec<u8>) -> (Vec<u8>, O
 		return (body, None);
 	};
 
-	match decompress(coding, &body) {
+	match decompress(coding, &body, limit) {
 		Ok(decoded) => {
 			headers.retain(|(name, _)| !name.eq_ignore_ascii_case(CONTENT_ENCODING));
 
@@ -436,12 +441,28 @@ pub fn coding_of(headers: &[(String, String)]) -> Option<Coding> {
 		.and_then(|(_, value)| Coding::parse(value))
 }
 
-fn decompress(coding: Coding, body: &[u8]) -> std::io::Result<Vec<u8>> {
-	let mut out = Vec::new();
-	match coding {
-		Coding::Gzip => flate2::read::GzDecoder::new(body).read_to_end(&mut out)?,
-		Coding::Brotli => brotli::Decompressor::new(body, BUFFER_SIZE).read_to_end(&mut out)?,
+/// Inflate a whole body, refusing to allocate more than `limit` for it.
+///
+/// The size of a compressed body says nothing about the size of the plain one:
+/// gzip's ratio is a thousand to one on the right input, so a couple of
+/// megabytes an origin is happy to send inflates to a couple of gigabytes here.
+/// Bounding the *output* is the only bound that means anything, and one byte
+/// past the limit is enough to know it was passed.
+fn decompress(coding: Coding, body: &[u8], limit: usize) -> std::io::Result<Vec<u8>> {
+	let reader: Box<dyn Read> = match coding {
+		Coding::Gzip => Box::new(flate2::read::GzDecoder::new(body)),
+		Coding::Brotli => Box::new(brotli::Decompressor::new(body, BUFFER_SIZE)),
 	};
+
+	let mut out = Vec::new();
+	reader.take((limit as u64).saturating_add(1)).read_to_end(&mut out)?;
+
+	if out.len() > limit {
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::InvalidData,
+			format!("body inflates past the {limit} byte limit"),
+		));
+	}
 
 	Ok(out)
 }
@@ -502,7 +523,7 @@ mod tests {
 		let mut headers = encoded(coding.token());
 
 		let compressed = compress(coding, &original).expect("compresses");
-		let (body, found) = decode(&mut headers, compressed);
+		let (body, found) = decode(&mut headers, compressed, usize::MAX);
 
 		assert_eq!(found, Some(coding));
 		assert_eq!(body, original, "interceptors must see the plain body");
@@ -522,7 +543,7 @@ mod tests {
 			"and restored afterwards"
 		);
 		assert_eq!(
-			decompress(coding, &body).expect("decompresses"),
+			decompress(coding, &body, usize::MAX).expect("decompresses"),
 			original,
 			"what the client receives must decode to the same bytes"
 		);
@@ -543,7 +564,7 @@ mod tests {
 		let mut headers = encoded("zstd");
 		let original = b"compressed with something we do not speak".to_vec();
 
-		let (body, coding) = decode(&mut headers, original.clone());
+		let (body, coding) = decode(&mut headers, original.clone(), usize::MAX);
 
 		assert_eq!(coding, None);
 		assert_eq!(body, original);
@@ -554,12 +575,50 @@ mod tests {
 		assert_eq!(encode(&mut headers, body, coding), original);
 	}
 
+	/// A compressed body's size is no bound on the plain one's. gzip will do a
+	/// thousand to one on the right input, so an origin sending a couple of
+	/// megabytes can ask this process for a couple of gigabytes — and get it,
+	/// until this limit existed.
+	#[test]
+	fn a_body_that_inflates_past_the_limit_is_refused() {
+		// A megabyte of zeroes: about a kilobyte on the wire.
+		let bomb = {
+			let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+			e.write_all(&vec![0u8; 1024 * 1024]).expect("gzip");
+			e.finish().expect("gzip")
+		};
+		assert!(
+			bomb.len() < 8 * 1024,
+			"the point of the test is the ratio: {} bytes in",
+			bomb.len()
+		);
+
+		let mut headers = vec![("content-encoding".to_string(), "gzip".to_string())];
+		let (body, coding) = decode(&mut headers, bomb.clone(), 64 * 1024);
+
+		assert_eq!(body, bomb, "the origin's own bytes, untouched");
+		assert!(coding.is_none(), "nothing claims to have decoded it");
+		assert!(
+			headers
+				.iter()
+				.any(|(name, _)| name.eq_ignore_ascii_case("content-encoding")),
+			"and the coding stays declared, because the body is still coded"
+		);
+
+		// The same body under a limit that fits decodes as it always did.
+		let mut headers = vec![("content-encoding".to_string(), "gzip".to_string())];
+		let (body, coding) = decode(&mut headers, bomb, 2 * 1024 * 1024);
+
+		assert_eq!(body.len(), 1024 * 1024);
+		assert_eq!(coding, Some(Coding::Gzip));
+	}
+
 	#[test]
 	fn a_body_that_will_not_decompress_is_passed_through() {
 		let mut headers = encoded("gzip");
 		let garbage = b"this is not gzip".to_vec();
 
-		let (body, coding) = decode(&mut headers, garbage.clone());
+		let (body, coding) = decode(&mut headers, garbage.clone(), usize::MAX);
 
 		assert_eq!(coding, None);
 		assert_eq!(body, garbage);
@@ -607,7 +666,7 @@ mod tests {
 			"the first coding negotiate names is the one we prefer"
 		);
 		assert_eq!(
-			decompress(Coding::Brotli, &body).expect("decompresses"),
+			decompress(Coding::Brotli, &body, usize::MAX).expect("decompresses"),
 			original,
 			"the client must get back exactly what the interceptors produced"
 		);
@@ -620,7 +679,7 @@ mod tests {
 		let body = ensure_compressed(&accept("gzip"), 200, &mut headers, page(), None);
 
 		assert_eq!(header(&headers, CONTENT_ENCODING), Some("gzip"));
-		assert_eq!(decompress(Coding::Gzip, &body).expect("decompresses"), page());
+		assert_eq!(decompress(Coding::Gzip, &body, usize::MAX).expect("decompresses"), page());
 	}
 
 	/// The one that matters most: a coding we cannot decode still leaves the
@@ -630,7 +689,7 @@ mod tests {
 		let original = page();
 		let mut headers = encoded("zstd");
 
-		let (body, coding) = decode(&mut headers, original.clone());
+		let (body, coding) = decode(&mut headers, original.clone(), usize::MAX);
 
 		assert_eq!(coding, None, "we do not speak zstd");
 

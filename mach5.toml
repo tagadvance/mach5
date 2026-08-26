@@ -397,6 +397,13 @@ bypass_ttl_minutes = 60
 [limits]
 # Cap on a buffered request body; bounds what a single stream can allocate.
 max_request_body_mb = 10
+# Cap on a buffered *response* body, applied both to what is read off the wire
+# and to what it inflates to. A compressed body's size says nothing about the
+# plain one's — gzip will do a thousand to one on the right input — so without
+# this a couple of megabytes from an origin becomes a couple of gigabytes of
+# resident memory here. A response over the cap is relayed to the client
+# uninspected rather than refused: what it loses is being looked at.
+max_response_body_mb = 64
 # Upstream fetch workers, using Maven's -T convention: "1C" is one per core,
 # "2C" two per core, "0.5C" half. A bare number is an absolute count.
 # "Core" here is the parallelism available to the process, so it stays correct

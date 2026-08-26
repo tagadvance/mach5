@@ -394,7 +394,7 @@ fn fetch_blocking(
 				status: stored.status,
 				headers: stored.headers,
 			};
-			let (body, coding) = encoding::decode(&mut head.headers, stored.body);
+			let (body, coding) = encoding::decode(&mut head.headers, stored.body, shared.config.max_response_body());
 			let mut response = ProxyResponse {
 				status: head.status,
 				headers: head.headers,
@@ -421,30 +421,49 @@ fn fetch_blocking(
 	let worth_keeping =
 		upstream::should_store(&shared.agents, &shared.config, &request, head.status, &head.headers, declared);
 
+	let limit = shared.config.max_response_body();
+	let mut reader = resp.into_reader();
+
 	if interceptor.wants_body(&request, &head) || worth_keeping {
+		// One byte past the limit is enough to know it was passed, and is all
+		// that is ever held beyond it. Nothing here trusts content-length: an
+		// origin is free to send more than it declared.
 		let mut body = Vec::new();
-		if let Err(e) = resp.into_reader().read_to_end(&mut body) {
+		if let Err(e) = reader.by_ref().take((limit as u64).saturating_add(1)).read_to_end(&mut body) {
 			log::warn!(
 				"failed reading upstream body for {}: {e}",
 				crate::redact::url(&request.url)
 			);
 		}
-		metrics.bytes_from_origin.add(body.len() as u64);
-		// The origin's own bytes, before anything rewrites them.
-		upstream::store(&shared.agents, &request, head.status, &head.headers, &body);
 
-		// Interceptors rewrite plain bytes; the coding goes back on afterwards.
-		let (body, coding) = encoding::decode(&mut head.headers, body);
-		let mut response = ProxyResponse {
-			status: head.status,
-			headers: head.headers,
-			body,
-		};
-		interceptor.on_response(&request, &mut response);
-		response.body = encoding::encode(&mut response.headers, response.body, coding);
-		finish_buffered(shared, &request, response, head_tx);
+		if body.len() > limit {
+			// Whatever wanted to look at this does not get to; the client
+			// still gets the response. Refusing it outright would turn a large
+			// download into a broken one over a plugin's filter being wide.
+			log::warn!(
+				"body for {} is over the {limit} byte buffer limit; relaying it uninspected",
+				crate::redact::url(&request.url)
+			);
+			reader = Box::new(std::io::Cursor::new(body).chain(reader));
+		} else {
+			metrics.bytes_from_origin.add(body.len() as u64);
+			// The origin's own bytes, before anything rewrites them.
+			upstream::store(&shared.agents, &request, head.status, &head.headers, &body);
 
-		return;
+			// Interceptors rewrite plain bytes; the coding goes back on
+			// afterwards.
+			let (body, coding) = encoding::decode(&mut head.headers, body, limit);
+			let mut response = ProxyResponse {
+				status: head.status,
+				headers: head.headers,
+				body,
+			};
+			interceptor.on_response(&request, &mut response);
+			response.body = encoding::encode(&mut response.headers, response.body, coding);
+			finish_buffered(shared, &request, response, head_tx);
+
+			return;
+		}
 	}
 
 	// Nothing wants the body: relay it as it arrives. Deliberately not a place
@@ -465,7 +484,6 @@ fn fetch_blocking(
 	// Relay the body. `blocking_send` is the backpressure: it parks this thread
 	// when the client is not draining fast enough, rather than queueing without
 	// bound.
-	let mut reader = resp.into_reader();
 	let mut buf = vec![0u8; STREAM_CHUNK_SIZE];
 	loop {
 		let read = match reader.read(&mut buf) {

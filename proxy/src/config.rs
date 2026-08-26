@@ -458,6 +458,13 @@ fn available_cores() -> usize {
 pub struct Limits {
 	/// Cap on a buffered request body; bounds what one stream can allocate.
 	pub max_request_body_mb: usize,
+	/// Cap on a buffered *response* body, applied both to what is read off the
+	/// wire and to what it inflates to. A compressed body's size says nothing
+	/// about the plain one's, so without this a couple of megabytes of gzip
+	/// becomes a couple of gigabytes of resident memory. A response over the
+	/// cap is relayed to the client rather than refused; what it loses is
+	/// being looked at.
+	pub max_response_body_mb: usize,
 	/// Upstream fetch workers, absolute (`8`) or per-core (`"1C"`, `"2C"`).
 	pub worker_threads: Threads,
 	pub connect_timeout_seconds: u64,
@@ -474,6 +481,7 @@ impl Default for Limits {
 	fn default() -> Self {
 		Self {
 			max_request_body_mb: 10,
+			max_response_body_mb: 64,
 			worker_threads: Threads::default(),
 			connect_timeout_seconds: 10,
 			read_timeout_seconds: 30,
@@ -596,6 +604,12 @@ impl Config {
 		self.limits.max_request_body_mb * 1024 * 1024
 	}
 
+	/// The most a response body may occupy while it is being held whole, in
+	/// bytes — both as it arrives and after it inflates.
+	pub fn max_response_body(&self) -> usize {
+		self.limits.max_response_body_mb * 1024 * 1024
+	}
+
 	pub fn worker_threads(&self) -> usize {
 		self.limits.worker_threads.resolve()
 	}
@@ -683,6 +697,7 @@ mod tests {
 		// Untouched fields keep their defaults.
 		assert_eq!(config.tls.clock_skew_minutes, 60);
 		assert_eq!(config.limits.max_request_body_mb, 10);
+		assert_eq!(config.limits.max_response_body_mb, 64);
 	}
 
 	#[test]
@@ -836,5 +851,25 @@ mod tests {
 		assert_eq!(config.leaf_ttl(), Duration::hours(6));
 		assert_eq!(config.clock_skew(), Duration::minutes(15));
 	}
+	/// The configs shipped in this repo are parsed by the same `deny_unknown_fields`
+	/// deserializer the binary uses, so a key added to one and not the other —
+	/// or to neither struct — is a container that will not start. Nothing else
+	/// reads these files until then.
+	#[test]
+	fn the_configs_in_this_repo_parse() {
+		let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+			.parent()
+			.expect("the crate sits under the repo root");
+
+		for name in ["mach5.toml", "docker/mach5.toml"] {
+			let path = root.join(name);
+			let text = std::fs::read_to_string(&path)
+				.unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+
+			Config::from_str(&text)
+				.unwrap_or_else(|e| panic!("{} does not parse: {e}", path.display()));
+		}
+	}
+
 }
 

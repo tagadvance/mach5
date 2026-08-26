@@ -409,7 +409,7 @@ fn handle_job(
 	let resp = match resp {
 		upstream::Fetched::Stored(stored) => {
 			let mut headers = stored.headers;
-			let (body, coding) = encoding::decode(&mut headers, stored.body);
+			let (body, coding) = encoding::decode(&mut headers, stored.body, config.max_response_body());
 			let mut response = ProxyResponse {
 				status: stored.status,
 				headers,
@@ -437,43 +437,61 @@ fn handle_job(
 	let worth_keeping =
 		upstream::should_store(agents, config, &job.request, head.status, &head.headers, declared);
 
+	let limit = config.max_response_body();
+	let mut reader = resp.into_reader();
+
 	if interceptor.wants_body(&job.request, &head) || worth_keeping {
+		// One byte past the limit is enough to know it was passed, and is all
+		// that is ever held beyond it. Nothing here trusts content-length: an
+		// origin is free to send more than it declared.
 		let mut body = Vec::new();
-		if let Err(e) = resp.into_reader().read_to_end(&mut body) {
+		if let Err(e) = reader.by_ref().take((limit as u64).saturating_add(1)).read_to_end(&mut body) {
 			log::warn!(
 				"failed reading upstream body for {}: {e}",
 				redact::url(&job.request.url)
 			);
 		}
-		metrics.bytes_from_origin.add(body.len() as u64);
-		// The origin's own bytes, before anything rewrites them.
-		upstream::store(agents, &job.request, head.status, &head.headers, &body);
 
-		// Interceptors rewrite plain bytes; the coding goes back on afterwards.
-		let (body, coding) = encoding::decode(&mut head.headers, body);
-		let mut response = ProxyResponse {
-			status: head.status,
-			headers: head.headers,
-			body,
-		};
-		interceptor.on_response(&job.request, &mut response);
-		response.body = encoding::encode(&mut response.headers, response.body, coding);
-		if config.http.compress {
-			let plain = response.body.len();
-			response.body = encoding::ensure_compressed(
-				&job.request.headers,
-				response.status,
-				&mut response.headers,
-				response.body,
-				coding,
+		if body.len() > limit {
+			// Whatever wanted to look at this does not get to; the client
+			// still gets the response. Refusing it outright would turn a large
+			// download into a broken one over a plugin's filter being wide.
+			log::warn!(
+				"body for {} is over the {limit} byte buffer limit; relaying it uninspected",
+				redact::url(&job.request.url)
 			);
-			metrics
-				.bytes_saved_by_compression
-				.add(plain.saturating_sub(response.body.len()) as u64);
-		}
-		metrics.bytes_to_client.add(response.body.len() as u64);
+			reader = Box::new(std::io::Cursor::new(body).chain(reader));
+		} else {
+			metrics.bytes_from_origin.add(body.len() as u64);
+			// The origin's own bytes, before anything rewrites them.
+			upstream::store(agents, &job.request, head.status, &head.headers, &body);
 
-		return send(Payload::Full(response));
+			// Interceptors rewrite plain bytes; the coding goes back on afterwards.
+			let (body, coding) = encoding::decode(&mut head.headers, body, limit);
+			let mut response = ProxyResponse {
+				status: head.status,
+				headers: head.headers,
+				body,
+			};
+			interceptor.on_response(&job.request, &mut response);
+			response.body = encoding::encode(&mut response.headers, response.body, coding);
+			if config.http.compress {
+				let plain = response.body.len();
+				response.body = encoding::ensure_compressed(
+					&job.request.headers,
+					response.status,
+					&mut response.headers,
+					response.body,
+					coding,
+				);
+				metrics
+					.bytes_saved_by_compression
+					.add(plain.saturating_sub(response.body.len()) as u64);
+			}
+			metrics.bytes_to_client.add(response.body.len() as u64);
+
+			return send(Payload::Full(response));
+		}
 	}
 
 	// Nothing wants the body: relay it as it arrives. Deliberately not a place
@@ -488,7 +506,6 @@ fn handle_job(
 	let mut rewriting = inject::streamer_for(config, &job.request, &mut head);
 	send(Payload::Head(head))?;
 
-	let mut reader = resp.into_reader();
 	let mut buf = vec![0u8; STREAM_CHUNK_SIZE];
 	loop {
 		match reader.read(&mut buf) {

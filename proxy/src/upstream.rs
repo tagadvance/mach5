@@ -384,15 +384,36 @@ pub fn declared_length(resp: &ureq::Response) -> Option<u64> {
 		.and_then(|value| value.trim().parse::<u64>().ok())
 }
 
+/// Every header the origin sent that is ours to relay, values included.
+///
+/// `headers_names` yields one entry per header *line*, so a header sent twice
+/// appears twice — but `header` finds only the first value, so taking one per
+/// name both duplicated the first value and dropped the second entirely. That
+/// is not a tidiness point: two `set-cookie` lines are how a login sets a session
+/// and a CSRF token, and one of them was being thrown away. A second
+/// `cache-control: private` or `vary: cookie` was invisible to the cache's
+/// eligibility check for the same reason, which is how a private response ends
+/// up in a shared cache.
 pub fn response_headers(resp: &ureq::Response) -> Vec<(String, String)> {
-	resp.headers_names()
-		.into_iter()
-		.filter(|name| !is_hop_by_hop(name))
-		.filter_map(|name| {
-			resp.header(&name)
-				.map(|value| (name.clone(), value.to_string()))
-		})
-		.collect()
+	let mut seen = std::collections::HashSet::new();
+	let mut headers = Vec::new();
+
+	for name in resp.headers_names() {
+		// `headers_names` lowercases, so the set is already case-folded — and
+		// ureq matches names case-insensitively, so `all` finds every line
+		// whatever the origin capitalised.
+		if is_hop_by_hop(&name) || !seen.insert(name.clone()) {
+			continue;
+		}
+
+		headers.extend(
+			resp.all(&name)
+				.into_iter()
+				.map(|value| (name.clone(), value.to_string())),
+		);
+	}
+
+	headers
 }
 
 /// Whether a header the client sent goes to the origin as it stands.
@@ -435,6 +456,45 @@ pub fn is_hop_by_hop(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// A header sent more than once is not a curiosity: two `set-cookie` lines
+	/// are how a login hands out a session and a CSRF token in one response.
+	/// Taking one value per name sent the first cookie twice and threw the
+	/// second away, so signing in through the proxy quietly half-worked.
+	#[test]
+	fn a_header_sent_twice_arrives_twice() {
+		let resp: ureq::Response = "HTTP/1.1 200 OK\r\n\
+			 content-type: text/html\r\n\
+			 Set-Cookie: session=abc; HttpOnly\r\n\
+			 set-cookie: csrf=xyz\r\n\
+			 Vary: Accept-Encoding\r\n\
+			 vary: Cookie\r\n\
+			 content-length: 0\r\n\
+			 \r\n"
+			.parse()
+			.expect("a well-formed response");
+
+		let headers = response_headers(&resp);
+		let values = |name: &str| -> Vec<&str> {
+			headers
+				.iter()
+				.filter(|(header, _)| header == name)
+				.map(|(_, value)| value.as_str())
+				.collect()
+		};
+
+		assert_eq!(values("set-cookie"), ["session=abc; HttpOnly", "csrf=xyz"]);
+		assert_eq!(
+			values("vary"),
+			["Accept-Encoding", "Cookie"],
+			"and the second is what tells the cache this is per-user"
+		);
+		assert_eq!(values("content-type"), ["text/html"]);
+		assert!(
+			values("content-length").is_empty(),
+			"framing is still each front end's own"
+		);
+	}
 
 	fn request(headers: Vec<(String, String)>) -> ProxyRequest {
 		ProxyRequest {

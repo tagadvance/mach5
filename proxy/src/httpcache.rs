@@ -20,7 +20,7 @@
 //! key on is left alone. The request half matters too — an `authorization`
 //! header means this body was for one person.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -373,22 +373,6 @@ impl Cache {
 		Some(cache)
 	}
 
-	/// Put `bytes` at `path` without any reader ever seeing a partial file.
-	///
-	/// The temporary carries the process id: two workers replacing the same key
-	/// at once is the case this exists for, and a shared temporary name would
-	/// just move the tear into it.
-	fn replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-		let temporary = path.with_extension(format!("tmp{}", std::process::id()));
-		std::fs::write(&temporary, bytes).inspect_err(|_| {
-			let _ = std::fs::remove_file(&temporary);
-		})?;
-
-		std::fs::rename(&temporary, path).inspect_err(|_| {
-			let _ = std::fs::remove_file(&temporary);
-		})
-	}
-
 	pub fn get(&self, key: &str) -> Option<(Entry, Vec<u8>)> {
 		let entry: Entry =
 			serde_json::from_slice(&std::fs::read(self.dir.join(format!("{key}.meta"))).ok()?)
@@ -411,10 +395,10 @@ impl Cache {
 		//
 		// The body first, so a reader that finds the metadata always finds
 		// something to go with it.
-		if Self::replace(&self.dir.join(format!("{key}.body")), body).is_err() {
+		if crate::disk::replace(&self.dir.join(format!("{key}.body")), body).is_err() {
 			return;
 		}
-		if Self::replace(&self.dir.join(format!("{key}.meta")), &meta).is_err() {
+		if crate::disk::replace(&self.dir.join(format!("{key}.meta")), &meta).is_err() {
 			let _ = std::fs::remove_file(self.dir.join(format!("{key}.body")));
 
 			return;

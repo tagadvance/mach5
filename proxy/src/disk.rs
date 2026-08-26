@@ -1,9 +1,11 @@
-//! Keeping a cache directory under its budget.
+//! Files under a budget, and files replaced without a reader seeing a tear.
 //!
-//! Shared by the two on-disk caches, which want the same thing: delete the
-//! least recently used files until the total fits again.
+//! Shared by the two on-disk caches and the list fetcher, which want the same
+//! two things: delete the least recently used files until the total fits
+//! again, and never leave a half-written file where something will read it.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Delete oldest-first until `budget` is met.
 ///
@@ -11,6 +13,33 @@ use std::path::{Path, PathBuf};
 /// where it does not — many are mounted `relatime` and will not update atime
 /// for a read. For files never written twice, that means oldest-first, which is
 /// the honest fallback.
+/// Put `bytes` at `path` without any reader ever seeing a partial file.
+///
+/// The temporary has to be unique per *write*, not per process. Workers here
+/// are threads, so a process id is the same for all of them, and two of them
+/// replacing one path shared a temporary: the second `create` truncated the
+/// first mid-write, and — because `rename` moves the name and not the open
+/// file — the loser then went on writing into the *published* file. A reader
+/// gets half a stylesheet or a clipped image, and it is served as a
+/// well-formed 200, since the framing is recomputed from what was read.
+///
+/// The counter is what makes them distinct; the pid is kept for the other
+/// case, two processes over one directory.
+pub fn replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+	static WRITES: AtomicU64 = AtomicU64::new(0);
+
+	let nth = WRITES.fetch_add(1, Ordering::Relaxed);
+	let temporary = path.with_extension(format!("tmp{}.{nth}", std::process::id()));
+
+	std::fs::write(&temporary, bytes).inspect_err(|_| {
+		let _ = std::fs::remove_file(&temporary);
+	})?;
+
+	std::fs::rename(&temporary, path).inspect_err(|_| {
+		let _ = std::fs::remove_file(&temporary);
+	})
+}
+
 pub fn sweep(dir: &Path, budget: u64) {
 	let Ok(entries) = std::fs::read_dir(dir) else {
 		return;
@@ -71,6 +100,68 @@ pub fn empty(dir: &Path) -> usize {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// The property the whole point rests on: at no instant does the published
+	/// path hold anything but a complete previous version or a complete new
+	/// one — even with several threads replacing it at once with different
+	/// contents.
+	#[test]
+	fn a_reader_never_sees_a_half_written_file() {
+		let dir = tempfile::TempDir::new().unwrap();
+		let path = dir.path().join("body");
+		let sizes = [1_000usize, 200_000, 40_000, 900_000];
+
+		replace(&path, &vec![b'0'; sizes[0]]).unwrap();
+
+		let writers: Vec<_> = sizes
+			.iter()
+			.enumerate()
+			.map(|(n, size)| {
+				let path = path.clone();
+				let byte = b'a' + n as u8;
+				let size = *size;
+
+				std::thread::spawn(move || {
+					for _ in 0..25 {
+						replace(&path, &vec![byte; size]).unwrap();
+					}
+				})
+			})
+			.collect();
+
+		for _ in 0..500 {
+			// Whatever is there must be one writer's bytes, all of them, and
+			// the right number of them. A tear shows up as a mixture or as a
+			// length nobody wrote.
+			if let Ok(read) = std::fs::read(&path) {
+				let byte = read[0];
+				assert!(
+					read.iter().all(|b| *b == byte),
+					"a mixture of two writers' bytes"
+				);
+
+				let wrote = match byte {
+					b'0' => sizes[0],
+					other => sizes[(other - b'a') as usize],
+				};
+				assert_eq!(read.len(), wrote, "the file is a length nobody wrote");
+			}
+			std::thread::yield_now();
+		}
+
+		for writer in writers {
+			writer.join().unwrap();
+		}
+
+		// And nothing is left behind.
+		let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+			.unwrap()
+			.filter_map(|e| e.ok())
+			.map(|e| e.file_name().to_string_lossy().to_string())
+			.filter(|name| name != "body")
+			.collect();
+		assert!(leftovers.is_empty(), "temporaries left behind: {leftovers:?}");
+	}
 
 	#[test]
 	fn sweeping_brings_a_directory_back_under_budget() {

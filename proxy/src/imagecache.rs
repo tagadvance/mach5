@@ -86,14 +86,13 @@ impl Cache {
 		let path = self.path_for(original, quality);
 
 		// Written beside and renamed, so a reader never sees a half-written
-		// image — the same reason the other stores here do it.
-		let temporary = path.with_extension("tmp");
-		let written = std::fs::write(&temporary, encoded).and_then(|()| {
-			std::fs::rename(&temporary, &path)
-		});
-		if let Err(e) = written {
+		// image — the same reason the other stores here do it, and through the
+		// same helper, because the temporary has to be unique per write. Two
+		// threads converting the same image write identical bytes, so the tear
+		// was never a wrong image; it was a clipped one, which is a broken
+		// image in the page.
+		if let Err(e) = crate::disk::replace(&path, encoded) {
 			log::debug!("cannot cache a re-encoded image: {e}");
-			let _ = std::fs::remove_file(&temporary);
 
 			return;
 		}

@@ -163,6 +163,16 @@ enabled = true
 # rather mach5 did not modify the page at all.
 # exclude = ["bank.example"]
 
+[upstream]
+# Which of an origin's addresses mach5 tries first: "system", "prefer-ipv4" or
+# "prefer-ipv6". Nothing is dropped, only reordered, so an AAAA-only origin is
+# still reached either way.
+#
+# mach5 resolves on its own host, so a client with IPv6 switched off still
+# reaches IPv6-only origins through it. `prefer-ipv4` is for when this host's
+# IPv6 is a 6rd tunnel and slower than the IPv4 underneath it.
+addresses = "system"
+
 [images]
 # Re-encode images to WebP on the way past.
 #

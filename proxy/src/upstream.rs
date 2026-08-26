@@ -89,6 +89,9 @@ pub struct Agents {
 pub fn agents(config: &Config) -> Agents {
 	let builder = || {
 		ureq::AgentBuilder::new()
+			// Ours, so which family an origin is reached over is a decision
+			// rather than an accident of whatever the resolver felt like.
+			.resolver(crate::resolver::Ordered::new(config.upstream.addresses))
 			// Pass 3xx through to the client; it re-requests and we intercept again.
 			.redirects(0)
 			.timeout_connect(Duration::from_secs(config.limits.connect_timeout_seconds))

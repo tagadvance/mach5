@@ -187,6 +187,29 @@ enabled = true
 # rather mach5 did not modify the page at all.
 # exclude = ["bank.example"]
 
+[upstream]
+# Which of an origin's addresses mach5 tries first.
+#
+# mach5 resolves origins on its own host, which has a consequence worth knowing:
+# a client does not need IPv6 to reach an IPv6-only site through mach5. Turning
+# IPv6 off on a laptop stops that laptop reaching v6-only origins; going through
+# here does not, as long as this host has v6.
+#
+#   "system"       whatever the resolver returns, in its order. RFC 6724
+#                  usually means IPv6 first when this host has a global v6
+#                  address. The default.
+#   "prefer-ipv4"  A records first, AAAA after.
+#   "prefer-ipv6"  the other way round.
+#
+# `prefer-ipv4` is for a host whose IPv6 is a 6rd tunnel — IPv6 carried over
+# IPv4 through a relay, often much slower than the IPv4 it is riding on. Under
+# "system" every dual-stack origin then pays for the tunnel first; under
+# `prefer-ipv4` none of them do.
+#
+# Nothing is ever dropped, only reordered: an AAAA-only origin is still reached,
+# because it is still in the list. A preference must not become a refusal.
+addresses = "system"
+
 [images]
 # Re-encode images to WebP on the way past.
 #

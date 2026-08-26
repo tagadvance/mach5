@@ -30,6 +30,7 @@ pub struct Config {
 	pub blocklist: Blocklist,
 	pub log: Log,
 	pub images: Images,
+	pub upstream: Upstream,
 	pub passthrough: Passthrough,
 	pub cosmetic: Cosmetic,
 	pub internal: Internal,
@@ -84,6 +85,31 @@ impl Default for Http {
 			compress: true,
 		}
 	}
+}
+
+/// Which of an origin's addresses to try first.
+///
+/// mach5 resolves origins on its own host, so this is independent of what the
+/// clients can do — a client with IPv6 switched off still reaches IPv6-only
+/// origins through mach5.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AddressPolicy {
+	/// Whatever the resolver returns, in its order. RFC 6724 usually means
+	/// IPv6 first.
+	#[default]
+	System,
+	/// A records first, AAAA after. For a host whose IPv6 is a 6rd tunnel and
+	/// slower than the IPv4 it rides on. Nothing is dropped, so an AAAA-only
+	/// origin is still reached.
+	PreferIpv4,
+	PreferIpv6,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct Upstream {
+	pub addresses: AddressPolicy,
 }
 
 /// Re-encoding images to WebP on the way past.

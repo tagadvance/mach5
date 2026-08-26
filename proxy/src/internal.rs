@@ -719,6 +719,21 @@ fn status_page(page: Page) -> String {
 	let internal = metrics::thousands(counted.internal);
 	let injected = metrics::thousands(counted.injected);
 	let passed_through = metrics::thousands(counted.passed_through);
+	// What each lookup came back with, rather than which one was connected to:
+	// mach5 hands the list to ureq and is not told which entry won. See
+	// `resolver.rs`.
+	let families = if counted.lookups_ipv4_only + counted.lookups_ipv6_only + counted.lookups_dual
+		== 0
+	{
+		r#"<td class="note">nothing looked up yet</td>"#.to_string()
+	} else {
+		format!(
+			r#"<td>{both} <span class="note">both · {v4} IPv4 only · {v6} IPv6 only</span></td>"#,
+			both = metrics::thousands(counted.lookups_dual),
+			v4 = metrics::thousands(counted.lookups_ipv4_only),
+			v6 = metrics::thousands(counted.lookups_ipv6_only),
+		)
+	};
 	// The one control that has to live here rather than in the panel: turning
 	// injection off removes the panel, so the way back on cannot be inside it.
 	let injection = match live.inject {
@@ -783,6 +798,7 @@ fn status_page(page: Page) -> String {
     <tr><th>Pages injected</th><td>{injected}</td></tr>
     <tr><th>Passed through undecrypted</th><td>{passed_through}</td></tr>
     <tr><th>Panel in pages</th>{injection}</tr>
+    <tr><th>Origins reachable</th>{families}</tr>
     <tr><th>Fetched unvalidated</th><td>{bypasses}</td></tr>
     <tr><th>Certificate failures</th><td>{tls_failures}</td></tr>
     <tr><th>Other upstream failures</th><td>{upstream_failures}</td></tr>

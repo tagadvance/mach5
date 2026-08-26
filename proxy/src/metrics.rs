@@ -81,6 +81,11 @@ pub struct Metrics {
 	pub bytes_saved_by_compression: Counter,
 	/// Bytes not sent because an image was re-encoded.
 	pub bytes_saved_by_images: Counter,
+	/// Upstream lookups by the families they came back with. Not utilisation —
+	/// see `resolver.rs` for why that would be a guess.
+	pub lookups_ipv4_only: Counter,
+	pub lookups_ipv6_only: Counter,
+	pub lookups_dual: Counter,
 	/// Time spent waiting on each plugin, by plugin name.
 	///
 	/// A locked map rather than the atomics above, because the keys are plugin
@@ -109,6 +114,9 @@ impl Default for Metrics {
 			bytes_to_client: Counter::default(),
 			bytes_saved_by_compression: Counter::default(),
 			bytes_saved_by_images: Counter::default(),
+			lookups_ipv4_only: Counter::default(),
+			lookups_ipv6_only: Counter::default(),
+			lookups_dual: Counter::default(),
 			plugins: Mutex::new(BTreeMap::new()),
 		}
 	}
@@ -148,6 +156,9 @@ impl Metrics {
 			bytes_to_client: self.bytes_to_client.get(),
 			bytes_saved_by_compression: self.bytes_saved_by_compression.get(),
 			bytes_saved_by_images: self.bytes_saved_by_images.get(),
+			lookups_ipv4_only: self.lookups_ipv4_only.get(),
+			lookups_ipv6_only: self.lookups_ipv6_only.get(),
+			lookups_dual: self.lookups_dual.get(),
 			plugins: self
 				.plugins
 				.lock()
@@ -203,6 +214,9 @@ pub struct Snapshot {
 	pub bytes_to_client: u64,
 	pub bytes_saved_by_compression: u64,
 	pub bytes_saved_by_images: u64,
+	pub lookups_ipv4_only: u64,
+	pub lookups_ipv6_only: u64,
+	pub lookups_dual: u64,
 	/// Keyed by plugin name — the one part of the JSON that is not flat,
 	/// because the set of plugins is not known until they are loaded.
 	pub plugins: BTreeMap<String, PluginStats>,

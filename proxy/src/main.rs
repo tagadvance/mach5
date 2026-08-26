@@ -23,6 +23,7 @@ mod metrics;
 mod passthrough;
 mod plugin;
 mod redact;
+mod resolver;
 mod settings;
 mod tcp;
 mod upstream;

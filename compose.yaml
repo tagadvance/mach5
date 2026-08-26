@@ -48,18 +48,42 @@ services:
   # to learn which origin was actually wanted.
   #
   # Optional. Skip it entirely if you already have something answering that way
-  # — `docker compose up mach5` starts the proxy alone.
+  # — `docker compose up mach5` starts the proxy alone, and this service only
+  # runs with `--profile dns`.
   #
-  # WHY THIS WANTS ITS OWN ADDRESS: it is a second DNS server, and port 53 is
-  # not shareable. If pi-hole is on another machine there is no conflict and you
-  # can publish this on the host normally. If pi-hole is on *this* machine, the
-  # two need separate addresses — which is what the `lan` network below is for,
-  # and it is why this used to be a manual `ip addr add`.
+  # IT NEEDS AN ADDRESS OF ITS OWN — but you very likely already have one.
+  #
+  # Port 53 is not shareable, so this and pi-hole cannot both listen on the same
+  # address. Three situations:
+  #
+  #   pi-hole is on another machine
+  #       Nothing to do. Leave MACH5_DNS_BIND unset and this listens on every
+  #       address, like any other container.
+  #
+  #   pi-hole is on THIS machine, and clients arrive over WireGuard
+  #       Set MACH5_DNS_BIND to your WireGuard interface's address — 10.x.y.1,
+  #       whatever `ip addr show wg0` says. That address already exists, it is
+  #       exactly where your clients are coming from, and pi-hole is on the LAN
+  #       address, so the two never collide. This is almost certainly you.
+  #
+  #   pi-hole is on THIS machine and clients are on the LAN
+  #       Set MACH5_DNS_BIND to a second LAN address. That one you do have to
+  #       create (`ip addr add`, persisted by your network config). A macvlan
+  #       network is the other way — Docker gives the container its own LAN
+  #       address and you alias nothing — but a macvlan container is
+  #       unreachable from its own host, including anything the host forwards,
+  #       so it is wrong the moment WireGuard or a VPN terminates here.
   dns:
     image: dockurr/dnsmasq:latest
     container_name: mach5-dns
     restart: unless-stopped
     profiles: ["dns"]
+
+    # One address, not all of them. This is the whole trick for coexisting with
+    # pi-hole: two resolvers, two addresses, one host, no aliasing.
+    ports:
+      - "${MACH5_DNS_BIND:-0.0.0.0}:53:53/udp"
+      - "${MACH5_DNS_BIND:-0.0.0.0}:53:53/tcp"
 
     environment:
       # Passed through rather than interpolated into the command, so the check
@@ -86,35 +110,6 @@ services:
     # Answering DNS is all it does, and it needs no more than this.
     cap_drop: [ALL]
     cap_add: [NET_BIND_SERVICE]
-
-    networks:
-      lan:
-        ipv4_address: ${MACH5_DNS_IP:-192.168.1.53}
-
-# A macvlan network gives the resolver its own address on your LAN, so it does
-# not have to share port 53 with anything else on this host — no interface
-# aliasing, no `ip addr add`, nothing to redo after a reboot.
-#
-# Fill these in in .env:
-#
-#   MACH5_LAN_PARENT   the host interface your LAN is on, e.g. eth0
-#   MACH5_LAN_SUBNET   e.g. 192.168.1.0/24
-#   MACH5_LAN_GATEWAY  e.g. 192.168.1.1
-#   MACH5_DNS_IP       a free address in that subnet for the resolver
-#   MACH5_PROXY_IP     where mach5 itself is reachable — what DNS will answer
-#
-# One macvlan caveat worth knowing before you debug it: the host cannot talk to
-# its own macvlan containers. Clients on the LAN can, which is all this needs,
-# but you will not be able to `dig` the resolver from the Docker host itself.
-networks:
-  lan:
-    driver: macvlan
-    driver_opts:
-      parent: ${MACH5_LAN_PARENT:-eth0}
-    ipam:
-      config:
-        - subnet: ${MACH5_LAN_SUBNET:-192.168.1.0/24}
-          gateway: ${MACH5_LAN_GATEWAY:-192.168.1.1}
 
 volumes:
   mach5-cache:

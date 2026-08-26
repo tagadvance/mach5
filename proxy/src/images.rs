@@ -42,6 +42,8 @@ pub struct Images {
 	/// style.
 	configured: u8,
 	settings: Arc<crate::settings::Store>,
+	/// Absent when switched off, and then every request pays the conversion.
+	cache: Option<Arc<crate::imagecache::Cache>>,
 	metrics: Arc<crate::metrics::Metrics>,
 }
 
@@ -50,6 +52,7 @@ impl Images {
 		Self {
 			configured: config.images.quality,
 			settings: crate::settings::shared(config),
+			cache: crate::imagecache::shared(config),
 			metrics: crate::metrics::shared(),
 		}
 	}
@@ -74,8 +77,26 @@ impl Interceptor for Images {
 			return;
 		};
 
-		let Some(webp) = to_webp(&resp.body, quality as f32) else {
-			return;
+		// Keyed on the bytes in hand, so a hit is by definition the
+		// re-encoding of exactly this image.
+		let cached = self
+			.cache
+			.as_ref()
+			.and_then(|cache| cache.get(&resp.body, quality));
+
+		let webp = match cached {
+			Some(webp) => webp,
+			None => {
+				let Some(webp) = to_webp(&resp.body, quality as f32) else {
+					return;
+				};
+
+				if let Some(cache) = self.cache.as_ref() {
+					cache.put(&resp.body, quality, &webp);
+				}
+
+				webp
+			}
 		};
 
 		// Larger is a real outcome, just a rare one, and shipping it would be
@@ -206,6 +227,7 @@ mod tests {
 			settings: Arc::new(crate::settings::Store::load(
 				std::env::temp_dir().join("mach5-images-test-settings.json"),
 			)),
+			cache: None,
 			metrics: Arc::new(crate::metrics::Metrics::default()),
 		}
 	}

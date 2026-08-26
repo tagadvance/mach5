@@ -13,6 +13,7 @@ mod config;
 mod cosmetic;
 mod encoding;
 mod fetch;
+mod imagecache;
 mod images;
 mod inject;
 mod insecure;

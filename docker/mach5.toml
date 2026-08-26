@@ -197,6 +197,22 @@ enabled = true
 # and is what the measurements above were taken at.
 quality = 80
 
+# How much disk the re-encoded images may take, so the conversion is done once
+# rather than per request. A 1600x1200 photograph costs about 2.5 seconds to
+# decode and re-encode; cached, the second request for it costs five
+# milliseconds.
+#
+# Entries are addressed by content — the SHA-256 of the original bytes and the
+# quality — so there is nothing to invalidate and nothing to go stale, and an
+# entry can only be reached by already holding the bytes it was made from.
+#
+# This saves CPU and not bandwidth: the original is still fetched from the
+# origin every time. A cache that avoids the fetch as well is a different and
+# more delicate thing — see the roadmap.
+#
+# 0 switches it off.
+cache_mb = 512
+
 [passthrough]
 # Hosts mach5 must never decrypt.
 #

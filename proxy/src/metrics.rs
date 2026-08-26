@@ -83,6 +83,9 @@ pub struct Metrics {
 	pub bytes_saved_by_images: Counter,
 	/// Upstream lookups by the families they came back with. Not utilisation —
 	/// see `resolver.rs` for why that would be a guess.
+	/// Re-encodings that did not have to be done again, and those that did.
+	pub image_cache_hits: Counter,
+	pub image_cache_misses: Counter,
 	pub lookups_ipv4_only: Counter,
 	pub lookups_ipv6_only: Counter,
 	pub lookups_dual: Counter,
@@ -114,6 +117,8 @@ impl Default for Metrics {
 			bytes_to_client: Counter::default(),
 			bytes_saved_by_compression: Counter::default(),
 			bytes_saved_by_images: Counter::default(),
+			image_cache_hits: Counter::default(),
+			image_cache_misses: Counter::default(),
 			lookups_ipv4_only: Counter::default(),
 			lookups_ipv6_only: Counter::default(),
 			lookups_dual: Counter::default(),
@@ -156,6 +161,8 @@ impl Metrics {
 			bytes_to_client: self.bytes_to_client.get(),
 			bytes_saved_by_compression: self.bytes_saved_by_compression.get(),
 			bytes_saved_by_images: self.bytes_saved_by_images.get(),
+			image_cache_hits: self.image_cache_hits.get(),
+			image_cache_misses: self.image_cache_misses.get(),
 			lookups_ipv4_only: self.lookups_ipv4_only.get(),
 			lookups_ipv6_only: self.lookups_ipv6_only.get(),
 			lookups_dual: self.lookups_dual.get(),
@@ -214,6 +221,8 @@ pub struct Snapshot {
 	pub bytes_to_client: u64,
 	pub bytes_saved_by_compression: u64,
 	pub bytes_saved_by_images: u64,
+	pub image_cache_hits: u64,
+	pub image_cache_misses: u64,
 	pub lookups_ipv4_only: u64,
 	pub lookups_ipv6_only: u64,
 	pub lookups_dual: u64,

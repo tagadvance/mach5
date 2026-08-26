@@ -93,14 +93,15 @@ impl Blocklist {
 
 	fn add(&mut self, text: &str) {
 		for line in text.lines() {
-			match parse(line) {
-				Some(Rule::Block(domain)) => {
-					self.blocked.insert(domain);
+			for rule in parse(line) {
+				match rule {
+					Rule::Block(domain) => {
+						self.blocked.insert(domain);
+					}
+					Rule::Allow(domain) => {
+						self.allowed.insert(domain);
+					}
 				}
-				Some(Rule::Allow(domain)) => {
-					self.allowed.insert(domain);
-				}
-				None => {}
 			}
 		}
 	}
@@ -380,37 +381,72 @@ enum Rule {
 
 /// Parse one line of a list in whichever of the three formats it happens to be.
 /// Anything else — cosmetic rules, URL patterns, regexes — is silently skipped.
-fn parse(line: &str) -> Option<Rule> {
+///
+/// A hosts line may name several hosts, which is why this returns a list.
+fn parse(line: &str) -> Vec<Rule> {
 	let line = line.trim();
 	if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
-		return None;
+		return Vec::new();
 	}
 
+	// A hosts file may put a comment after the name, and the whole line was
+	// being thrown away for it — silently, in the direction of blocking less.
+	// Only after whitespace: `example.com##.ad-banner` is a cosmetic rule, and
+	// splitting that on `#` would turn it into a block on the site itself.
+	let line = match line.find(" #").or_else(|| line.find("\t#")) {
+		Some(at) => line[..at].trim(),
+		None => line,
+	};
+
 	if let Some(rule) = line.strip_prefix("@@") {
-		return Some(Rule::Allow(normalize(anchored(rule)?)?));
+		return one(anchored(rule).and_then(normalize).map(Rule::Allow));
 	}
 
 	if line.starts_with("||") {
-		return Some(Rule::Block(normalize(anchored(line)?)?));
+		return one(anchored(line).and_then(normalize).map(Rule::Block));
 	}
 
-	// A hosts file line: an address, then the name it is being pointed at.
+	// A hosts file line: an address, then the names being pointed at it — of
+	// which there may be several, and dropping all but the first left the rest
+	// unblocked with nothing said about it.
 	if let Some((_address, rest)) = line.split_once(char::is_whitespace) {
-		let name = rest.split_whitespace().next()?;
-
-		return Some(Rule::Block(normalize(name)?));
+		return rest
+			.split_whitespace()
+			.filter_map(normalize)
+			.map(Rule::Block)
+			.collect();
 	}
 
-	Some(Rule::Block(normalize(line)?))
+	one(normalize(line).map(Rule::Block))
 }
 
-/// The domain of an Adblock anchor rule, `||ads.example.com^$third-party`.
-/// Options after the separator are ignored; wildcards and paths mean the rule
-/// is more than a domain match, so it is not ours to honour.
+fn one(rule: Option<Rule>) -> Vec<Rule> {
+	rule.into_iter().collect()
+}
+
+/// The domain of an Adblock anchor rule, `||ads.example.com^`.
+///
+/// A rule carrying `$` options is **refused**, not stripped of them. The
+/// options are what scopes it: `||cdn.example^$third-party` blocks that host
+/// only when something else embeds it, and honouring the domain alone blocks
+/// the site you typed into the address bar. The mirror case is worse, because
+/// it fails open — `@@||tracker.example^$document` became a blanket allowance
+/// that quietly defeated a hosts-file block of the same name from another list.
+///
+/// mach5 has no notion of request context, so neither scope can be evaluated,
+/// and a rule whose scope cannot be read is not ours to honour — the same rule
+/// `cosmetic` already follows for domains it cannot fully parse. The cost is
+/// that a chunk of a real EasyList is skipped; the alternative is a rule
+/// applying far more widely than it was written to.
 fn anchored(rule: &str) -> Option<&str> {
 	let rest = rule.strip_prefix("||")?;
-	let domain = rest.split(['^', '$']).next().unwrap_or(rest);
+	if rest.contains('$') {
+		return None;
+	}
 
+	let domain = rest.split('^').next().unwrap_or(rest);
+
+	// A wildcard or a path means the rule is more than a domain match.
 	(!domain.contains(['*', '/'])).then_some(domain)
 }
 
@@ -476,14 +512,51 @@ mod tests {
 			 127.0.0.1\ttracker.example.net\n\
 			 bare.example.org\n\
 			 ||anchored.example.com^\n\
-			 ||options.example.com^$third-party\n",
+			 0.0.0.0 first.example.net second.example.net\n\
+			 commented.example.org  # and a note about it\n",
 		);
 
 		assert!(list.blocks("ads.example.com"));
 		assert!(list.blocks("tracker.example.net"));
 		assert!(list.blocks("bare.example.org"));
 		assert!(list.blocks("anchored.example.com"));
-		assert!(list.blocks("options.example.com"));
+		assert!(
+			list.blocks("first.example.net") && list.blocks("second.example.net"),
+			"a hosts line may name several, and all but the first were dropped"
+		);
+		assert!(
+			list.blocks("commented.example.org"),
+			"a trailing comment lost the whole line"
+		);
+	}
+
+	/// The options are what scopes an Adblock rule. Stripping them turns
+	/// `||cdn.example^$third-party` — block this only when something else
+	/// embeds it — into a block on the site you typed in, and turns
+	/// `@@||tracker.example^$document` into a blanket allowance that quietly
+	/// defeats a hosts-file block of the same name from another list. mach5
+	/// cannot evaluate either scope, so it honours neither rule.
+	#[test]
+	fn a_rule_whose_scope_cannot_be_read_is_not_honoured() {
+		let scoped = list(
+			"0.0.0.0 tracker.example\n\
+			 ||cdn.example^$third-party\n\
+			 @@||tracker.example^$document\n",
+		);
+
+		assert!(
+			!scoped.blocks("cdn.example"),
+			"a conditional block must not become an unconditional one"
+		);
+		assert!(
+			scoped.blocks("tracker.example"),
+			"nor a conditional exception an unconditional one"
+		);
+
+		// Without options, both still work exactly as before.
+		let plain = list("0.0.0.0 tracker.example\n@@||tracker.example^\n||cdn.example^\n");
+		assert!(plain.blocks("cdn.example"));
+		assert!(!plain.blocks("tracker.example"));
 	}
 
 	#[test]

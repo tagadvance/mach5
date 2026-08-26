@@ -187,6 +187,24 @@ enabled = true
 # rather mach5 did not modify the page at all.
 # exclude = ["bank.example"]
 
+# Mark off-screen images `loading="lazy"`, so a browser fetches them when they
+# are needed rather than all at once. On a high-latency link the win is round
+# trips rather than bytes, which is the thing that hurts there.
+#
+# A site that already does this well sees no change — the Guardian gained four
+# out of a hundred and eighteen, Wikipedia none. The value is for the sites that
+# never got round to it, which is most of them.
+lazy_images = true
+
+# How many images to leave alone at the top of a page.
+#
+# Lazy-loading the image someone actually came to see makes the page slower, not
+# faster: it is the documented way to ruin Largest Contentful Paint. The first
+# images in a document are the ones most likely to be it, so they are left
+# eager. An `<img>` whose author wrote `loading` or `fetchpriority` is never
+# touched at all — they have already thought about this.
+eager_images = 3
+
 [upstream]
 # Which of an origin's addresses mach5 tries first.
 #

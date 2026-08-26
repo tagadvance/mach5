@@ -225,7 +225,13 @@ pub fn streamer_for(
 		return None;
 	}
 
-	Streamer::new(&head.headers)
+	Streamer::new(
+		&head.headers,
+		Lazy {
+			enabled: config.inject.lazy_images,
+			eager: config.inject.eager_images,
+		},
+	)
 }
 
 /// One set of exclusions for the process, as with everything else built per
@@ -234,6 +240,45 @@ pub fn shared(config: &Config) -> Arc<Inject> {
 	static SHARED: std::sync::OnceLock<Arc<Inject>> = std::sync::OnceLock::new();
 
 	SHARED.get_or_init(|| Arc::new(Inject::new(config))).clone()
+}
+
+/// How to treat a page's images.
+#[derive(Debug, Clone, Copy)]
+pub struct Lazy {
+	pub enabled: bool,
+	/// How many to leave alone at the top of the document.
+	pub eager: usize,
+}
+
+/// Mark one image as deferrable, unless it is one of the first — or unless the
+/// author already said what they wanted.
+///
+/// The reason for `eager` is that lazy-loading the image someone came to see
+/// makes the page slower, not faster: it is the documented way to ruin Largest
+/// Contentful Paint. A streaming parser sees elements in document order, so
+/// "the first few" is simply the first few this handler is called for.
+///
+/// An author who wrote `loading` or `fetchpriority` has already thought about
+/// this, and is not to be argued with.
+fn defer(el: &mut lol_html::html_content::Element, seen: &Rc<Cell<usize>>, lazy: Lazy) {
+	let nth = seen.get();
+	seen.set(nth + 1);
+
+	if !lazy.enabled || nth < lazy.eager {
+		return;
+	}
+
+	if el.get_attribute("loading").is_some() || el.get_attribute("fetchpriority").is_some() {
+		return;
+	}
+
+	let _ = el.set_attribute("loading", "lazy");
+
+	// Free while we are here, and for the same reason: decoding off the main
+	// thread is only ever a gain for something not being looked at yet.
+	if el.get_attribute("decoding").is_none() {
+		let _ = el.set_attribute("decoding", "async");
+	}
 }
 
 /// Rewriting a page as it arrives, rather than after it has all arrived.
@@ -264,7 +309,7 @@ type Sink = Box<dyn FnMut(&[u8])>;
 impl Streamer {
 	/// `None` when this response is not one to rewrite on the fly, in which
 	/// case the caller relays it as it always did.
-	pub fn new(response_headers: &[(String, String)]) -> Option<Self> {
+	pub fn new(response_headers: &[(String, String)], lazy: Lazy) -> Option<Self> {
 		let coding = crate::encoding::coding_of(response_headers);
 		// A coding named but not understood cannot be decoded, so the bytes
 		// cannot be parsed, so there is nothing to do but pass them through.
@@ -277,6 +322,10 @@ impl Streamer {
 		let injected = Rc::new(Cell::new(false));
 		let into_head = injected.clone();
 		let into_body = injected;
+
+		// Counted across the document, which a streaming parser gives for free:
+		// handlers fire in the order the elements appear.
+		let seen = Rc::new(Cell::new(0usize));
 
 		let sink = out.clone();
 		let settings = Settings::new()
@@ -292,6 +341,11 @@ impl Streamer {
 					el.prepend(TAGS, ContentType::Html);
 					into_body.set(true);
 				}
+
+				Ok(())
+			}))
+			.append_element_content_handler(element!("img", move |el| {
+				defer(el, &seen, lazy);
 
 				Ok(())
 			}));
@@ -648,11 +702,101 @@ mod tests {
 		);
 	}
 
+	/// Push a whole document through the streamer in one go, which is what the
+	/// front ends do a chunk at a time.
+	fn stream(html: &[u8], lazy: Lazy) -> String {
+		let mut streamer = Streamer::new(&headers(&[("content-type", "text/html")]), lazy)
+			.expect("a page");
+		let mut out = streamer.push(html);
+		out.extend(streamer.finish());
+
+		String::from_utf8(out).expect("utf-8 in, utf-8 out")
+	}
+
+	fn lazily() -> Lazy {
+		Lazy {
+			enabled: true,
+			eager: 2,
+		}
+	}
+
+	#[test]
+	fn images_past_the_first_few_are_deferred() {
+		let page = stream(
+			b"<html><body><img src=1><img src=2><img src=3><img src=4></body></html>",
+			lazily(),
+		);
+
+		assert_eq!(
+			page.matches("loading=\"lazy\"").count(),
+			2,
+			"the first two stay eager: {page}"
+		);
+		assert!(
+			page.contains(r#"<img src=1><img src=2><img src=3 loading="lazy""#),
+			"and it is the first two, in document order: {page}"
+		);
+		assert!(
+			page.contains("<img src=1><img src=2>"),
+			"the author's own markup is left as it was written: {page}"
+		);
+	}
+
+	/// Lazy-loading the image someone came to see is the documented way to ruin
+	/// Largest Contentful Paint, and the top of the document is where it is.
+	#[test]
+	fn the_top_of_the_page_is_left_alone() {
+		let page = stream(b"<html><body><img src=hero></body></html>", lazily());
+
+		assert!(!page.contains("loading"), "{page}");
+	}
+
+	#[test]
+	fn an_author_who_already_decided_is_not_argued_with() {
+		let page = stream(
+			br#"<html><body><img src=1><img src=2><img src=3 loading="eager"><img src=4 fetchpriority="high"></body></html>"#,
+			lazily(),
+		);
+
+		assert!(page.contains(r#"loading="eager""#), "{page}");
+		assert!(
+			!page.contains(r#"loading="lazy""#),
+			"neither of the last two is ours to change: {page}"
+		);
+	}
+
+	#[test]
+	fn deferring_can_be_switched_off() {
+		let page = stream(
+			b"<html><body><img src=1><img src=2><img src=3></body></html>",
+			Lazy {
+				enabled: false,
+				eager: 0,
+			},
+		);
+
+		assert!(!page.contains("loading"), "{page}");
+	}
+
+	#[test]
+	fn a_deferred_image_also_decodes_off_the_main_thread() {
+		let page = stream(
+			br#"<html><body><img src=1><img src=2><img src=3><img src=4 decoding="sync"></body></html>"#,
+			lazily(),
+		);
+
+		assert!(page.contains(r#"src=3 loading="lazy" decoding="async""#), "{page}");
+		assert!(
+			page.contains(r#"decoding="sync""#),
+			"and an author's own choice survives: {page}"
+		);
+	}
+
 	#[test]
 	fn only_a_html_page_is_rewritten() {
 		for content_type in ["text/html; charset=utf-8", "TEXT/HTML"] {
 			assert!(
-				Streamer::new(&headers(&[("content-type", content_type)])).is_some(),
+				Streamer::new(&headers(&[("content-type", content_type)]), lazily()).is_some(),
 				"{content_type} is a page"
 			);
 		}

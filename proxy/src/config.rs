@@ -334,6 +334,16 @@ pub struct Inject {
 	/// Hosts left exactly as the origin sent them. A parent domain covers its
 	/// subdomains, as in the blocklist.
 	pub exclude: Vec<String>,
+	/// Mark off-screen images `loading="lazy"`, so a browser fetches them when
+	/// they are needed rather than all at once. On a high-latency link the win
+	/// is round trips, not bytes.
+	pub lazy_images: bool,
+	/// How many images to leave alone at the top of a page.
+	///
+	/// Lazy-loading the image someone actually came to see makes the page
+	/// *slower* — it is the documented way to ruin Largest Contentful Paint —
+	/// and the first images in a document are the ones most likely to be it.
+	pub eager_images: usize,
 }
 
 impl Default for Inject {
@@ -341,6 +351,8 @@ impl Default for Inject {
 		Self {
 			enabled: true,
 			exclude: Vec::new(),
+			lazy_images: true,
+			eager_images: 3,
 		}
 	}
 }

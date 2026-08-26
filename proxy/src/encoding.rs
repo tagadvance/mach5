@@ -37,6 +37,11 @@ const COMPRESSIBLE_TYPES: [&str; 8] = [
 	"image/svg+xml",
 ];
 
+/// How much of a chunk to hand the decompressor before looking at what came
+/// out. Small enough that a bomb is caught early, large enough that an ordinary
+/// page costs a handful of iterations.
+const SLICE_SIZE: usize = 8 * 1024;
+
 const BUFFER_SIZE: usize = 8192;
 /// Cheap enough to sit in the request path; we are re-compressing for one hop
 /// on the local network, not for a CDN cache.
@@ -336,22 +341,46 @@ impl Decoder {
 		}
 	}
 
-	/// Feed encoded bytes in, take whatever plain bytes came out.
-	pub fn push(&mut self, chunk: &[u8]) -> std::io::Result<Vec<u8>> {
-		match self {
-			Self::Gzip(inner) => {
-				inner.write_all(chunk)?;
-				inner.flush()?;
+	/// Feed encoded bytes in, take whatever plain bytes came out — refusing to
+	/// produce more than `limit` from one chunk.
+	///
+	/// [`decode`] bounds a whole buffered body, and never sees this path: HTML
+	/// is not cacheable, so a page always streams. A compressed chunk says
+	/// nothing about how much comes out of it — brotli's window makes 64KB into
+	/// hundreds of megabytes on the right input, per concurrent stream — so the
+	/// bound has to be here too.
+	///
+	/// Fed in slices and measured between them, so the overshoot is one slice's
+	/// expansion rather than the whole chunk's.
+	pub fn push(&mut self, chunk: &[u8], limit: usize) -> std::io::Result<Vec<u8>> {
+		let mut out = Vec::new();
 
-				Ok(std::mem::take(inner.get_mut()))
-			}
-			Self::Brotli(inner) => {
-				inner.write_all(chunk)?;
-				inner.flush()?;
+		for slice in chunk.chunks(SLICE_SIZE) {
+			let produced = match self {
+				Self::Gzip(inner) => {
+					inner.write_all(slice)?;
+					inner.flush()?;
 
-				Ok(std::mem::take(inner.get_mut()))
+					std::mem::take(inner.get_mut())
+				}
+				Self::Brotli(inner) => {
+					inner.write_all(slice)?;
+					inner.flush()?;
+
+					std::mem::take(inner.get_mut())
+				}
+			};
+			out.extend_from_slice(&produced);
+
+			if out.len() > limit {
+				return Err(std::io::Error::new(
+					std::io::ErrorKind::InvalidData,
+					format!("one chunk inflates past the {limit} byte limit"),
+				));
 			}
 		}
+
+		Ok(out)
 	}
 
 }

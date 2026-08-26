@@ -247,6 +247,7 @@ pub fn streamer_for(
 			eager: config.inject.eager_images,
 		},
 		output,
+		config.stream_buffer_bytes(),
 	)?;
 
 	if crate::encoding::coding_of(&head.headers).is_none() {
@@ -319,6 +320,9 @@ fn defer(el: &mut lol_html::html_content::Element, seen: &Rc<Cell<usize>>, lazy:
 /// latency.
 pub struct Streamer {
 	decoder: Option<crate::encoding::Decoder>,
+	/// The most one chunk may inflate to. A compressed chunk says nothing about
+	/// how much comes out of it, and a page always takes this path.
+	inflate_limit: usize,
 	encoder: Option<crate::encoding::Encoder>,
 	rewriter: HtmlRewriter<'static, Sink>,
 	out: Rc<RefCell<Vec<u8>>>,
@@ -354,6 +358,7 @@ impl Streamer {
 		response_headers: &[(String, String)],
 		lazy: Lazy,
 		output: Option<crate::encoding::Coding>,
+		inflate_limit: usize,
 	) -> Option<Self> {
 		let coding = crate::encoding::coding_of(response_headers);
 		// A coding named but not understood cannot be decoded, so the bytes
@@ -408,6 +413,7 @@ impl Streamer {
 			// in the clear is compressed on the way out, and one that arrived
 			// compressed keeps the coding it came in.
 			decoder: coding.map(crate::encoding::Decoder::new),
+			inflate_limit,
 			encoder: output.map(crate::encoding::Encoder::new),
 			rewriter: HtmlRewriter::new(
 				settings,
@@ -425,7 +431,7 @@ impl Streamer {
 		}
 
 		let plain = match self.decoder.as_mut() {
-			Some(decoder) => match decoder.push(chunk) {
+			Some(decoder) => match decoder.push(chunk, self.inflate_limit) {
 				Ok(plain) => plain,
 				Err(e) => {
 					log::debug!("no longer reading this page: {e}");
@@ -771,13 +777,17 @@ mod tests {
 	/// Push a whole document through the streamer in one go, which is what the
 	/// front ends do a chunk at a time.
 	fn stream(html: &[u8], lazy: Lazy) -> String {
-		let mut streamer = Streamer::new(&headers(&[("content-type", "text/html")]), lazy, None)
-			.expect("a page");
+		let mut streamer =
+			Streamer::new(&headers(&[("content-type", "text/html")]), lazy, None, NO_LIMIT)
+				.expect("a page");
 		let mut out = streamer.push(html);
 		out.extend(streamer.finish());
 
 		String::from_utf8(out).expect("utf-8 in, utf-8 out")
 	}
+
+	/// For the tests that are about rewriting rather than about the bomb guard.
+	const NO_LIMIT: usize = usize::MAX;
 
 	fn lazily() -> Lazy {
 		Lazy {
@@ -831,6 +841,7 @@ mod tests {
 			]),
 			lazily(),
 			Some(crate::encoding::Coding::Gzip),
+			NO_LIMIT,
 		)
 		.expect("a page")
 	}
@@ -871,6 +882,43 @@ mod tests {
 			page.matches("<p>after</p>").count(),
 			1,
 			"exactly once — a give-up must not send the same bytes twice: {page}"
+		);
+	}
+
+	/// A page always takes the streaming path — HTML is never cacheable — so
+	/// `decode`'s ceiling never applies to one. A compressed chunk says nothing
+	/// about how much comes out of it, and without a bound here a single 64KB
+	/// chunk of a bomb is hundreds of megabytes, per concurrent stream.
+	#[test]
+	fn a_chunk_that_inflates_past_the_limit_stops_the_body() {
+		let bomb = {
+			use std::io::Write;
+
+			let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+			e.write_all(&vec![b' '; 8 * 1024 * 1024]).expect("gzip");
+
+			e.finish().expect("gzip")
+		};
+		assert!(bomb.len() < 64 * 1024, "the point is the ratio: {}", bomb.len());
+
+		let mut streamer = Streamer::new(
+			&headers(&[("content-type", "text/html"), ("content-encoding", "gzip")]),
+			lazily(),
+			Some(crate::encoding::Coding::Gzip),
+			256 * 1024,
+		)
+		.expect("a page");
+
+		let mut out = streamer.push(&bomb);
+		out.extend(streamer.finish());
+
+		// Refused, and the coding still closed — a client that cannot inflate
+		// what it was sent throws the whole page away.
+		let page = gunzip(&out);
+		assert!(
+			page.len() <= 256 * 1024 + 8 * 1024,
+			"it stopped at the limit rather than holding all eight megabytes: {}",
+			page.len()
 		);
 	}
 
@@ -993,7 +1041,8 @@ mod tests {
 	fn only_a_html_page_is_rewritten() {
 		for content_type in ["text/html; charset=utf-8", "TEXT/HTML"] {
 			assert!(
-				Streamer::new(&headers(&[("content-type", content_type)]), lazily(), None).is_some(),
+				Streamer::new(&headers(&[("content-type", content_type)]), lazily(), None, NO_LIMIT)
+					.is_some(),
 				"{content_type} is a page"
 			);
 		}

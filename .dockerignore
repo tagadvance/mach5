@@ -1,15 +1,5 @@
 # Build artefacts — never ship a host-built binary into the image.
 proxy/target/
-app/build/
-build/
-.gradle/
-
-# The Java prototype is not part of the proxy image.
-app/
-gradle/
-gradlew
-gradlew.bat
-settings.gradle.kts
 
 .git/
 .idea/

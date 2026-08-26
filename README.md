@@ -5,8 +5,7 @@ on the fly for whatever host the client asked for, signed by a root CA installed
 on the device. That gives it every byte of every page, which is the point: ad
 blocking, cosmetic filtering, JavaScript injection, and on-the-fly rewriting.
 
-`proxy/` is the live implementation, in Rust on Cloudflare's quiche. `app/` is an
-abandoned Java prototype, kept only for reference.
+`proxy/` is the implementation, in Rust on Cloudflare's quiche.
 
 ## What it does
 

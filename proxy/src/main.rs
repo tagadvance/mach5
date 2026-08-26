@@ -397,10 +397,19 @@ fn handle_job(
 		// before the hand-off is what stops a stalled client turning into an
 		// unbounded queue on the event loop's side; `false` means the stream
 		// is gone, which reads to the caller exactly like a closed channel.
-		if let Payload::Chunk(chunk) = &payload {
-			if !job.budget.claim(chunk.len()) {
-				return Err(Gone::Stream);
-			}
+		//
+		// A whole buffered body counts too. It is bounded per response by
+		// `max_response_body_mb`, but nothing bounded how many of them could be
+		// queued at once: a client opening its hundred streams for large images
+		// and then not reading left every one of those bodies sitting in the
+		// event loop's memory until the connection idled out.
+		let claiming = match &payload {
+			Payload::Chunk(chunk) => chunk.len(),
+			Payload::Full(response) => response.body.len(),
+			_ => 0,
+		};
+		if claiming > 0 && !job.budget.claim(claiming) {
+			return Err(Gone::Stream);
 		}
 
 		results
@@ -1161,6 +1170,15 @@ fn send_full(
 	} else {
 		payload
 	};
+
+	// Claimed like any other body, so the event loop's books balance: it
+	// releases whatever it pops, and a release with no matching claim would
+	// quietly under-count every later response on the stream.
+	if let Payload::Full(response) = &payload {
+		if !response.body.is_empty() && !job.budget.claim(response.body.len()) {
+			return Err(Gone::Stream);
+		}
+	}
 
 	results
 		.send(FetchResult {

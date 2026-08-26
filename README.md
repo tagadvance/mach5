@@ -14,7 +14,9 @@ blocking, cosmetic filtering, JavaScript injection, and on-the-fly rewriting.
   starts there and moves itself over once it sees the `Alt-Svc` header.
 - **Blocks domains.** hosts files, bare domain lists and Adblock `||domain^`
   anchors, fetched on a schedule and cached. A blocked request is answered
-  locally — 204, or a transparent pixel if an image was expected.
+  locally — 204, or a transparent pixel if an image was expected. `$third-party`
+  is honoured; a rule scoped by anything else mach5 cannot evaluate is skipped
+  rather than applied more widely than it was written.
 - **Hides elements.** Adblock cosmetic rules (`domain##selector`) from filter
   lists, plus anything hidden by hand: press `Ctrl+Shift+H` on a page, click an
   element, and it stays hidden on the next visit. Both are served back as a

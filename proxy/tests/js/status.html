@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mach5</title>
+<style>
+:root { color-scheme: light dark; }
+body {
+  margin: 0; min-height: 100vh; display: flex; align-items: center;
+  justify-content: center; padding: 2rem;
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: #fff; color: #202124;
+}
+main { max-width: 42rem; }
+.mark { font-size: 3.5rem; line-height: 1; color: #b0b3b8; margin-bottom: 1rem; }
+h1 { font-size: 1.65rem; font-weight: 500; margin: 0 0 1rem; }
+.lede { font-size: 1.05rem; }
+p { margin: 0 0 1rem; }
+details { margin: 1.5rem 0; }
+summary { cursor: pointer; color: #1a73e8; }
+.detail { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .85rem; word-break: break-word; margin-top: .75rem; }
+.note { font-size: .9rem; color: #5f6368; }
+.actions { margin-top: 2rem; }
+button {
+  font: inherit; font-size: .95rem; padding: .55rem 1.1rem; border: 0;
+  border-radius: 4px; background: #1a73e8; color: #fff; cursor: pointer;
+}
+button:hover { background: #1867cf; }
+@media (prefers-color-scheme: dark) {
+  body { background: #202124; color: #e8eaed; }
+  .note { color: #9aa0a6; }
+  summary { color: #8ab4f8; }
+  button { background: #8ab4f8; color: #202124; }
+  button:hover { background: #aecbfa; }
+}
+</style>
+<style>
+body { align-items: flex-start; }
+table { border-collapse: collapse; width: 100%; margin: 0 0 1rem; }
+th, td { padding: .35rem 0; font-weight: 400; text-align: left; }
+td { text-align: right; font-variant-numeric: tabular-nums; }
+td .note { font-size: .8rem; }
+h2 { font-size: 1.1rem; font-weight: 500; margin: 2rem 0 .75rem; }
+ul { list-style: none; margin: 0; padding: 0; }
+li { display: flex; align-items: center; justify-content: space-between;
+  gap: 1rem; padding: .35rem 0; }
+li button { font-size: .8rem; padding: .3rem .7rem; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .85rem; word-break: break-all; }
+</style>
+</head>
+<body>
+<main>
+  <h1>mach5</h1>
+  <p class="lede">Running for 2s.</p>
+  <p class="note"><a href="/.mach5/ca">Install the mach5 root certificate</a> on a device before anything else here works &mdash; on a phone it usually lands in Settings rather than in the browser. This is the configured root CA.</p>
+  <table>
+    <tr><th>Requests</th><td>2</td></tr>
+    <tr><th>Blocked</th><td class="note">no blocklist loaded</td></tr>
+    <tr><th>Cosmetic rules</th><td class="note">no cosmetic lists loaded</td></tr>
+    <tr><th>mach5 endpoints</th><td>2</td></tr>
+    <tr><th>Pages injected</th><td>0</td></tr>
+    <tr><th>Passed through undecrypted</th><td>0</td></tr>
+    <tr><th>Panel in pages</th><td>on <button data-set='{"image_quality":"auto","inject":"off"}'>turn off</button></td></tr>
+    <tr><th>Origins reachable</th><td class="note">nothing looked up yet</td></tr>
+    <tr><th>Cache</th><td>0 B <span class="note">from re-encoding · 0 B not re-fetched · 0 served, 0 revalidated</span> <button data-post="/.mach5/cache/clear">empty it</button></td></tr>
+    <tr><th>Fetched unvalidated</th><td>0</td></tr>
+    <tr><th>Certificate failures</th><td>0</td></tr>
+    <tr><th>Other upstream failures</th><td>0</td></tr>
+    <tr><th>Body bytes from origins</th><td>0 B</td></tr>
+    <tr><th>Body bytes to clients</th><td>0 B</td></tr>
+    <tr><th>Bytes saved compressing</th><td>0 B</td></tr>
+    <tr><th>Saved by re-encoding images</th><td>0 B</td></tr>
+  </table>
+  
+  <h2>localhost</h2>
+  <p class="note">This site&rsquo;s certificate is being validated normally.</p>
+  <ul><li><code>#ad-slot</code><button data-selector="#ad-slot">Remove</button></li></ul>
+</main>
+<script>
+addEventListener('click', (e) => {
+	const control = e.target.closest('button[data-selector]');
+	if (control) {
+		fetch('/.mach5/hidden/remove', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ selector: control.dataset.selector }),
+		}).then(() => location.reload(), () => {});
+
+		return;
+	}
+
+	const action = e.target.closest('button[data-post]');
+	if (action) {
+		fetch(action.dataset.post, { method: 'POST' }).then(() => location.reload(), () => {});
+
+		return;
+	}
+
+	const setting = e.target.closest('button[data-set]');
+	if (setting) {
+		fetch('/.mach5/settings', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: setting.dataset.set,
+		}).then(() => location.reload(), () => {});
+	}
+});
+</script>
+</body>
+</html>

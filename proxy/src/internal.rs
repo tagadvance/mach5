@@ -655,6 +655,10 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 /// This is the one page in mach5 that is ours end to end, so an inline script is
 /// safe here in a way it would not be on somebody else's site: no CSP of ours to
 /// work around, and nothing on the page that a site could have written.
+///
+/// Each fetch carries a rejection handler because without one a failed POST is
+/// an unhandled rejection rather than a click that did nothing. Doing nothing is
+/// the honest outcome: the page is only worth reloading if the change landed.
 const REMOVE: &str = r#"<script>
 addEventListener('click', (e) => {
 	const control = e.target.closest('button[data-selector]');
@@ -663,14 +667,14 @@ addEventListener('click', (e) => {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ selector: control.dataset.selector }),
-		}).then(() => location.reload());
+		}).then(() => location.reload(), () => {});
 
 		return;
 	}
 
 	const action = e.target.closest('button[data-post]');
 	if (action) {
-		fetch(action.dataset.post, { method: 'POST' }).then(() => location.reload());
+		fetch(action.dataset.post, { method: 'POST' }).then(() => location.reload(), () => {});
 
 		return;
 	}
@@ -681,7 +685,7 @@ addEventListener('click', (e) => {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
 			body: setting.dataset.set,
-		}).then(() => location.reload());
+		}).then(() => location.reload(), () => {});
 	}
 });
 </script>"#;

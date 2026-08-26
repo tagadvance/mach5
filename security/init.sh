@@ -70,11 +70,12 @@ chmod 644 "$cert"
 echo
 openssl x509 -in "$cert" -noout -subject -dates
 echo
-echo "Point mach5 at them:"
+echo "Point mach5 at them. mach5.toml already has a [ca] section — uncomment the"
+echo "two lines in it, do not paste a second [ca] header or TOML will refuse the"
+echo "file with \"duplicate key\":"
 echo
-echo "  [ca]"
 echo "  cert = \"security/$cert\""
 echo "  key = \"security/$key\""
 echo
 echo "Then install the certificate on each device — mach5 serves it at"
-echo "/.mach5/ca once it is running."
+echo "/.mach5/ca once it is running. Read SECURITY.md first if you have not."

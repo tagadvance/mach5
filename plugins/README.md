@@ -75,6 +75,14 @@ whichever front end is speaking to the client, and it recomputes them from the
 body actually sent. A `content-length` of your own would simply be a lie about
 a body only mach5 knows the size of.
 
+**A chunk plugin and a cacheable response do not mix.** The chunk hooks run on
+responses that *stream*, and a response mach5 wants to put in the origin cache
+is buffered instead — so a `"chunks": true` plugin sees nothing at all for one.
+It is not silent about it: the first time says so in the log with the URL and
+what to do, and the count sits beside your plugin on the `/.mach5/` status page
+under "not shown". Narrow your `match` so it does not claim cacheable
+responses, or turn the origin cache off with `[images] origin_cache_mb = 0`.
+
 **One reply per hook, and it must parse.** There is no request id in the
 protocol — replies are matched to hooks by order — so a line that is not a
 reply puts the two sides permanently out of step. mach5 abandons a plugin that

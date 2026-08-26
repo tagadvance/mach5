@@ -695,6 +695,9 @@ table { border-collapse: collapse; width: 100%; margin: 0 0 1rem; }
 th, td { padding: .35rem 0; font-weight: 400; text-align: left; }
 td { text-align: right; font-variant-numeric: tabular-nums; }
 td .note { font-size: .8rem; }
+/* Only ever used for a plugin that is not seeing what it asked for, which is
+   the one thing on this page somebody is hunting for rather than reading. */
+td .warn { font-size: .8rem; font-weight: 500; }
 h2 { font-size: 1.1rem; font-weight: 500; margin: 2rem 0 .75rem; }
 ul { list-style: none; margin: 0; padding: 0; }
 li { display: flex; align-items: center; justify-content: space-between;
@@ -952,8 +955,20 @@ fn plugin_table(plugins: &BTreeMap<String, PluginStats>) -> String {
 	let rows: String = plugins
 		.iter()
 		.map(|(name, stats)| {
+			// Only when it has happened, and loudly when it has: a plugin that
+			// is not firing looks like a broken plugin, and this is the one
+			// place that says it is not.
+			let skipped = if stats.skipped == 0 {
+				String::new()
+			} else {
+				format!(
+					r#" <span class="warn">· {} not shown: asked for chunks, but the 					response was buffered to be cached</span>"#,
+					metrics::thousands(stats.skipped)
+				)
+			};
+
 			format!(
-				r#"<tr><th>{}</th><td>{} <span class="note">calls, {} each</span></td></tr>"#,
+				r#"<tr><th>{}</th><td>{} <span class="note">calls, {} each</span>{skipped}</td></tr>"#,
 				escape(name),
 				metrics::thousands(stats.calls),
 				metrics::duration(std::time::Duration::from_micros(stats.mean_micros))
@@ -2155,7 +2170,7 @@ mod tests {
 		assert_eq!(
 			stats["plugins"],
 			serde_json::json!({
-				"rewrite.py": { "calls": 2, "total_micros": 3000, "mean_micros": 1500 }
+				"rewrite.py": { "calls": 2, "total_micros": 3000, "mean_micros": 1500, "skipped": 0 }
 			}),
 			"what each plugin cost, keyed by name"
 		);

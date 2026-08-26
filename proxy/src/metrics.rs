@@ -48,6 +48,11 @@ impl Counter {
 pub struct PluginTime {
 	pub calls: u64,
 	pub total: Duration,
+	/// Responses this plugin asked to see and was not shown. There is exactly
+	/// one way that happens — a chunk plugin whose response was buffered for
+	/// the cache — and the whole reason it is counted is that the symptom
+	/// otherwise is "my plugin does not run" with nothing to look at.
+	pub skipped: u64,
 }
 
 /// Every counter the proxy keeps, plus the moment it started.
@@ -157,6 +162,17 @@ impl Metrics {
 		time.total += elapsed;
 	}
 
+	/// A response this plugin wanted and did not get. Returns how many times it
+	/// has now happened, so the caller can say it loudly the first time and
+	/// quietly afterwards.
+	pub fn record_plugin_skip(&self, name: &str) -> u64 {
+		let mut plugins = self.plugins.lock().expect("plugin timing lock");
+		let time = plugins.entry(name.to_string()).or_default();
+		time.skipped += 1;
+
+		time.skipped
+	}
+
 	/// Read every counter once.
 	///
 	/// The page and the JSON are both rendered from one of these rather than
@@ -209,6 +225,7 @@ pub struct PluginStats {
 	pub calls: u64,
 	pub total_micros: u64,
 	pub mean_micros: u64,
+	pub skipped: u64,
 }
 
 impl PluginStats {
@@ -221,6 +238,7 @@ impl PluginStats {
 			// A recorded plugin has been called at least once, so the guard is
 			// only here to keep a division from depending on that.
 			mean_micros: total_micros / time.calls.max(1),
+			skipped: time.skipped,
 		}
 	}
 }

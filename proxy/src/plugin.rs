@@ -581,19 +581,33 @@ impl Interceptor for Plugin {
 		//
 		// Said out loud, because what happens instead is that the plugin sees
 		// *nothing* for this response: the chunk hooks only run on the
-		// streaming branch, which `worth_keeping` took it off. Wrong either
-		// way, and silence is the worse of the two. Closing it properly is a
-		// contract decision — skip storing when a chunk plugin is interested,
-		// or run the chunk hooks over the buffered body at the point the
-		// encoding still matches — so it is written down rather than guessed
-		// at. See HANDOVER.md.
+		// streaming branch, which `worth_keeping` took it off.
+		//
+		// The symptom on its own is "my plugin does not fire", with no error
+		// and nothing in the log — which is a bad evening for whoever inherits
+		// it. So the first one explains itself in full, the rest are counted,
+		// and the count sits beside the plugin on the status page, which is
+		// where somebody debugging this will actually be looking.
 		if self.chunks {
-			log::warn!(
-				"plugin {} takes chunks, but this response was buffered for the \
-				 cache, so it sees none of it: {}",
-				self.name,
-				crate::redact::url(&req.url)
-			);
+			let skipped = self.metrics.record_plugin_skip(&self.name);
+			if skipped == 1 {
+				log::warn!(
+					"plugin {} asked for chunks, and this response was buffered so it \
+					 could be cached — so the plugin sees none of it. The chunk hooks \
+					 only run on responses that stream. Either narrow the plugin's \
+					 `match` so it does not claim cacheable responses, or turn the \
+					 origin cache off with [images] origin_cache_mb = 0. Counted from \
+					 here on, and shown on the /.mach5/ status page. First was: {}",
+					self.name,
+					crate::redact::url(&req.url)
+				);
+			} else {
+				log::debug!(
+					"plugin {} takes chunks and this response was buffered ({skipped} so far): {}",
+					self.name,
+					crate::redact::url(&req.url)
+				);
+			}
 
 			return;
 		}
@@ -824,8 +838,16 @@ mod tests {
 
 		static SPAWNING: Mutex<()> = Mutex::new(());
 
+		// A distinct name per fixture. The metrics are process-global and keyed
+		// by the plugin's filename, so two fixtures called the same thing share
+		// a row and each other's counts.
+		static NTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 		let dir = tempfile::TempDir::new().unwrap();
-		let path = dir.path().join("plugin");
+		let path = dir.path().join(format!(
+			"plugin{}",
+			NTH.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+		));
 
 		for attempt in 0..10 {
 			let guard = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
@@ -991,6 +1013,43 @@ mod tests {
 		let mut line = Vec::new();
 		assert_eq!(read_line_capped(&mut source, &mut line, 512).unwrap(), 6);
 		assert_eq!(line, b"first", "and the newline is not part of it");
+	}
+
+	/// A plugin that does not fire looks exactly like a broken plugin. This is
+	/// the one path where mach5 declines to call one it was asked to call, so
+	/// it has to be the one path that says so — in the log the first time, and
+	/// on the status page from then on.
+	#[test]
+	fn a_chunk_plugin_that_is_skipped_says_so_where_someone_will_look() {
+		let (_dir, plugin) = plugin_from(
+			"#!/bin/sh\nread -r line\nprintf '{\"match\":{},\"chunks\":true}\\n'\n\
+			 while read -r line; do printf '{\"body_b64\":\"c2Vlbg==\"}\\n'; done\n",
+			Duration::from_secs(3),
+		);
+
+		let mut buffered = ProxyResponse {
+			status: 200,
+			headers: vec![("content-type".to_string(), "text/html".to_string())],
+			body: b"original".to_vec(),
+		};
+		plugin.on_response(&req(), &mut buffered);
+		plugin.on_response(&req(), &mut buffered);
+
+		assert_eq!(buffered.body, b"original", "it saw none of it");
+
+		let counted = plugin
+			.metrics
+			.snapshot()
+			.plugins
+			.get(&plugin.name)
+			.map(|stats| stats.skipped);
+
+		assert_eq!(
+			counted,
+			Some(2),
+			"and both times are on the status page, because the symptom on its \
+			 own is silence"
+		);
 	}
 
 	/// The filter is the thing that decides what a plugin sees, and until now no

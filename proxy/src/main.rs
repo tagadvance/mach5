@@ -68,7 +68,11 @@ struct FetchJob {
 	request: ProxyRequest,
 	/// The body still arriving, when there is one, and the length the client
 	/// declared for it.
-	upload: Option<(tokio::sync::mpsc::Receiver<body::Chunk>, Option<u64>)>,
+	upload: Option<(
+		tokio::sync::mpsc::Receiver<body::Chunk>,
+		body::Ending,
+		Option<u64>,
+	)>,
 	/// How much of the response may be in flight at once. See [`budget`].
 	budget: Arc<budget::Budget>,
 }
@@ -156,6 +160,9 @@ struct Client {
 /// reading the other end of its channel.
 struct Upload {
 	chunks: tokio::sync::mpsc::Sender<body::Chunk>,
+	/// Told apart from a body that simply ended, so a stream the client reset
+	/// does not become a shorter but perfectly well-formed request upstream.
+	ending: body::Ending,
 	/// Bytes read off the stream that the channel had no room for. The event
 	/// loop must never block, so a full channel parks chunks here instead —
 	/// bounded, because parking without a bound is just buffering again.
@@ -965,16 +972,25 @@ fn poll_requests(
 						// the body follows it down a channel, so a large upload
 						// is never assembled anywhere.
 						let (chunks, receiver) = body::channel();
+						let ending = body::Ending::default();
 						uploads.insert(
 							stream_id,
 							Upload {
 								chunks,
+								ending: ending.clone(),
 								overflow: VecDeque::new(),
 								parked: 0,
 								finished: false,
 							},
 						);
-						dispatch(key, stream_id, request, Some((receiver, length)), jobs, park_cap);
+						dispatch(
+							key,
+							stream_id,
+							request,
+							Some((receiver, ending, length)),
+							jobs,
+							park_cap,
+						);
 					}
 					None => log::warn!("stream={stream_id} missing pseudo-headers; ignoring"),
 				}
@@ -990,9 +1006,12 @@ fn poll_requests(
 			}
 			Ok((stream_id, quiche::h3::Event::Reset(code))) => {
 				log::debug!("stream={stream_id} reset by peer (code {code})");
-				// Dropping the sender ends the worker's body early, which is
-				// the truth: the client stopped sending.
-				uploads.remove(&stream_id);
+				// A reset is the client stopping, not finishing. Saying so
+				// before the sender goes is what stops the worker forwarding a
+				// truncated upload as a complete request.
+				if let Some(upload) = uploads.remove(&stream_id) {
+					upload.ending.abort();
+				}
 			}
 			Ok((_, quiche::h3::Event::PriorityUpdate)) => {}
 			Ok((_, quiche::h3::Event::GoAway)) => {}
@@ -1100,7 +1119,11 @@ fn dispatch(
 	key: &quiche::ConnectionId<'static>,
 	stream_id: u64,
 	request: ProxyRequest,
-	upload: Option<(tokio::sync::mpsc::Receiver<body::Chunk>, Option<u64>)>,
+	upload: Option<(
+		tokio::sync::mpsc::Receiver<body::Chunk>,
+		body::Ending,
+		Option<u64>,
+	)>,
 	jobs: &Sender<FetchJob>,
 	stream_cap: usize,
 ) {

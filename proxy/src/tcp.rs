@@ -267,14 +267,23 @@ async fn handle(shared: Arc<Shared>, sni: Option<String>, req: Request<Incoming>
 	// fills the channel, which stops us taking bytes off the client.
 	let upload = (!incoming.is_end_stream() && length != Some(0)).then(|| {
 		let (chunks_tx, chunks_rx) = crate::body::channel();
+		let ending = crate::body::Ending::default();
+		let aborting = ending.clone();
 
 		tokio::spawn(async move {
 			let mut incoming = incoming;
 			while let Some(frame) = incoming.frame().await {
-				let Ok(frame) = frame else {
-					// A client that dies mid-upload closes the channel by
-					// dropping this sender, which the worker reads as an end.
-					break;
+				let frame = match frame {
+					Ok(frame) => frame,
+					// A client that dies mid-upload also drops this sender, so
+					// without saying so the worker cannot tell that from a body
+					// that ended — and forwards a truncated upload as a
+					// complete, shorter request.
+					Err(_) => {
+						aborting.abort();
+
+						break;
+					}
 				};
 				let Ok(data) = frame.into_data() else {
 					// Trailers; nothing upstream is waiting for them.
@@ -291,7 +300,7 @@ async fn handle(shared: Arc<Shared>, sni: Option<String>, req: Request<Incoming>
 			}
 		});
 
-		(chunks_rx, length)
+		(chunks_rx, ending, length)
 	});
 
 	// RFC 9110 §9.3.2: a HEAD is answered with the headers a GET would carry
@@ -352,7 +361,11 @@ enum Outcome {
 fn fetch_blocking(
 	shared: &Shared,
 	mut request: ProxyRequest,
-	upload: Option<(tokio::sync::mpsc::Receiver<crate::body::Chunk>, Option<u64>)>,
+	upload: Option<(
+		tokio::sync::mpsc::Receiver<crate::body::Chunk>,
+		crate::body::Ending,
+		Option<u64>,
+	)>,
 	head_tx: tokio::sync::oneshot::Sender<Outcome>,
 	body_tx: tokio::sync::mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
 ) {

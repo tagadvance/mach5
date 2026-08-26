@@ -34,6 +34,29 @@ pub fn channel() -> (Sender<Chunk>, Receiver<Chunk>) {
 	tokio::sync::mpsc::channel(CHANNEL_DEPTH)
 }
 
+/// Why the chunks stopped, shared between the front end filling a body and the
+/// worker reading it.
+///
+/// A dropped sender is how a front end says "that was all of it", and it is
+/// also what happens when the client dies mid-upload — so without this the two
+/// are indistinguishable, and a client that vanished at 3MB of a 10MB POST had
+/// a well-formed 3MB POST committed at the origin. `content-length` is
+/// hop-by-hop and stripped, so ureq re-frames the short body itself and the
+/// origin sees nothing wrong with it.
+#[derive(Clone, Default)]
+pub struct Ending(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Ending {
+	/// The client stopped sending before the body was complete.
+	pub fn abort(&self) {
+		self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+	}
+
+	fn aborted(&self) -> bool {
+		self.0.load(std::sync::atomic::Ordering::SeqCst)
+	}
+}
+
 /// The body of a request being forwarded, from the worker's point of view.
 pub enum RequestBody {
 	/// Nothing to send: no body, or one already read into `ProxyRequest::body`.
@@ -54,6 +77,7 @@ pub enum RequestBody {
 /// client, and reading the next chunk is exactly as long as it should wait.
 pub struct Reader {
 	chunks: Receiver<Chunk>,
+	ending: Ending,
 	/// What is left of the chunk last handed out, since a caller's buffer is
 	/// rarely the same size as a chunk.
 	rest: Chunk,
@@ -61,9 +85,10 @@ pub struct Reader {
 }
 
 impl Reader {
-	pub fn new(chunks: Receiver<Chunk>) -> Self {
+	pub fn new(chunks: Receiver<Chunk>, ending: Ending) -> Self {
 		Self {
 			chunks,
+			ending,
 			rest: Vec::new(),
 			offset: 0,
 		}
@@ -74,8 +99,18 @@ impl Read for Reader {
 	fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
 		if self.offset == self.rest.len() {
 			// The sender being dropped is how a front end says "that was all of
-			// it", so it ends the body rather than failing it.
+			// it" — unless it also said the client went away first, in which
+			// case this is a body that stopped rather than one that ended, and
+			// forwarding it would have the origin commit a truncated upload as
+			// a complete one.
 			let Some(chunk) = self.chunks.blocking_recv() else {
+				if self.ending.aborted() {
+					return Err(std::io::Error::new(
+						std::io::ErrorKind::UnexpectedEof,
+						"the client stopped sending before the body was complete",
+					));
+				}
+
 				return Ok(0);
 			};
 
@@ -127,13 +162,13 @@ pub fn take(
 	config: &crate::config::Config,
 	wanted: bool,
 	request: &mut crate::interceptor::ProxyRequest,
-	upload: Option<(Receiver<Chunk>, Option<u64>)>,
+	upload: Option<(Receiver<Chunk>, Ending, Option<u64>)>,
 ) -> Result<RequestBody, Rejected> {
-	let Some((chunks, length)) = upload else {
+	let Some((chunks, ending, length)) = upload else {
 		return Ok(RequestBody::None);
 	};
 
-	let mut reader = Reader::new(chunks);
+	let mut reader = Reader::new(chunks, ending);
 
 	if !wanted {
 		return Ok(RequestBody::Streaming { reader, length });
@@ -186,6 +221,63 @@ pub enum TooLarge {
 mod tests {
 	use super::*;
 
+	/// A dropped sender means "that was all of it", and it is also what happens
+	/// when the client dies. Told apart, because `content-length` is stripped as
+	/// hop-by-hop and ureq re-frames the body itself — so a client that vanished
+	/// at 3MB of a 10MB POST had a well-formed 3MB POST committed at the origin,
+	/// with nothing anywhere saying it was short.
+	#[test]
+	fn a_body_that_stopped_is_not_a_body_that_ended() {
+		let (tx, rx) = tokio::sync::mpsc::channel(4);
+		let ending = Ending::default();
+		tx.blocking_send(b"the first half".to_vec()).unwrap();
+		ending.abort();
+		drop(tx);
+
+		let mut reader = Reader::new(rx, ending);
+		let mut got = Vec::new();
+
+		// What arrived still arrives; the failure is at the end of it.
+		let error = loop {
+			let mut buf = [0u8; 8];
+			match reader.read(&mut buf) {
+				Ok(0) => panic!("a truncated body must not read as a complete one"),
+				Ok(n) => got.extend_from_slice(&buf[..n]),
+				Err(e) => break e,
+			}
+		};
+
+		assert_eq!(got, b"the first half");
+		assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+
+		// And read_to_cap turns it into the rejection the caller already has a
+		// branch for, which until now was unreachable.
+		let (tx, rx) = tokio::sync::mpsc::channel(4);
+		let ending = Ending::default();
+		tx.blocking_send(b"half".to_vec()).unwrap();
+		ending.abort();
+		drop(tx);
+
+		assert!(matches!(
+			read_to_cap(&mut Reader::new(rx, ending), 1024),
+			Err(TooLarge::Interrupted(_))
+		));
+	}
+
+	/// The ordinary end, which must stay ordinary.
+	#[test]
+	fn a_body_that_ended_reads_as_complete() {
+		let (tx, rx) = tokio::sync::mpsc::channel(4);
+		tx.blocking_send(b"all of it".to_vec()).unwrap();
+		drop(tx);
+
+		assert_eq!(
+			read_to_cap(&mut Reader::new(rx, Ending::default()), 1024)
+				.unwrap_or_else(|_| panic!("a whole body")),
+			b"all of it"
+		);
+	}
+
 	fn reader_of(chunks: &[&[u8]]) -> Reader {
 		let (tx, rx) = channel();
 		for chunk in chunks {
@@ -193,7 +285,7 @@ mod tests {
 		}
 		drop(tx);
 
-		Reader::new(rx)
+		Reader::new(rx, Ending::default())
 	}
 
 	#[test]
@@ -224,7 +316,7 @@ mod tests {
 		let (tx, rx) = channel();
 		drop(tx);
 
-		let mut reader = Reader::new(rx);
+		let mut reader = Reader::new(rx, Ending::default());
 		let mut got = Vec::new();
 		reader.read_to_end(&mut got).unwrap();
 

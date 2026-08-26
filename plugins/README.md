@@ -69,6 +69,19 @@ Anything you omit is left as-is, so `{}` means "no change":
 | `headers` | both | Replace the whole header list |
 | `body_b64` | both | Replace the body (base64, so binary is safe) |
 
+Framing headers in `headers` are dropped: `content-length`,
+`transfer-encoding`, `connection` and the rest of the hop-by-hop set belong to
+whichever front end is speaking to the client, and it recomputes them from the
+body actually sent. A `content-length` of your own would simply be a lie about
+a body only mach5 knows the size of.
+
+**One reply per hook, and it must parse.** There is no request id in the
+protocol — replies are matched to hooks by order — so a line that is not a
+reply puts the two sides permanently out of step. mach5 abandons a plugin that
+sends one, rather than applying every later answer to the wrong hook. In
+practice this means: do not print anything to **stdout** except replies. Use
+stderr for logging; it is left attached and goes to mach5's own log.
+
 ### Uploaded bodies
 
 By default an upload streams past you: the `request` hook still fires, with the

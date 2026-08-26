@@ -57,6 +57,19 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
+
+/// The most a plugin may say in one line.
+///
+/// A reply carries a whole body as base64, so it is naturally the largest thing
+/// in the protocol; this is generous against `max_response_body_mb` and exists
+/// only to stop a plugin that never sends a newline asking for all of memory.
+const MAX_REPLY_BYTES: usize = 128 * 1024 * 1024;
+
+/// How many unread replies to hold. `call` takes one per hook, so anything past
+/// a couple is a plugin talking to itself — and an unbounded queue of that is a
+/// leak with no ceiling.
+const REPLY_QUEUE: usize = 4;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -237,6 +250,49 @@ fn executables_in(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 	Ok(out)
 }
 
+/// Read one newline-terminated line, refusing to hold more than `limit` of it.
+///
+/// Returns the number of bytes read, `0` at end of input, and an error once the
+/// ceiling is passed — which has to end the conversation, because a line that
+/// was cut short leaves no way to find where the next one starts.
+fn read_line_capped(
+	from: &mut impl BufRead,
+	into: &mut Vec<u8>,
+	limit: usize,
+) -> std::io::Result<usize> {
+	let mut taken = 0;
+
+	loop {
+		let available = from.fill_buf()?;
+		if available.is_empty() {
+			return Ok(taken);
+		}
+
+		let (used, done) = match available.iter().position(|b| *b == b'\n') {
+			Some(at) => (at + 1, true),
+			None => (available.len(), false),
+		};
+
+		if taken + used > limit {
+			from.consume(used);
+
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				format!("a reply longer than {limit} bytes"),
+			));
+		}
+
+		// The newline itself is not part of the line.
+		into.extend_from_slice(&available[..used - usize::from(done)]);
+		from.consume(used);
+		taken += used;
+
+		if done {
+			return Ok(taken);
+		}
+	}
+}
+
 impl Plugin {
 	fn start(path: &Path, timeout: Duration) -> std::io::Result<Self> {
 		let mut child = Command::new(path)
@@ -267,12 +323,32 @@ impl Plugin {
 			// released this thread.
 		});
 
-		let (tx, lines) = std::sync::mpsc::channel();
+		// Bounded, so a plugin writing lines nobody asked for cannot grow this
+		// without end. `call` drains one per hook, so anything past a couple is
+		// a plugin talking to itself; the send blocks, which parks the reader
+		// thread rather than the proxy.
+		let (tx, lines) = std::sync::mpsc::sync_channel::<String>(REPLY_QUEUE);
+		let reading = path.display().to_string();
 		std::thread::spawn(move || {
-			for line in BufReader::new(stdout).lines() {
-				let Ok(line) = line else {
-					break;
-				};
+			let mut stdout = BufReader::new(stdout);
+
+			loop {
+				// Not `lines()`: that grows one String until a newline arrives,
+				// and a plugin that never sends one is asking for the whole of
+				// memory. A line over the ceiling ends the conversation, since
+				// after it there is no way to find the start of the next one.
+				let mut line = Vec::new();
+				match read_line_capped(&mut stdout, &mut line, MAX_REPLY_BYTES) {
+					Ok(0) => break,
+					Ok(_) => {}
+					Err(e) => {
+						log::error!("plugin {reading}: {e}");
+
+						break;
+					}
+				}
+
+				let line = String::from_utf8_lossy(&line).into_owned();
 				if tx.send(line).is_err() {
 					break;
 				}
@@ -299,12 +375,23 @@ impl Plugin {
 			metrics: crate::metrics::shared(),
 		};
 
-		// Ask what it wants to see. A plugin that ignores the init hook keeps
-		// the empty filter and therefore sees everything.
+		// Ask what it wants to see. A plugin that answers with an empty filter
+		// sees everything, which is a legitimate thing to want.
 		let init = plugin
 			.call::<_, InitReply>(&serde_json::json!({ "hook": "init" }))
 			.unwrap_or_default();
 		let filter = init.filter;
+
+		// But one that could not answer at all has been abandoned by `call`,
+		// and loading it would keep the *default* filter — which is empty, so
+		// it would be recorded as seeing all traffic. That is the fail-open
+		// direction, and it was reachable by a plugin printing one line of its
+		// own before its loop.
+		if plugin.io.lock().unwrap().is_none() {
+			return Err(std::io::Error::other(
+				"it did not answer the init hook, so what it wants to see is unknown",
+			));
+		}
 
 		if filter.is_empty() {
 			log::info!("started plugin {} (sees all traffic)", plugin.name);
@@ -394,8 +481,21 @@ impl Plugin {
 		match serde_json::from_str(&reply) {
 			Ok(reply) => Some(reply),
 			Err(e) => {
-				// One bad line is not fatal; the plugin stays up.
-				log::warn!("plugin {}: ignoring unparsable reply: {e}", self.name);
+				// Fatal, because the protocol has no correlation id: there is
+				// exactly one reply per hook, and a line that is not one means
+				// the two sides no longer agree about which hook is being
+				// answered. Left running, the plugin answers every hook with
+				// the *previous* hook's reply for the rest of the process — so
+				// a 403 computed for an advert is applied to the next request,
+				// and a body computed for one response is written as another's.
+				// The old behaviour of ignoring it never healed, and a desynced
+				// plugin always answers promptly, so no timeout ever caught it.
+				log::error!(
+					"plugin {}: unparsable reply, so it is out of step with its \
+					 hooks and cannot be trusted; abandoning it: {e}",
+					self.name
+				);
+				self.abandon(&mut guard);
 
 				None
 			}
@@ -452,7 +552,7 @@ impl Interceptor for Plugin {
 			req.url = url;
 		}
 		if let Some(headers) = reply.headers {
-			req.headers = headers;
+			req.headers = relayable(headers);
 		}
 		if let Some(body) = decode_body(&self.name, reply.body_b64) {
 			req.body = body;
@@ -470,6 +570,16 @@ impl Interceptor for Plugin {
 		resp.headers = head.headers;
 
 		if !matched {
+			return;
+		}
+
+		// A plugin that asked for chunks is never handed a whole body, whatever
+		// else caused this response to be buffered. `wants_body` says so, but
+		// the front ends buffer on `wants_body(..) || worth_keeping`, so a
+		// cacheable response reached here with the plugin's answer ignored —
+		// and it got the megabytes chunk mode exists to avoid, while its chunk
+		// hooks were never called at all.
+		if self.chunks {
 			return;
 		}
 
@@ -492,7 +602,7 @@ impl Interceptor for Plugin {
 			resp.status = status;
 		}
 		if let Some(headers) = reply.headers {
-			resp.headers = headers;
+			resp.headers = relayable(headers);
 		}
 		if let Some(body) = decode_body(&self.name, reply.body_b64) {
 			resp.body = body;
@@ -523,7 +633,7 @@ impl Interceptor for Plugin {
 			head.status = status;
 		}
 		if let Some(headers) = reply.headers {
-			head.headers = headers;
+			head.headers = relayable(headers);
 		}
 		if reply.body_b64.is_some() {
 			log::warn!(
@@ -617,9 +727,33 @@ fn short_circuit(name: &str, reply: &Reply) -> Option<ProxyResponse> {
 
 	Some(ProxyResponse {
 		status,
-		headers: reply.headers.clone().unwrap_or_default(),
+		headers: relayable(reply.headers.clone().unwrap_or_default()),
 		body: decode_body(name, reply.body_b64.clone()).unwrap_or_default(),
 	})
+}
+
+/// A plugin's headers, minus the ones that describe this hop rather than the
+/// message.
+///
+/// Framing is each front end's own: `upstream::response_headers` strips these
+/// from what the origin sent for that reason, and a plugin's were going through
+/// untouched. `{"headers":[["content-length","1000000"]],"body_b64":"aGk="}`
+/// had hyper frame a million bytes and send two — the client waits for the rest
+/// and the keep-alive connection is poisoned — while the h3 side saw a declared
+/// length and forwarded the lie unchanged.
+fn relayable(headers: Vec<(String, String)>) -> Vec<(String, String)> {
+	headers
+		.into_iter()
+		.filter(|(name, _)| {
+			if crate::upstream::is_hop_by_hop(name) {
+				log::debug!("plugin: ignoring {name}, which is this hop's to decide");
+
+				return false;
+			}
+
+			true
+		})
+		.collect()
 }
 
 fn decode_body(name: &str, body_b64: Option<String>) -> Option<Vec<u8>> {
@@ -663,6 +797,187 @@ mod tests {
 		assert_eq!(req.url, "https://example.com/");
 	}
 
+	/// Write `body` to an executable in a fresh temp dir and start a plugin from
+	/// it. The directory comes back too, so it outlives the process.
+	///
+	/// Serialised, and retried on `ETXTBSY`: `cargo test` runs these on threads
+	/// of one process, and a spawn on one thread can inherit a write handle
+	/// another thread has open on the file it is about to exec. Nothing to do
+	/// with the code under test, and maddening to debug twice.
+	fn plugin_from(body: &str, timeout: Duration) -> (tempfile::TempDir, Plugin) {
+		use std::os::unix::fs::PermissionsExt;
+
+		static SPAWNING: Mutex<()> = Mutex::new(());
+
+		let dir = tempfile::TempDir::new().unwrap();
+		let path = dir.path().join("plugin");
+
+		for attempt in 0..10 {
+			let guard = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
+			std::fs::write(&path, body).unwrap();
+			std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+			match Plugin::start(&path, timeout) {
+				Ok(plugin) => return (dir, plugin),
+				Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+					drop(guard);
+					std::thread::sleep(Duration::from_millis(20 * (attempt + 1)));
+				}
+				Err(e) => panic!("the plugin has to start: {e}"),
+			}
+		}
+
+		panic!("the plugin never got past ETXTBSY");
+	}
+
+	/// The same, for the one test that wants the failure rather than the plugin.
+	fn start_expecting_failure(body: &str, timeout: Duration) -> std::io::Result<Plugin> {
+		use std::os::unix::fs::PermissionsExt;
+
+		let dir = tempfile::TempDir::new().unwrap();
+		let path = dir.path().join("plugin");
+		std::fs::write(&path, body).unwrap();
+		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+		Plugin::start(&path, timeout)
+	}
+
+	fn head(status: u16) -> ResponseHead {
+		ResponseHead {
+			status,
+			headers: vec![("content-type".to_string(), "text/html".to_string())],
+		}
+	}
+
+	fn req() -> ProxyRequest {
+		ProxyRequest {
+			method: "GET".to_string(),
+			url: "https://example.com/".to_string(),
+			headers: Vec::new(),
+			body: Vec::new(),
+		}
+	}
+
+	/// Framing is this hop's to decide — `upstream::response_headers` strips
+	/// these from what the origin sent for exactly that reason, and a plugin's
+	/// were going through untouched. A content-length of a million against a
+	/// two-byte body has hyper frame a million and send two: the client waits
+	/// for the rest and the connection is poisoned.
+	#[test]
+	fn a_plugin_does_not_get_to_set_the_framing() {
+		let (_dir, plugin) = plugin_from(
+			"#!/bin/sh\nread -r line\nprintf '{\"filter\":{}}\\n'\n\
+			 read -r line\n\
+			 printf '{\"headers\":[[\"content-length\",\"1000000\"],[\"transfer-encoding\",\"chunked\"],[\"x-plugin\",\"kept\"]],\"body_b64\":\"aGk=\"}\\n'\n\
+			 sleep 5\n",
+			Duration::from_secs(3),
+		);
+
+		let mut resp = ProxyResponse {
+			status: 200,
+			headers: vec![("content-type".to_string(), "text/html".to_string())],
+			body: b"original".to_vec(),
+		};
+		plugin.on_response(&req(), &mut resp);
+
+		assert_eq!(resp.body, b"hi", "the plugin's body is still applied");
+		assert!(
+			resp.headers
+				.iter()
+				.any(|(name, value)| name == "x-plugin" && value == "kept"),
+			"and so are its own headers: {:?}",
+			resp.headers
+		);
+		for framing in ["content-length", "transfer-encoding"] {
+			assert!(
+				!resp.headers.iter().any(|(name, _)| name == framing),
+				"{framing} is not a plugin's to set: {:?}",
+				resp.headers
+			);
+		}
+	}
+
+	/// The protocol has no correlation id: one reply per hook, in order. A line
+	/// that is not a reply means the two sides no longer agree about which hook
+	/// is being answered, and ignoring it never healed — every later hook got
+	/// the previous one's answer, for the rest of the process.
+	#[test]
+	fn a_reply_that_does_not_parse_ends_the_conversation() {
+		let (_dir, plugin) = plugin_from(
+			"#!/bin/sh\nread -r line\nprintf '{\"filter\":{}}\\n'\n\
+			 read -r line\nprintf 'this is not json\\n'\n\
+			 sleep 5\n",
+			Duration::from_secs(3),
+		);
+
+		let mut resp = ProxyResponse {
+			status: 200,
+			headers: Vec::new(),
+			body: b"original".to_vec(),
+		};
+		plugin.on_response(&req(), &mut resp);
+
+		assert_eq!(resp.body, b"original", "nothing of a bad reply is applied");
+		assert!(
+			plugin.io.lock().unwrap().is_none(),
+			"and the plugin is abandoned rather than left a hook out of step"
+		);
+	}
+
+	/// A plugin that cannot say what it wants to see would be loaded with the
+	/// *default* filter, which is empty — and an empty filter means it sees all
+	/// traffic. Fail-open, and reachable by a plugin printing one line of its
+	/// own before its loop.
+	#[test]
+	fn a_plugin_that_cannot_answer_init_is_not_loaded() {
+		let started =
+			start_expecting_failure("#!/bin/sh\nprintf 'loaded\\n'\nsleep 5\n", Duration::from_secs(2));
+
+		assert!(started.is_err());
+	}
+
+	/// `wants_body` says a chunk plugin never gets a whole one, but the front
+	/// ends buffer on `wants_body(..) || worth_keeping` — so a cacheable
+	/// response reached `on_response` with that answer ignored, and the plugin
+	/// got the megabytes chunk mode exists to avoid while its chunk hooks were
+	/// never called.
+	#[test]
+	fn a_chunk_plugin_is_never_handed_a_whole_body() {
+		let (_dir, plugin) = plugin_from(
+			"#!/bin/sh\nread -r line\nprintf '{\"filter\":{},\"chunks\":true}\\n'\n\
+			 read -r line\nprintf '{\"body_b64\":\"c2hvdWxkIG5vdCBoYXBwZW4=\"}\\n'\n\
+			 sleep 5\n",
+			Duration::from_secs(3),
+		);
+
+		assert!(plugin.chunks);
+		assert!(!plugin.wants_body(&req(), &head(200)));
+
+		let mut resp = ProxyResponse {
+			status: 200,
+			headers: vec![("content-type".to_string(), "text/html".to_string())],
+			body: b"original".to_vec(),
+		};
+		plugin.on_response(&req(), &mut resp);
+
+		assert_eq!(resp.body, b"original", "it was not offered the body at all");
+	}
+
+	/// A line grows until a newline arrives, so a plugin that never sends one is
+	/// asking for the whole of memory.
+	#[test]
+	fn a_line_with_no_end_is_refused_rather_than_held() {
+		let mut source = std::io::Cursor::new(b"x".repeat(4096));
+		let mut line = Vec::new();
+
+		assert!(read_line_capped(&mut source, &mut line, 512).is_err());
+
+		let mut source = std::io::Cursor::new(b"first\nsecond\n".to_vec());
+		let mut line = Vec::new();
+		assert_eq!(read_line_capped(&mut source, &mut line, 512).unwrap(), 6);
+		assert_eq!(line, b"first", "and the newline is not part of it");
+	}
+
 	/// A plugin that answers `init` and then stops reading its stdin. The pipe
 	/// fills, and `write_all` on a full pipe waits for as long as it takes —
 	/// which the reply timeout never gets to see, because the worker is parked
@@ -671,18 +986,10 @@ mod tests {
 	/// them.
 	#[test]
 	fn a_plugin_that_stops_reading_does_not_take_the_worker_with_it() {
-		let dir = tempfile::TempDir::new().unwrap();
-		let script = dir.path().join("deaf");
-		std::fs::write(
-			&script,
+		let (_dir, plugin) = plugin_from(
 			"#!/bin/sh\nread -r line\nprintf '{\"filter\":{}}\\n'\nsleep 60\n",
-		)
-		.unwrap();
-
-		use std::os::unix::fs::PermissionsExt;
-		std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-		let plugin = Plugin::start(&script, Duration::from_secs(1)).expect("it starts");
+			Duration::from_secs(1),
+		);
 
 		// Comfortably past a pipe buffer, which is what a response hook
 		// carrying a page looks like anyway.

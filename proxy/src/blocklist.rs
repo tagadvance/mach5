@@ -56,6 +56,9 @@ pub struct Blocklist {
 	/// which it is in `sec-fetch-site`.
 	blocked_embedded: HashSet<String>,
 	allowed: HashSet<String>,
+	/// `@@||host^$third-party`, which is how one list cancels another's
+	/// third-party block.
+	allowed_embedded: HashSet<String>,
 	metrics: Arc<crate::metrics::Metrics>,
 	/// How many of the configured sources actually gave us something.
 	sources: usize,
@@ -69,6 +72,7 @@ impl Blocklist {
 		Self {
 			blocked: HashSet::new(),
 			blocked_embedded: HashSet::new(),
+			allowed_embedded: HashSet::new(),
 			allowed: allow
 				.iter()
 				.filter_map(|domain| normalize(domain))
@@ -110,6 +114,9 @@ impl Blocklist {
 					Rule::Allow(domain) => {
 						self.allowed.insert(domain);
 					}
+					Rule::AllowEmbedded(domain) => {
+						self.allowed_embedded.insert(domain);
+					}
 				}
 			}
 		}
@@ -148,11 +155,15 @@ impl Blocklist {
 	/// only on the host: a `$third-party` rule applies to a subresource and not
 	/// to the page it is on.
 	fn blocks_request(&self, req: &ProxyRequest, host: &str) -> bool {
-		if covers(&self.allowed, host) {
+		let embedded = embedded(req);
+
+		// An exception cancels whatever matched, as long as its own scope
+		// applies to this request.
+		if covers(&self.allowed, host) || (embedded && covers(&self.allowed_embedded, host)) {
 			return false;
 		}
 
-		covers(&self.blocked, host) || (embedded(req) && covers(&self.blocked_embedded, host))
+		covers(&self.blocked, host) || (embedded && covers(&self.blocked_embedded, host))
 	}
 
 	/// Whether this host is blocked outright, for callers with no request in
@@ -402,22 +413,44 @@ enum Rule {
 	/// Blocked only where the page did not go looking for it itself.
 	BlockEmbedded(String),
 	Allow(String),
+	/// Excepted only there. The whitelist half of `$third-party`, and honouring
+	/// the block half without it turns a rule two lists agree on into a block
+	/// where neither list meant one.
+	AllowEmbedded(String),
 }
 
-/// Whether this request is the page itself, or something the page pulled in
-/// from somewhere else.
-///
-/// `sec-fetch-site` is the browser answering exactly this question, which is
-/// why `$third-party` is the one Adblock option mach5 can honour. A client that
-/// does not send it — curl, an app, an old browser — is treated as first-party,
-/// because being wrong that way skips an advert and being wrong the other way
-/// blocks the page somebody asked for.
-fn embedded(req: &ProxyRequest) -> bool {
+fn fetch_metadata(req: &ProxyRequest, name: &str) -> Option<String> {
 	req.headers
 		.iter()
-		.find(|(name, _)| name.eq_ignore_ascii_case("sec-fetch-site"))
+		.find(|(header, _)| header.eq_ignore_ascii_case(name))
 		.map(|(_, value)| value.trim().to_ascii_lowercase())
-		.is_some_and(|site| site == "cross-site" || site == "same-site")
+}
+
+/// Whether this request is third-party in the sense `$third-party` means it:
+/// something a page pulled in from a different site than its own.
+///
+/// The browser answers this in `sec-fetch-site`, which is why this is the one
+/// Adblock option mach5 can honour. Two details decide whether it is honoured
+/// correctly, and getting either wrong blocks pages people asked for:
+///
+/// - **`same-site` is first-party.** Adblock compares registrable domains, and
+///   `same-site` is the browser saying the registrable domains match — only
+///   `cross-site` is a different one.
+/// - **A top-level navigation is never third-party**, whatever it came from. A
+///   link click from one site to another is `cross-site` too, and a document
+///   request is its own first party, so `$third-party` must not match it. An
+///   *iframe* navigation is a subresource and does match, which is why this
+///   looks at `sec-fetch-dest` rather than `sec-fetch-mode`.
+///
+/// A client that sends no `sec-fetch-site` — curl, an app, an old browser — is
+/// treated as first-party, because being wrong that way skips an advert and
+/// being wrong the other way blocks a site somebody asked for.
+fn embedded(req: &ProxyRequest) -> bool {
+	if fetch_metadata(req, "sec-fetch-site").as_deref() != Some("cross-site") {
+		return false;
+	}
+
+	fetch_metadata(req, "sec-fetch-dest").as_deref() != Some("document")
 }
 
 /// Parse one line of a list in whichever of the three formats it happens to be.
@@ -440,12 +473,13 @@ fn parse(line: &str) -> Vec<Rule> {
 	};
 
 	if let Some(rule) = line.strip_prefix("@@") {
-		// An exception is never narrowed to third-party here: honouring
-		// `@@||x^$third-party` as an unconditional allowance is the fail-open
-		// case this whole function exists to avoid.
 		return one(match anchored(rule) {
 			Anchored::Plain(domain) => normalize(domain).map(Rule::Allow),
-			_ => None,
+			// Narrowed to third-party rather than dropped. Dropping it while
+			// honouring the block half turns a domain the adservers list blocks
+			// and the whitelist un-blocks into a block neither list meant.
+			Anchored::ThirdParty(domain) => normalize(domain).map(Rule::AllowEmbedded),
+			Anchored::Unreadable => None,
 		});
 	}
 
@@ -646,22 +680,40 @@ mod tests {
 	#[test]
 	fn a_third_party_rule_blocks_a_subresource_and_not_the_page() {
 		let scoped = list("||cdn.example^$third-party\n");
-		let ask = |site: Option<&str>| {
+		let ask = |site: Option<&str>, dest: Option<&str>| {
 			let mut req = request("https://cdn.example/x.js", "*/*");
-			if let Some(site) = site {
-				req.headers
-					.push(("sec-fetch-site".to_string(), site.to_string()));
+			for (name, value) in [("sec-fetch-site", site), ("sec-fetch-dest", dest)] {
+				if let Some(value) = value {
+					req.headers.push((name.to_string(), value.to_string()));
+				}
 			}
 
 			scoped.blocks_request(&req, "cdn.example")
 		};
 
-		assert!(ask(Some("cross-site")), "embedded by another origin");
-		assert!(ask(Some("same-site")), "and by a sibling of one");
-		assert!(!ask(Some("none")), "typed into the address bar");
-		assert!(!ask(Some("same-origin")), "or fetched by its own page");
 		assert!(
-			!ask(None),
+			ask(Some("cross-site"), Some("script")),
+			"a subresource from another site is what the rule is about"
+		);
+		assert!(
+			ask(Some("cross-site"), Some("iframe")),
+			"and so is a third-party frame"
+		);
+		assert!(
+			!ask(Some("cross-site"), Some("document")),
+			"but a link click is a navigation, and a document is its own first \
+			 party — blocking it hands somebody a block page for a site they \
+			 asked for by name"
+		);
+		assert!(
+			!ask(Some("same-site"), Some("script")),
+			"`same-site` means the registrable domains match, which is what \
+			 `$third-party` compares — so this is first-party"
+		);
+		assert!(!ask(Some("none"), Some("document")), "typed into the address bar");
+		assert!(!ask(Some("same-origin"), Some("script")), "its own page fetched it");
+		assert!(
+			!ask(None, None),
 			"a client that says nothing is treated as the page itself: being \
 			 wrong that way skips an advert, and being wrong the other way \
 			 blocks a site somebody asked for"
@@ -673,6 +725,35 @@ mod tests {
 		req.headers
 			.push(("sec-fetch-site".to_string(), "none".to_string()));
 		assert!(plain.blocks_request(&req, "cdn.example"));
+	}
+
+	/// Filter lists come in pairs: an adservers file blocks and a whitelist file
+	/// cancels. Honouring the block half of `$third-party` while dropping the
+	/// exception half turns a domain the two lists agree on into a block
+	/// neither of them meant.
+	#[test]
+	fn a_third_party_exception_cancels_a_third_party_block() {
+		let both = list("||tracker.example^$third-party\n@@||tracker.example^$third-party\n");
+
+		let mut embedded = request("https://tracker.example/p.gif", "*/*");
+		embedded.headers.push(("sec-fetch-site".to_string(), "cross-site".to_string()));
+		embedded.headers.push(("sec-fetch-dest".to_string(), "image".to_string()));
+
+		assert!(
+			!both.blocks_request(&embedded, "tracker.example"),
+			"the exception applies exactly where the block does"
+		);
+
+		// And an exception scoped to third-party does not un-block a plain
+		// rule for a first-party request — there was nothing to un-block.
+		let mixed = list("0.0.0.0 tracker.example\n@@||tracker.example^$third-party\n");
+		let first_party = request("https://tracker.example/p.gif", "*/*");
+		assert!(mixed.blocks_request(&first_party, "tracker.example"));
+		assert!(
+			!mixed.blocks_request(&embedded, "tracker.example"),
+			"but it does cancel one for a third-party request, which is what \
+			 a whitelist file is for"
+		);
 	}
 
 	#[test]

@@ -8,14 +8,25 @@
 //! `content-security-policy` header, which would take a real protection off a
 //! real site to make a cosmetic feature work.
 //!
-//! Everything here works on bytes. A page is not always UTF-8 — and quite often
-//! is not what its `charset` claims — so decoding one into a `String` to search
-//! it would replace every byte we failed to understand and hand the client back
-//! a corrupted page. Matching ASCII tags over bytes and splicing in ASCII bytes
-//! leaves every other byte exactly where the origin put it, whatever it means.
+//! Where the tags go is decided by an HTML parser — Cloudflare's `lol_html` —
+//! rather than by searching the bytes for `</head>`. Searching worked until it
+//! did not: a `</head>` inside a comment, a script string or a `<textarea>` is
+//! not the end of the head, and splicing there puts our tags in the middle of
+//! somebody's JavaScript. A parser knows the difference, and it is the same
+//! parser that makes the rest of the roadmap's HTML work possible at all.
+//!
+//! Encoding still matters, and is still not something to guess at. `lol_html`
+//! is told the charset from the `content-type` header and works in it; when
+//! that names something it cannot handle — a UTF-16 page, say — the body is
+//! handed back exactly as it arrived rather than mangled into UTF-8.
 
+use std::cell::Cell;
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::Arc;
+
+use lol_html::html_content::ContentType;
+use lol_html::{element, AsciiCompatibleEncoding, HtmlRewriter, Settings};
 
 use crate::config::Config;
 use crate::interceptor::{Interceptor, ProxyRequest, ProxyResponse, ResponseHead};
@@ -23,16 +34,13 @@ use crate::interceptor::{Interceptor, ProxyRequest, ProxyResponse, ResponseHead}
 /// What gets spliced in. The stylesheet first, so it is already being fetched
 /// while the parser reaches the script; `defer` so the picker runs after the
 /// document is parsed and never blocks it.
-const TAGS: &[u8] =
-	br#"<link rel="stylesheet" href="/.mach5/hidden.css"><script src="/.mach5/mach5.js" defer></script>"#;
+const TAGS: &str =
+	r#"<link rel="stylesheet" href="/.mach5/hidden.css"><script src="/.mach5/mach5.js" defer></script>"#;
 
 /// Proof our tags are already there. Injecting twice would run the picker's
 /// double-run guard for nothing and, worse, make a redirect chain or a
 /// re-proxied page grow a tag per hop.
 const MARKER: &[u8] = b"/.mach5/mach5.js";
-
-const HEAD_END: &[u8] = b"</head>";
-const BODY_START: &[u8] = b"<body";
 
 /// Adds the tags to HTML pages.
 pub struct Inject {
@@ -70,8 +78,8 @@ impl Interceptor for Inject {
 		// Counted here rather than beside `wants_body`: a page can be buffered,
 		// looked at and left alone, and a count of what we considered injecting
 		// would not be a count of what we injected.
-		if let Some(at) = insertion_point(&resp.body) {
-			resp.body.splice(at..at, TAGS.iter().copied());
+		if let Some(rewritten) = rewrite(&resp.body, charset(&resp.headers)) {
+			resp.body = rewritten;
 			self.metrics.injected.increment();
 		}
 	}
@@ -95,53 +103,91 @@ fn is_html(headers: &[(String, String)]) -> bool {
 	})
 }
 
-/// Where the tags go: just before the first `</head>`, or failing that just
-/// after the opening `<body>` tag. `None` means neither is there, and a
-/// document with no head and no body is not one we understand well enough to
-/// edit — a fragment, a feed served as HTML, or something mislabelled.
-fn insertion_point(body: &[u8]) -> Option<usize> {
+/// Put the tags in the page, or hand it back unchanged.
+///
+/// `None` means nothing was injected: the tags are already there, the document
+/// has neither a `<head>` nor a `<body>` to put them in, or its encoding is one
+/// we will not risk rewriting.
+fn rewrite(body: &[u8], charset: &str) -> Option<Vec<u8>> {
 	if find_ascii(body, MARKER).is_some() {
 		return None;
 	}
 
-	if let Some(at) = find_ascii(body, HEAD_END) {
-		return Some(at);
+	// Decided before anything is parsed: a page in an encoding the rewriter
+	// cannot work in has to be left alone, not rewritten as though it were
+	// UTF-8.
+	let encoding = encoding_for(charset)?;
+
+	// Shared because both handlers may run and only one may inject: `<head>`
+	// closes before `<body>` opens, so by the time the fallback is reached the
+	// answer is already known.
+	let injected = Rc::new(Cell::new(false));
+	let into_head = injected.clone();
+	let into_body = injected.clone();
+
+	let mut out = Vec::with_capacity(body.len() + TAGS.len());
+	let settings = Settings::new()
+		.with_encoding(encoding)
+		.append_element_content_handler(element!("head", move |el| {
+			// At the end of the head's content — which is what `</head>` meant,
+			// back when it was the right `</head>`.
+			el.append(TAGS, ContentType::Html);
+			into_head.set(true);
+
+			Ok(())
+		}))
+		.append_element_content_handler(element!("body", move |el| {
+			if !into_body.get() {
+				el.prepend(TAGS, ContentType::Html);
+				into_body.set(true);
+			}
+
+			Ok(())
+		}));
+
+	let mut rewriter = HtmlRewriter::new(settings, |chunk: &[u8]| out.extend_from_slice(chunk));
+	if rewriter.write(body).is_err() || rewriter.end().is_err() {
+		// A document the parser refused. The origin's bytes are still correct,
+		// which is more than can be said for a half-rewritten copy of them.
+		log::debug!("could not parse a page as html; leaving it alone");
+
+		return None;
 	}
 
-	body_tag_end(body)
+	injected.get().then_some(out)
 }
 
-/// End of the opening `<body …>` tag. The first `>` after it ends the tag in
-/// every document that is not already broken; a `>` inside an attribute value
-/// would fool this, but a `<body>` with one is rare enough — and the cost is a
-/// pair of tags landing a few bytes early, not a corrupted page.
-fn body_tag_end(body: &[u8]) -> Option<usize> {
-	let mut from = 0;
+/// The encoding to rewrite in, or `None` for one that cannot be rewritten
+/// safely.
+///
+/// `lol_html` cannot work in UTF-16 or ISO-2022-JP, and a page declaring one of
+/// those must come back untouched rather than reinterpreted. A label nobody
+/// recognises is treated as UTF-8, which is what such a page almost always
+/// turns out to be.
+fn encoding_for(charset: &str) -> Option<AsciiCompatibleEncoding> {
+	let Some(encoding) = encoding_rs::Encoding::for_label_no_replacement(charset.as_bytes()) else {
+		return Some(AsciiCompatibleEncoding::utf_8());
+	};
 
-	while let Some(offset) = find_ascii(&body[from..], BODY_START) {
-		let start = from + offset;
-		let after = start + BODY_START.len();
+	AsciiCompatibleEncoding::new(encoding)
+}
 
-		// `<bodyguard>` is not `<body>`: the name has to end here.
-		match body.get(after) {
-			Some(b'>') => return Some(after + 1),
-			Some(c) if c.is_ascii_whitespace() || *c == b'/' => {
-				if let Some(close) = body[after..].iter().position(|c| *c == b'>') {
-					return Some(after + close + 1);
-				}
-
-				return None;
-			}
-			_ => from = after,
-		}
-	}
-
-	None
+/// The charset the response declared, or UTF-8 when it declared none. Almost
+/// every page is UTF-8; the ones that are not are usually explicit about it.
+fn charset(headers: &[(String, String)]) -> &str {
+	headers
+		.iter()
+		.find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+		.and_then(|(_, value)| value.split(';').find_map(|part| {
+			let part = part.trim();
+			part.strip_prefix("charset=")
+				.or_else(|| part.strip_prefix("charset ="))
+		}))
+		.map(|charset| charset.trim().trim_matches('"'))
+		.unwrap_or("utf-8")
 }
 
 /// First offset at which `needle` appears, comparing ASCII case-insensitively.
-/// Tag names are ASCII, so this never has to know what encoding the rest of the
-/// bytes are in.
 fn find_ascii(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 	if needle.len() > haystack.len() {
 		return None;
@@ -194,6 +240,122 @@ mod tests {
 		}
 	}
 
+	/// The reason this stopped being a byte search. A `</head>` inside a script
+	/// string is not the end of the head, and splicing there lands the tags in
+	/// the middle of somebody's JavaScript — a broken page, from a proxy whose
+	/// whole job is not to break pages.
+	#[test]
+	fn a_head_end_inside_a_script_is_not_the_end_of_the_head() {
+		let mut resp = html(
+			200,
+			br#"<html><head><script>var s = "</head>";</script><title>x</title></head><body>hi</body></html>"#,
+		);
+		run(&inject(&[]), "https://example.com/", &mut resp);
+
+		let body = String::from_utf8(resp.body).unwrap();
+
+		assert!(
+			body.contains(&format!("<title>x</title>{TAGS}</head>")),
+			"the tags belong at the real end of the head: {body}"
+		);
+		assert!(
+			body.contains(r#"var s = "</head>";"#),
+			"and the script must come through untouched: {body}"
+		);
+	}
+
+	#[test]
+	fn a_head_end_inside_a_comment_is_not_the_end_of_the_head() {
+		let mut resp = html(
+			200,
+			b"<html><head><!-- </head> --><title>x</title></head><body>hi</body></html>",
+		);
+		run(&inject(&[]), "https://example.com/", &mut resp);
+
+		let body = String::from_utf8(resp.body).unwrap();
+
+		assert!(body.contains(&format!("<title>x</title>{TAGS}</head>")), "{body}");
+	}
+
+	/// The old scan looked for the first `>` after `<body`, which an attribute
+	/// value can carry.
+	#[test]
+	fn a_body_attribute_containing_a_bracket_does_not_confuse_it() {
+		let mut resp = html(200, br#"<html><body data-x="a > b">hi</body></html>"#);
+		run(&inject(&[]), "https://example.com/", &mut resp);
+
+		let body = String::from_utf8(resp.body).unwrap();
+
+		assert!(
+			body.contains(&format!(r#"<body data-x="a > b">{TAGS}hi"#)),
+			"the tags go after the whole opening tag: {body}"
+		);
+	}
+
+	/// A page mach5 cannot rewrite in the encoding it declares comes back
+	/// exactly as it arrived. Reinterpreting it as UTF-8 would corrupt every
+	/// character in it.
+	#[test]
+	fn a_page_in_an_encoding_we_cannot_rewrite_is_left_alone() {
+		let original = b"<html><head></head><body>hi</body></html>".to_vec();
+		let mut resp = ProxyResponse {
+			status: 200,
+			headers: vec![(
+				"content-type".to_string(),
+				"text/html; charset=utf-16le".to_string(),
+			)],
+			body: original.clone(),
+		};
+		run(&inject(&[]), "https://example.com/", &mut resp);
+
+		assert_eq!(resp.body, original);
+	}
+
+	/// One that mach5 *can* rewrite: the high bytes are meaningful in this
+	/// encoding and must survive being parsed and written back out.
+	#[test]
+	fn a_windows_1252_page_keeps_its_bytes() {
+		// 0xA9 is © in windows-1252 and not valid UTF-8 on its own.
+		let mut body = b"<html><head></head><body>caf\xe9 \xa9</body></html>".to_vec();
+		body = body
+			.iter()
+			.copied()
+			.flat_map(|b| if b == b'\\' { vec![] } else { vec![b] })
+			.collect();
+		let mut resp = ProxyResponse {
+			status: 200,
+			headers: vec![(
+				"content-type".to_string(),
+				"text/html; charset=windows-1252".to_string(),
+			)],
+			body,
+		};
+		run(&inject(&[]), "https://example.com/", &mut resp);
+
+		assert!(
+			resp.body.windows(2).any(|w| w == [0xe9, b' ']),
+			"the high bytes are still the ones the origin sent"
+		);
+		assert!(resp.body.ends_with(b"</body></html>"));
+	}
+
+	#[test]
+	fn the_declared_charset_is_read_out_of_the_content_type() {
+		assert_eq!(charset(&[("content-type".to_string(), "text/html".to_string())]), "utf-8");
+		assert_eq!(
+			charset(&[(
+				"Content-Type".to_string(),
+				"text/html; charset=windows-1252".to_string()
+			)]),
+			"windows-1252"
+		);
+		assert_eq!(
+			charset(&[("content-type".to_string(), "text/html;charset=\"utf-8\"".to_string())]),
+			"utf-8",
+			"quoted, as some origins write it"
+		);
+	}
+
 	#[test]
 	fn tags_land_before_the_head_closes() {
 		let mut resp = html(200, b"<html><head><title>x</title></head><body>hi</body></html>");
@@ -203,7 +365,7 @@ mod tests {
 			String::from_utf8(resp.body).unwrap(),
 			format!(
 				"<html><head><title>x</title>{}</head><body>hi</body></html>",
-				std::str::from_utf8(TAGS).unwrap()
+				TAGS
 			)
 		);
 	}
@@ -217,7 +379,7 @@ mod tests {
 
 		assert!(body.contains(&format!(
 			"{}</HEAD>",
-			std::str::from_utf8(TAGS).unwrap()
+			TAGS
 		)));
 	}
 
@@ -232,7 +394,7 @@ mod tests {
 			run(&inject(&[]), "https://example.com/", &mut resp);
 
 			let body = String::from_utf8(resp.body).unwrap();
-			let at = body.find(std::str::from_utf8(TAGS).unwrap());
+			let at = body.find(TAGS);
 
 			assert!(at.is_some(), "{}", String::from_utf8_lossy(page));
 			assert_eq!(
@@ -265,7 +427,7 @@ mod tests {
 	#[test]
 	fn a_page_that_already_has_the_script_is_untouched() {
 		let mut original = Vec::from(&b"<html><head>"[..]);
-		original.extend_from_slice(TAGS);
+		original.extend_from_slice(TAGS.as_bytes());
 		original.extend_from_slice(b"</head><body></body></html>");
 
 		let mut resp = html(200, &original);
@@ -285,7 +447,7 @@ mod tests {
 		original.extend_from_slice(&after[..]);
 
 		let mut expected = Vec::from(&before[..]);
-		expected.extend_from_slice(TAGS);
+		expected.extend_from_slice(TAGS.as_bytes());
 		expected.extend_from_slice(&after[..]);
 
 		let mut resp = html(200, &original);

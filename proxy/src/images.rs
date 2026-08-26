@@ -151,6 +151,9 @@ fn set_content_type(headers: &mut Vec<(String, String)>) {
 	headers.push(("content-type".to_string(), "image/webp".to_string()));
 }
 
+/// What libwebp will accept in either direction (`WEBP_MAX_DIMENSION`).
+const MAX_DIMENSION: u32 = 16383;
+
 /// Decode and re-encode, or `None` when the bytes are not an image we can read.
 ///
 /// A body that will not decode is not an error worth reporting: an origin may
@@ -163,14 +166,34 @@ fn to_webp(body: &[u8], quality: f32) -> Option<Vec<u8>> {
 		.decode()
 		.ok()?;
 
+	// libwebp refuses either dimension above this, and the `webp` crate's
+	// `encode` unwraps that refusal — inside an h3 worker, which is a bare
+	// spawned thread with nothing supervising it, so one panorama would take a
+	// worker down for the lifetime of the process and the listener would
+	// quietly answer fewer and fewer connections. A picture too big to convert
+	// is just a picture we pass through.
+	if decoded.width() > MAX_DIMENSION || decoded.height() > MAX_DIMENSION {
+		log::debug!(
+			"not re-encoding a {}x{} image: past what webp can hold",
+			decoded.width(),
+			decoded.height()
+		);
+
+		return None;
+	}
+
 	// Transparency has to survive, or a logo comes out on a black square.
+	//
+	// `encode_simple` rather than `encode` for the same reason as the guard
+	// above: it hands back an error where `encode` unwraps one.
 	let encoded = if decoded.color().has_alpha() {
 		webp::Encoder::from_rgba(&decoded.to_rgba8(), decoded.width(), decoded.height())
-			.encode(quality)
+			.encode_simple(false, quality)
 	} else {
 		webp::Encoder::from_rgb(&decoded.to_rgb8(), decoded.width(), decoded.height())
-			.encode(quality)
-	};
+			.encode_simple(false, quality)
+	}
+	.ok()?;
 
 	Some(encoded.to_vec())
 }
@@ -360,5 +383,23 @@ mod tests {
 			"a logo must not come back on a black square"
 		);
 		assert_eq!((features.width(), features.height()), (100, 100));
+	}
+
+	/// libwebp refuses anything past `WEBP_MAX_DIMENSION`, and the `webp`
+	/// crate's `encode` unwraps that refusal. Before the guard this test did
+	/// not fail, it panicked — which in an h3 worker means the thread is gone
+	/// for good and the listener answers one fewer connection from then on.
+	#[test]
+	fn an_image_too_wide_for_webp_is_passed_through() {
+		let wide = png(MAX_DIMENSION + 1, 2);
+
+		assert_eq!(to_webp(&wide, 80.0), None, "too wide to convert is not a reason to crash");
+	}
+
+	#[test]
+	fn an_image_at_the_limit_still_converts() {
+		let edge = png(MAX_DIMENSION, 2);
+
+		assert!(to_webp(&edge, 80.0).is_some(), "16383 is allowed, and must stay allowed");
 	}
 }

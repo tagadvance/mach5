@@ -21,6 +21,9 @@ use tempfile::TempDir;
 /// of milliseconds.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How many ports to try before treating a failure to start as real.
+const ATTEMPTS: usize = 4;
+
 /// A port nothing is listening on, found by letting the kernel pick one and
 /// then letting go of it.
 ///
@@ -54,7 +57,32 @@ impl Proxy {
 
 	/// As [`Self::start`], with extra configuration appended — which is how a
 	/// test says something the shared configuration does not.
+	///
+	/// Retries, because [`free_port`] is racy by construction and a dozen of
+	/// these start at once: the port can be taken between being handed over and
+	/// being bound, and the only symptom is a child that exits immediately. A
+	/// suite that fails one run in five is worse than no suite.
 	pub fn start_with(blocklist: &str, extra: &str) -> Self {
+		for _ in 0..ATTEMPTS - 1 {
+			let mut proxy = Self::spawn(blocklist, extra);
+			if proxy.await_ready() {
+				return proxy;
+			}
+		}
+
+		// The last one reports properly rather than retrying, so a real failure
+		// still shows its log instead of a bare "gave up".
+		let mut proxy = Self::spawn(blocklist, extra);
+		assert!(
+			proxy.await_ready(),
+			"proxy exited during startup\n{}",
+			proxy.log()
+		);
+
+		proxy
+	}
+
+	fn spawn(blocklist: &str, extra: &str) -> Self {
 		let dir = TempDir::new().expect("temporary directory");
 		let tcp_port = free_port();
 		// The QUIC listener wants a port of its own, and refuses to start
@@ -112,15 +140,12 @@ impl Proxy {
 			.spawn()
 			.expect("spawn the proxy");
 
-		let mut proxy = Self {
+		Self {
 			child,
 			dir,
 			tcp_port,
 			alt_svc,
-		};
-		proxy.await_ready();
-
-		proxy
+		}
 	}
 
 	/// The `alt-svc` value this instance was configured to advertise, so a test
@@ -212,16 +237,19 @@ impl Proxy {
 		read_response(&mut stream)
 	}
 
-	fn await_ready(&mut self) {
+	/// Whether it came up. `false` means the child died before listening,
+	/// which with a dozen of these starting at once is nearly always the port
+	/// having been taken between `free_port` handing it over and the bind.
+	fn await_ready(&mut self) -> bool {
 		let deadline = Instant::now() + STARTUP_TIMEOUT;
 
 		while Instant::now() < deadline {
 			if TcpStream::connect(("127.0.0.1", self.tcp_port)).is_ok() {
-				return;
+				return true;
 			}
 
-			if let Ok(Some(status)) = self.child.try_wait() {
-				panic!("proxy exited during startup ({status})\n{}", self.log());
+			if let Ok(Some(_)) = self.child.try_wait() {
+				return false;
 			}
 
 			std::thread::sleep(Duration::from_millis(25));

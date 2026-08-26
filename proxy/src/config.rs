@@ -120,6 +120,10 @@ pub struct Images {
 	/// How much disk the re-encoded images may take. 0 switches the cache off
 	/// and pays the conversion on every request.
 	pub cache_mb: u32,
+	/// How much disk the origins' own image bytes may take, so a repeat does
+	/// not have to be downloaded again. Freshness and revalidation are the
+	/// origin's to decide; see `httpcache.rs`.
+	pub origin_cache_mb: u32,
 	/// WebP quality, 0-100. 80 is the usual "indistinguishable at a glance"
 	/// setting and is what the measurements behind this were taken at.
 	pub quality: u8,
@@ -131,6 +135,7 @@ impl Default for Images {
 			enabled: true,
 			quality: 80,
 			cache_mb: 512,
+			origin_cache_mb: 256,
 		}
 	}
 }

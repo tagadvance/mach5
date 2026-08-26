@@ -82,6 +82,7 @@ pub struct Agents {
 	/// Used only for a host in [`crate::insecure::bypasses`]. See that module.
 	permissive: ureq::Agent,
 	bypasses: std::sync::Arc<crate::insecure::Bypasses>,
+	cache: Option<std::sync::Arc<crate::httpcache::Cache>>,
 	metrics: std::sync::Arc<crate::metrics::Metrics>,
 }
 
@@ -114,6 +115,7 @@ pub fn agents(config: &Config) -> Agents {
 		strict: builder().build(),
 		permissive,
 		bypasses: crate::insecure::bypasses(),
+		cache: crate::httpcache::shared(config),
 		metrics: crate::metrics::shared(),
 	}
 }
@@ -166,11 +168,35 @@ fn is_tls_failure(message: &str) -> bool {
 /// filling. When the client told us how long it would be, that length goes back
 /// on — ureq falls back to chunked encoding without it, and enough origins
 /// refuse a chunked upload that it is worth carrying through.
+/// What a fetch produced: a live response to read, or one that never left the
+/// disk.
+///
+/// A cached body still goes through the interceptors exactly as a fetched one
+/// does — the cache is in the fetch, not in the chain, so a plugin cannot tell
+/// the difference and does not have to.
+pub enum Fetched {
+	/// Boxed only to keep the two variants a similar size: a `ureq::Response`
+	/// is several hundred bytes and every caller matches on this immediately.
+	Live(Box<ureq::Response>),
+	Stored(ProxyResponse),
+}
+
 pub fn call(
 	agents: &Agents,
 	req: &ProxyRequest,
 	body: crate::body::RequestBody,
-) -> Result<ureq::Response, FetchError> {
+) -> Result<Fetched, FetchError> {
+	// Only a body-less request can be answered from disk: anything carrying an
+	// upload is not a repeat of something.
+	let cached = match &body {
+		crate::body::RequestBody::None if req.body.is_empty() => lookup(agents, req),
+		_ => None,
+	};
+
+	if let Some(Cached::Fresh(response)) = cached {
+		return Ok(Fetched::Stored(response));
+	}
+
 	let agent = agents.for_host(crate::host_of(&req.url));
 	let mut request = agent.request(&req.method, &req.url);
 	for (name, value) in &req.headers {
@@ -188,6 +214,18 @@ pub fn call(
 	// check by forging it.
 	request = request.set(VIA, via_id());
 
+	// A stale entry is worth an `if-none-match` rather than a download: the
+	// origin answers 304 in a couple of hundred bytes, and nothing is served
+	// staler than it allowed.
+	if let Some(Cached::Stale(entry, _)) = &cached {
+		if let Some(etag) = &entry.etag {
+			request = request.set("if-none-match", etag);
+		}
+		if let Some(modified) = &entry.last_modified {
+			request = request.set("if-modified-since", modified);
+		}
+	}
+
 	let result = match body {
 		crate::body::RequestBody::Streaming { reader, length } => {
 			if let Some(length) = length {
@@ -201,12 +239,91 @@ pub fn call(
 		crate::body::RequestBody::None => request.call(),
 	};
 
-	match result {
-		Ok(resp) => Ok(resp),
+	let response = match result {
+		Ok(resp) => resp,
 		// An HTTP error status is a perfectly good response to relay.
-		Err(ureq::Error::Status(_, resp)) => Ok(resp),
-		Err(ureq::Error::Transport(t)) => Err(failure(&agents.metrics, t.to_string())),
+		Err(ureq::Error::Status(_, resp)) => resp,
+		Err(ureq::Error::Transport(t)) => return Err(failure(&agents.metrics, t.to_string())),
+	};
+
+	// "Nothing has changed" — so what we already had is the answer, and only a
+	// few hundred bytes crossed the wire to establish it.
+	if response.status() == 304 {
+		if let Some(Cached::Stale(entry, body)) = cached {
+			if let Some(cache) = agents.cache.as_ref() {
+				cache.metrics().origin_cache_revalidated.increment();
+				cache.metrics().bytes_saved_by_origin_cache.add(body.len() as u64);
+				// Whatever the origin said this time about how long it is good
+				// for, so a revalidated entry does not ask again immediately.
+				let refreshed = crate::httpcache::entry_for(
+					entry.status,
+					&entry.headers,
+					crate::httpcache::now(),
+				);
+				cache.put(&crate::httpcache::key(req), &refreshed, &body);
+			}
+
+			return Ok(Fetched::Stored(crate::httpcache::as_response(&entry, body)));
+		}
 	}
+
+	Ok(Fetched::Live(Box::new(response)))
+}
+
+/// A stored answer, and whether it may be served without asking.
+enum Cached {
+	Fresh(ProxyResponse),
+	Stale(crate::httpcache::Entry, Vec<u8>),
+}
+
+fn lookup(agents: &Agents, req: &ProxyRequest) -> Option<Cached> {
+	let cache = agents.cache.as_ref()?;
+
+	// A hard refresh is a client saying it does not trust what anyone has
+	// stored, and it is right to be able to say so.
+	let wants = crate::httpcache::client_wants(req);
+	if wants == crate::httpcache::ClientWants::Nothing {
+		return None;
+	}
+	let Some((entry, body)) = cache.get(&crate::httpcache::key(req)) else {
+		cache.metrics().origin_cache_misses.increment();
+
+		return None;
+	};
+
+	if entry.is_fresh(crate::httpcache::now())
+		&& wants == crate::httpcache::ClientWants::Anything
+	{
+		cache.metrics().origin_cache_hits.increment();
+		cache.metrics().bytes_saved_by_origin_cache.add(body.len() as u64);
+
+		return Some(Cached::Fresh(crate::httpcache::as_response(&entry, body)));
+	}
+
+	if entry.can_revalidate() {
+		return Some(Cached::Stale(entry, body));
+	}
+
+	// Stale and nothing to ask with: no better than not having it.
+	cache.metrics().origin_cache_misses.increment();
+
+	None
+}
+
+/// Keep a response, if it is one that may be kept. Called by the front ends
+/// once the origin's own bytes are in hand and before anything has rewritten
+/// them.
+pub fn store(agents: &Agents, req: &ProxyRequest, status: u16, headers: &[(String, String)], body: &[u8]) {
+	let Some(cache) = agents.cache.as_ref() else {
+		return;
+	};
+
+	if !crate::httpcache::eligible(req, status, headers) {
+		return;
+	}
+
+	let entry = crate::httpcache::entry_for(status, headers, crate::httpcache::now());
+	cache.put(&crate::httpcache::key(req), &entry, body);
 }
 
 /// Sort one transport failure into the two kinds, counting it on the way past.
@@ -277,6 +394,7 @@ mod tests {
 			permissive: ureq::AgentBuilder::new().build(),
 			bypasses,
 			metrics: std::sync::Arc::new(crate::metrics::Metrics::default()),
+			cache: None,
 		}
 	}
 

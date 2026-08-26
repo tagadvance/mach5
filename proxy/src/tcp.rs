@@ -385,6 +385,30 @@ fn fetch_blocking(
 		}
 	};
 
+	// A response that came off the disk has no reader; it is already whole, so
+	// it takes the buffered path unconditionally and the interceptors run on it
+	// exactly as they would on a fetched one.
+	let resp = match resp {
+		upstream::Fetched::Stored(stored) => {
+			let mut head = ResponseHead {
+				status: stored.status,
+				headers: stored.headers,
+			};
+			let (body, coding) = encoding::decode(&mut head.headers, stored.body);
+			let mut response = ProxyResponse {
+				status: head.status,
+				headers: head.headers,
+				body,
+			};
+			interceptor.on_response(&request, &mut response);
+			response.body = encoding::encode(&mut response.headers, response.body, coding);
+			finish_buffered(shared, &request, response, head_tx);
+
+			return;
+		}
+		upstream::Fetched::Live(live) => *live,
+	};
+
 	let mut head = ResponseHead {
 		status: resp.status(),
 		headers: upstream::response_headers(&resp),
@@ -399,6 +423,8 @@ fn fetch_blocking(
 			);
 		}
 		metrics.bytes_from_origin.add(body.len() as u64);
+		// The origin's own bytes, before anything rewrites them.
+		upstream::store(&shared.agents, &request, head.status, &head.headers, &body);
 
 		// Interceptors rewrite plain bytes; the coding goes back on afterwards.
 		let (body, coding) = encoding::decode(&mut head.headers, body);
@@ -409,22 +435,7 @@ fn fetch_blocking(
 		};
 		interceptor.on_response(&request, &mut response);
 		response.body = encoding::encode(&mut response.headers, response.body, coding);
-		if shared.config.http.compress {
-			let plain = response.body.len();
-			response.body = encoding::ensure_compressed(
-				&request.headers,
-				response.status,
-				&mut response.headers,
-				response.body,
-				coding,
-			);
-			metrics
-				.bytes_saved_by_compression
-				.add(plain.saturating_sub(response.body.len()) as u64);
-		}
-		apply_alt_svc(&shared.config, &mut response.headers);
-		metrics.bytes_to_client.add(response.body.len() as u64);
-		let _ = head_tx.send(Outcome::Buffered(response));
+		finish_buffered(shared, &request, response, head_tx);
 
 		return;
 	}
@@ -617,6 +628,35 @@ async fn splice(
 	metrics.bytes_to_client.add(returned);
 
 	Ok(())
+}
+
+/// The last stretch every whole response takes: compress it if it is worth
+/// compressing, advertise h3, count it, and hand it to the connection.
+fn finish_buffered(
+	shared: &Shared,
+	request: &ProxyRequest,
+	mut response: ProxyResponse,
+	head_tx: tokio::sync::oneshot::Sender<Outcome>,
+) {
+	let metrics = crate::metrics::shared();
+
+	if shared.config.http.compress {
+		let plain = response.body.len();
+		response.body = crate::encoding::ensure_compressed(
+			&request.headers,
+			response.status,
+			&mut response.headers,
+			response.body,
+			None,
+		);
+		metrics
+			.bytes_saved_by_compression
+			.add(plain.saturating_sub(response.body.len()) as u64);
+	}
+
+	apply_alt_svc(&shared.config, &mut response.headers);
+	metrics.bytes_to_client.add(response.body.len() as u64);
+	let _ = head_tx.send(Outcome::Buffered(response));
 }
 
 /// Serve a response an interceptor produced instead of fetching the origin.

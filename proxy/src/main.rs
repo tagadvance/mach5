@@ -10,9 +10,11 @@ mod blocklist;
 mod body;
 mod ca;
 mod config;
+mod disk;
 mod cosmetic;
 mod encoding;
 mod fetch;
+mod httpcache;
 mod imagecache;
 mod images;
 mod inject;
@@ -392,6 +394,28 @@ fn handle_job(
 		}
 	};
 
+	// One that came off the disk is already whole, so it takes the buffered
+	// path unconditionally and the interceptors run on it exactly as they would
+	// on a fetched one.
+	let resp = match resp {
+		upstream::Fetched::Stored(stored) => {
+			let mut headers = stored.headers;
+			let (body, coding) = encoding::decode(&mut headers, stored.body);
+			let mut response = ProxyResponse {
+				status: stored.status,
+				headers,
+				body,
+			};
+			interceptor.on_response(&job.request, &mut response);
+			response.body = encoding::encode(&mut response.headers, response.body, coding);
+			compress_own(config, &job.request, &mut response);
+			metrics.bytes_to_client.add(response.body.len() as u64);
+
+			return send(Payload::Full(response));
+		}
+		upstream::Fetched::Live(live) => *live,
+	};
+
 	let mut head = ResponseHead {
 		status: resp.status(),
 		headers: upstream::response_headers(&resp),
@@ -406,6 +430,8 @@ fn handle_job(
 			);
 		}
 		metrics.bytes_from_origin.add(body.len() as u64);
+		// The origin's own bytes, before anything rewrites them.
+		upstream::store(agents, &job.request, head.status, &head.headers, &body);
 
 		// Interceptors rewrite plain bytes; the coding goes back on afterwards.
 		let (body, coding) = encoding::decode(&mut head.headers, body);

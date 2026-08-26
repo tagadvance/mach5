@@ -84,6 +84,12 @@ pub struct Metrics {
 	/// Upstream lookups by the families they came back with. Not utilisation —
 	/// see `resolver.rs` for why that would be a guess.
 	/// Re-encodings that did not have to be done again, and those that did.
+	/// Images served without asking the origin, and stale ones the origin
+	/// confirmed with a 304 instead of a download.
+	pub origin_cache_hits: Counter,
+	pub origin_cache_revalidated: Counter,
+	pub origin_cache_misses: Counter,
+	pub bytes_saved_by_origin_cache: Counter,
 	pub image_cache_hits: Counter,
 	pub image_cache_misses: Counter,
 	pub lookups_ipv4_only: Counter,
@@ -117,6 +123,10 @@ impl Default for Metrics {
 			bytes_to_client: Counter::default(),
 			bytes_saved_by_compression: Counter::default(),
 			bytes_saved_by_images: Counter::default(),
+			origin_cache_hits: Counter::default(),
+			origin_cache_revalidated: Counter::default(),
+			origin_cache_misses: Counter::default(),
+			bytes_saved_by_origin_cache: Counter::default(),
 			image_cache_hits: Counter::default(),
 			image_cache_misses: Counter::default(),
 			lookups_ipv4_only: Counter::default(),
@@ -161,6 +171,10 @@ impl Metrics {
 			bytes_to_client: self.bytes_to_client.get(),
 			bytes_saved_by_compression: self.bytes_saved_by_compression.get(),
 			bytes_saved_by_images: self.bytes_saved_by_images.get(),
+			origin_cache_hits: self.origin_cache_hits.get(),
+			origin_cache_revalidated: self.origin_cache_revalidated.get(),
+			origin_cache_misses: self.origin_cache_misses.get(),
+			bytes_saved_by_origin_cache: self.bytes_saved_by_origin_cache.get(),
 			image_cache_hits: self.image_cache_hits.get(),
 			image_cache_misses: self.image_cache_misses.get(),
 			lookups_ipv4_only: self.lookups_ipv4_only.get(),
@@ -221,6 +235,10 @@ pub struct Snapshot {
 	pub bytes_to_client: u64,
 	pub bytes_saved_by_compression: u64,
 	pub bytes_saved_by_images: u64,
+	pub origin_cache_hits: u64,
+	pub origin_cache_revalidated: u64,
+	pub origin_cache_misses: u64,
+	pub bytes_saved_by_origin_cache: u64,
 	pub image_cache_hits: u64,
 	pub image_cache_misses: u64,
 	pub lookups_ipv4_only: u64,

@@ -227,6 +227,7 @@ pub fn shared(config: &Config) -> Arc<Store> {
 pub struct Internal {
 	store: Arc<Store>,
 	settings: Arc<crate::settings::Store>,
+	cache_dir: std::path::PathBuf,
 	bypasses: Arc<crate::insecure::Bypasses>,
 	/// How long a typed bypass lasts, or `None` when the mechanism is off.
 	bypass_ttl: Option<std::time::Duration>,
@@ -252,6 +253,7 @@ impl Internal {
 		Self {
 			store: shared(config),
 			settings: crate::settings::shared(config),
+			cache_dir: config.paths.cache_dir.clone(),
 			bypasses: crate::insecure::bypasses(),
 			// `None` is the whole switch: no TTL, no endpoint.
 			bypass_ttl: config.bypass_phrase().map(|_| config.bypass_ttl()),
@@ -323,6 +325,7 @@ impl Internal {
 
 				empty(204)
 			}
+			("/.mach5/cache/clear", "POST") => self.clear_caches(),
 			("/.mach5/settings", "GET") => self.settings(),
 			("/.mach5/settings", "POST") => self.change_settings(body),
 			("/.mach5/hidden.css", "GET") => self.stylesheet(host),
@@ -331,6 +334,7 @@ impl Internal {
 			(
 				"/.mach5"
 				| "/.mach5/"
+				| "/.mach5/cache/clear"
 				| "/.mach5/settings"
 				| "/.mach5/stats.json"
 				| "/.mach5/hidden"
@@ -443,6 +447,24 @@ impl Internal {
 		self.settings.set(wanted);
 
 		self.settings()
+	}
+
+	/// Throw away everything cached. The blunt instrument for when something is
+	/// stored that should not be — the hard refresh below handles one URL, this
+	/// handles the lot.
+	///
+	/// Allowed where most controls are not, because emptying a cache cannot
+	/// make mach5 less safe; the worst it costs is a re-download. It is on the
+	/// status page rather than in the panel all the same, so it takes a
+	/// deliberate visit.
+	fn clear_caches(&self) -> ProxyResponse {
+		let removed: usize = ["images", "origins"]
+			.iter()
+			.map(|which| crate::disk::empty(&self.cache_dir.join(which)))
+			.sum();
+		log::info!("cache emptied: {removed} file(s) removed");
+
+		empty(204)
 	}
 
 	fn hidden(&self, host: &str) -> ProxyResponse {
@@ -646,6 +668,13 @@ addEventListener('click', (e) => {
 		return;
 	}
 
+	const action = e.target.closest('button[data-post]');
+	if (action) {
+		fetch(action.dataset.post, { method: 'POST' }).then(() => location.reload());
+
+		return;
+	}
+
 	const setting = e.target.closest('button[data-set]');
 	if (setting) {
 		fetch('/.mach5/settings', {
@@ -719,6 +748,19 @@ fn status_page(page: Page) -> String {
 	let internal = metrics::thousands(counted.internal);
 	let injected = metrics::thousands(counted.injected);
 	let passed_through = metrics::thousands(counted.passed_through);
+	// One line: a raw string has no line continuation, so a wrapped one would
+	// put backslashes on the page.
+	let caching = format!(
+		concat!(
+			r#"<td>{saved_images} <span class="note">from re-encoding · "#,
+			r#"{saved_origin} not re-fetched · {hits} served, {revalidated} revalidated"#,
+			r#"</span> <button data-post="/.mach5/cache/clear">empty it</button></td>"#,
+		),
+		saved_images = metrics::bytes(counted.bytes_saved_by_images),
+		saved_origin = metrics::bytes(counted.bytes_saved_by_origin_cache),
+		hits = metrics::thousands(counted.origin_cache_hits),
+		revalidated = metrics::thousands(counted.origin_cache_revalidated),
+	);
 	// What each lookup came back with, rather than which one was connected to:
 	// mach5 hands the list to ureq and is not told which entry won. See
 	// `resolver.rs`.
@@ -799,6 +841,7 @@ fn status_page(page: Page) -> String {
     <tr><th>Passed through undecrypted</th><td>{passed_through}</td></tr>
     <tr><th>Panel in pages</th>{injection}</tr>
     <tr><th>Origins reachable</th>{families}</tr>
+    <tr><th>Cache</th>{caching}</tr>
     <tr><th>Fetched unvalidated</th><td>{bypasses}</td></tr>
     <tr><th>Certificate failures</th><td>{tls_failures}</td></tr>
     <tr><th>Other upstream failures</th><td>{upstream_failures}</td></tr>
@@ -989,6 +1032,7 @@ mod tests {
 			settings: Arc::new(crate::settings::Store::load(
 				dir.path().join("settings.json"),
 			)),
+			cache_dir: dir.path().to_path_buf(),
 			bypasses: Arc::new(crate::insecure::Bypasses::default()),
 			bypass_ttl: Some(std::time::Duration::from_secs(60)),
 			metrics: Arc::new(Metrics::default()),

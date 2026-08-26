@@ -250,6 +250,30 @@ quality = 80
 # 0 switches it off.
 cache_mb = 512
 
+# How much disk the origins' own image bytes may take, so a repeat does not have
+# to be downloaded again. This is the one that saves bandwidth rather than CPU —
+# it matters little on a gigabit line at home and a great deal on a cloud
+# container's billed egress.
+#
+# It is ordinary shared-cache behaviour, not "keep it and stop asking". An entry
+# still fresh by the origin's own max-age is served with no request at all; a
+# stale one is revalidated with if-none-match, and a 304 is a couple of hundred
+# bytes where the image was three hundred thousand. Nothing is ever served
+# staler than the origin allowed.
+#
+# Only what is plainly public is stored at all: a 200, an image content-type, no
+# set-cookie, no `private`/`no-store`/`no-cache`, no authorization on the
+# request, no `vary` beyond accept and accept-encoding, and either a freshness
+# lifetime or a validator. Anything else is not cached rather than cached
+# carefully.
+#
+# A browser's hard refresh works: shift-reload sends `cache-control: no-cache`,
+# which mach5 honours by revalidating before serving. The status page also has
+# a button to empty both caches outright.
+#
+# 0 switches it off.
+origin_cache_mb = 256
+
 [passthrough]
 # Hosts mach5 must never decrypt.
 #

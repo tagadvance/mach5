@@ -63,7 +63,7 @@ impl Cache {
 		};
 		// Once at startup, so a budget lowered between runs takes effect
 		// without waiting for enough traffic to trigger a sweep.
-		cache.sweep();
+		crate::disk::sweep(&cache.dir, cache.budget);
 
 		Some(cache)
 	}
@@ -100,7 +100,7 @@ impl Cache {
 
 		if self.since_sweep.fetch_add(1, Ordering::Relaxed) + 1 >= SWEEP_EVERY {
 			self.since_sweep.store(0, Ordering::Relaxed);
-			self.sweep();
+			crate::disk::sweep(&self.dir, self.budget);
 		}
 	}
 
@@ -108,51 +108,6 @@ impl Cache {
 		self.dir.join(name_for(original, quality))
 	}
 
-	/// Delete the least recently used entries until the budget is met.
-	///
-	/// Least recently *used* rather than written, which needs the filesystem to
-	/// be updating access times — many are mounted `relatime` and will not.
-	/// Modification time is the honest fallback and, for files that are never
-	/// modified after they are written, means oldest-first.
-	fn sweep(&self) {
-		let Ok(entries) = std::fs::read_dir(&self.dir) else {
-			return;
-		};
-
-		let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
-			.filter_map(|entry| {
-				let entry = entry.ok()?;
-				let meta = entry.metadata().ok()?;
-				let used = meta.accessed().or_else(|_| meta.modified()).ok()?;
-
-				Some((used, meta.len(), entry.path()))
-			})
-			.collect();
-
-		let total: u64 = files.iter().map(|(_, size, _)| size).sum();
-		if total <= self.budget {
-			return;
-		}
-
-		files.sort_by_key(|(used, _, _)| *used);
-
-		let mut freed = 0;
-		for (_, size, path) in files {
-			if total - freed <= self.budget {
-				break;
-			}
-
-			if std::fs::remove_file(&path).is_ok() {
-				freed += size;
-			}
-		}
-
-		log::info!(
-			"image cache swept: {} freed to stay under {}",
-			crate::metrics::bytes(freed),
-			crate::metrics::bytes(self.budget)
-		);
-	}
 }
 
 /// The filename for a given input. SHA-256 rather than something cheaper
@@ -254,7 +209,7 @@ mod tests {
 			// Distinct timestamps, so "oldest first" has something to sort on.
 			std::thread::sleep(std::time::Duration::from_millis(5));
 		}
-		cache.sweep();
+		crate::disk::sweep(&cache.dir, cache.budget);
 
 		let left: u64 = std::fs::read_dir(&cache.dir)
 			.unwrap()

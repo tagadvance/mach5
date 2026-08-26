@@ -194,7 +194,9 @@ fn the_stylesheet_applies_this_hosts_list() {
 		response.header("content-type"),
 		Some("text/css; charset=utf-8")
 	);
-	assert_eq!(response.text(), "#promo { display: none !important }");
+	// One rule per selector, so a selector the browser cannot parse cannot take
+	// the rest of the host's list with it.
+	assert_eq!(response.text(), "#promo { display: none !important }\n");
 }
 
 #[test]

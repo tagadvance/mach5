@@ -545,11 +545,19 @@ impl Internal {
 			"text/css; charset=utf-8".to_string(),
 		));
 
-		if !selectors.is_empty() {
-			response.body =
-				format!("{} {{ display: none !important }}", selectors.join(", "))
-					.into_bytes();
-		}
+		// One rule per selector, not one rule listing all of them. CSS discards
+		// a whole style rule when any selector in its list fails to parse, and
+		// `usable` only refuses the characters that would let a selector escape
+		// its rule — it cannot tell a valid selector from an invalid one. So a
+		// single `,` posted by a page to its own host turned off every cosmetic
+		// rule for that host, including the ones from the filter lists, and the
+		// status page still listed it as hidden. A rule each contains the
+		// damage to the selector that is actually broken.
+		response.body = selectors
+			.iter()
+			.map(|selector| format!("{selector} {{ display: none !important }}\n"))
+			.collect::<String>()
+			.into_bytes();
 
 		response
 	}
@@ -1044,6 +1052,51 @@ mod tests {
 	use super::*;
 
 	use tempfile::TempDir;
+
+	/// The stylesheet as it should read: one rule per selector, so that one
+	/// selector the browser cannot parse cannot take the rest with it.
+	/// `usable` refuses the characters a selector could escape its rule with;
+	/// it cannot tell a *valid* selector from an invalid one, and nothing else
+	/// can either. So a page posting one meaningless-but-harmless selector to
+	/// its own host used to take out the whole stylesheet — CSS drops an entire
+	/// style rule when any selector in its list fails to parse, and everything
+	/// was in one rule. Every cosmetic rule for that host stopped applying, and
+	/// the status page still listed the bad one as hidden.
+	#[test]
+	fn one_unparsable_selector_does_not_take_the_others_with_it() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		for selector in [".cookie-banner", ",", ".ad-slot"] {
+			call(
+				&internal,
+				"POST",
+				"https://news.example/.mach5/hidden",
+				&format!(r#"{{"selector":"{selector}"}}"#),
+			);
+		}
+
+		let sheet = String::from_utf8(
+			call(&internal, "GET", "https://news.example/.mach5/hidden.css", "").body,
+		)
+		.unwrap();
+
+		for line in sheet.lines() {
+			assert!(
+				line.ends_with("{ display: none !important }"),
+				"each selector stands or falls on its own: {line}"
+			);
+		}
+		assert!(sheet.contains(".cookie-banner {"), "{sheet}");
+		assert!(sheet.contains(".ad-slot {"), "{sheet}");
+	}
+
+	fn rules(selectors: &[&str]) -> String {
+		selectors
+			.iter()
+			.map(|selector| format!("{selector} {{ display: none !important }}\n"))
+			.collect()
+	}
 
 	fn internal(dir: &TempDir) -> Internal {
 		internal_with(dir, CertAuthority::generate_dev(&Config::default()).unwrap())
@@ -1606,7 +1659,7 @@ mod tests {
 		assert_eq!(response.status, 200);
 		assert_eq!(
 			body_of(&response),
-			"#ad, .promo { display: none !important }"
+			rules(&["#ad", ".promo"])
 		);
 		assert!(response
 			.headers
@@ -1658,7 +1711,7 @@ mod tests {
 
 		assert_eq!(
 			css,
-			"#ad, .promo, .cookie-banner, .newsletter { display: none !important }",
+			rules(&["#ad", ".promo", ".cookie-banner", ".newsletter"]),
 			"picked first, then the lists, with the duplicate kept once"
 		);
 	}
@@ -1687,7 +1740,7 @@ mod tests {
 				"https://other.example/.mach5/hidden.css",
 				""
 			)),
-			"#ad { display: none !important }"
+			rules(&["#ad"])
 		);
 		assert!(
 			call(&internal, "GET", "https://third.example/.mach5/hidden.css", "")
@@ -1754,7 +1807,7 @@ mod tests {
 		));
 
 		assert_eq!(
-			css, "#ad, .x > .y { display: none !important }",
+			css, rules(&["#ad", ".x > .y"]),
 			"only the selectors that cannot break out survive"
 		);
 		assert!(usable(".wrap > .ad"), "a child combinator is a selector");

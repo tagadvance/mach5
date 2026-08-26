@@ -917,7 +917,7 @@ fn poll_requests(
 	loop {
 		match http3.poll(conn) {
 			Ok((stream_id, quiche::h3::Event::Headers { list, more_frames })) => {
-				match build_request(&list) {
+				match build_request(conn.server_name(), &list) {
 					Some((request, _)) if !more_frames => {
 						// No body to wait for.
 						dispatch(key, stream_id, request, None, jobs, park_cap);
@@ -1312,7 +1312,10 @@ fn flush(socket: &mio::net::UdpSocket, out: &mut [u8], clients: &mut ClientMap) 
 /// The request, and the body length the client declared for it — kept because
 /// the hop-by-hop filter drops `content-length`, and passing it upstream is
 /// what keeps an upload out of chunked encoding.
-fn build_request(list: &[quiche::h3::Header]) -> Option<(ProxyRequest, Option<u64>)> {
+fn build_request(
+	sni: Option<&str>,
+	list: &[quiche::h3::Header],
+) -> Option<(ProxyRequest, Option<u64>)> {
 	let mut method = None;
 	let mut authority = None;
 	let mut path = None;
@@ -1339,11 +1342,18 @@ fn build_request(list: &[quiche::h3::Header]) -> Option<(ProxyRequest, Option<u6
 	}
 
 	let scheme = scheme.unwrap_or_else(|| "https".to_string());
-	// TODO: this drops any port in :authority and lets the scheme's default
+	// The SNI wins, exactly as it does on the TCP side: it is the name the
+	// client asked TLS for, the only name this connection's certificate covers,
+	// and the only one a passthrough decision was ever made against. Trusting
+	// `:authority` instead meant a client could hand over any name it liked
+	// after the handshake — including one on the passthrough list, whose whole
+	// promise is that mach5 never holds its plaintext.
+	let authority = sni.map(str::to_string).or(authority)?;
+	// TODO: this drops any port in the authority and lets the scheme's default
 	// apply (443 for https). Correct for the common case; a transparent
 	// deployment should instead recover the real origin address via
 	// SO_ORIGINAL_DST to preserve nonstandard ports.
-	let url = format!("{scheme}://{}{}", authority_host(&authority?), path?);
+	let url = format!("{scheme}://{}{}", authority_host(&authority), path?);
 
 	Some((
 		ProxyRequest {
@@ -1532,7 +1542,7 @@ mod tests {
 			quiche::h3::Header::new(b"connection", b"keep-alive"),
 		];
 
-		let (req, length) = build_request(&list).expect("should parse");
+		let (req, length) = build_request(None, &list).expect("should parse");
 
 		assert_eq!(length, None, "a GET declares no body length");
 		assert_eq!(req.method, "GET");
@@ -1644,10 +1654,32 @@ mod tests {
 		);
 	}
 
+	/// The handshake decided what this connection is, including whether the
+	/// host was one never to decrypt. Letting `:authority` name a different
+	/// one afterwards steps around that decision entirely — and the TCP side
+	/// already prefers the SNI for exactly this reason.
+	#[test]
+	fn the_name_asked_of_tls_wins_over_the_one_in_the_request() {
+		let list = vec![
+			quiche::h3::Header::new(b":method", b"GET"),
+			quiche::h3::Header::new(b":scheme", b"https"),
+			quiche::h3::Header::new(b":authority", b"secure.bank.example"),
+			quiche::h3::Header::new(b":path", b"/account"),
+		];
+
+		let (req, _) = build_request(Some("innocent.example"), &list).expect("should parse");
+		assert_eq!(req.url, "https://innocent.example/account");
+
+		// And with no SNI at all — which no browser does, but a hand-written
+		// client can — the authority is all there is.
+		let (req, _) = build_request(None, &list).expect("should parse");
+		assert_eq!(req.url, "https://secure.bank.example/account");
+	}
+
 	#[test]
 	fn build_request_needs_authority_and_path() {
 		let list = vec![quiche::h3::Header::new(b":method", b"GET")];
 
-		assert!(build_request(&list).is_none());
+		assert!(build_request(None, &list).is_none());
 	}
 }

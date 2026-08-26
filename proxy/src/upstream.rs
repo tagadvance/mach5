@@ -199,8 +199,23 @@ pub fn call(
 
 	let agent = agents.for_host(crate::host_of(&req.url));
 	let mut request = agent.request(&req.method, &req.url);
+	// A stale entry means the conditional request about to be sent is *ours*,
+	// asking about the copy on disk.
+	let revalidating = matches!(cached, Some(Cached::Stale(..)));
+
 	for (name, value) in &req.headers {
 		if !forwarded(name, value) {
+			continue;
+		}
+
+		// The client's own validators ask a different question, and RFC 9110
+		// §13.1.3 says a server presented with `if-none-match` must ignore
+		// `if-modified-since` — so a client sending `if-none-match: *` against
+		// an entry we hold on a `last-modified` alone gets a 304 for *its*
+		// question, which the code below then reads as the origin confirming
+		// what mach5 had stored. That is a stale asset pinned in a shared cache
+		// by anyone who asks for it.
+		if revalidating && conditional(name) {
 			continue;
 		}
 
@@ -248,20 +263,46 @@ pub fn call(
 	// few hundred bytes crossed the wire to establish it.
 	if response.status() == 304 {
 		if let Some(Cached::Stale(entry, body)) = cached {
+			// RFC 9111 §4.3.4: what the origin said *this* time replaces what
+			// was stored, header by header. Re-applying the stored ones left
+			// the origin no way to shorten a lifetime, add a `vary`, or take
+			// back permission to store this at all — and reset the clock to a
+			// full lifetime every time it tried.
+			let headers =
+				crate::httpcache::refreshed_headers(&entry.headers, &response_headers(&response));
+
 			if let Some(cache) = agents.cache.as_ref() {
 				cache.metrics().origin_cache_revalidated.increment();
 				cache.metrics().bytes_saved_by_origin_cache.add(body.len() as u64);
-				// Whatever the origin said this time about how long it is good
-				// for, so a revalidated entry does not ask again immediately.
-				let refreshed = crate::httpcache::entry_for(
-					entry.status,
-					&entry.headers,
-					crate::httpcache::now(),
-				);
-				cache.put(&crate::httpcache::key(req), &refreshed, &body);
+
+				let key = crate::httpcache::key(req);
+				if crate::httpcache::eligible(req, entry.status, &headers) {
+					let refreshed = crate::httpcache::entry_for(
+						entry.status,
+						&headers,
+						crate::httpcache::now(),
+					);
+					cache.put(&key, &refreshed, &body);
+				} else {
+					// It was public when it was stored and the origin has just
+					// said it is not. Keeping it would mean handing it to the
+					// next person who asks.
+					log::info!(
+						"dropping {} from the cache: the origin no longer says it is public",
+						crate::redact::url(&req.url)
+					);
+					cache.forget(&key);
+				}
 			}
 
-			return Ok(Fetched::Stored(crate::httpcache::as_response(&entry, body)));
+			let refreshed = crate::httpcache::Entry {
+				headers,
+				..entry
+			};
+
+			return Ok(Fetched::Stored(crate::httpcache::as_response(
+				&refreshed, body,
+			)));
 		}
 	}
 
@@ -416,6 +457,15 @@ pub fn response_headers(resp: &ureq::Response) -> Vec<(String, String)> {
 	headers
 }
 
+/// Headers that make a request conditional, and therefore belong to whoever is
+/// doing the conditioning.
+fn conditional(name: &str) -> bool {
+	matches!(
+		name.to_ascii_lowercase().as_str(),
+		"if-none-match" | "if-modified-since" | "if-match" | "if-unmodified-since" | "if-range"
+	)
+}
+
 /// Whether a header the client sent goes to the origin as it stands.
 ///
 /// Two do not, for unrelated reasons:
@@ -456,6 +506,31 @@ pub fn is_hop_by_hop(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// A conditional request mach5 sends is about the copy on *its* disk. RFC
+	/// 9110 §13.1.3 says a server given `if-none-match` must ignore
+	/// `if-modified-since`, so a client's `if-none-match: *` against an entry
+	/// held on a `last-modified` alone got a 304 for the client's question —
+	/// which the 304 handler then read as the origin confirming what mach5 had
+	/// stored, and refreshed a stale body to a full lifetime for everybody.
+	#[test]
+	fn a_clients_own_validators_do_not_go_with_our_revalidation() {
+		for name in [
+			"if-none-match",
+			"If-Modified-Since",
+			"if-match",
+			"if-unmodified-since",
+			"if-range",
+		] {
+			assert!(conditional(name), "{name} conditions a request");
+		}
+
+		// Not conditionals, and a proxy that dropped these would break ranges
+		// and content negotiation.
+		for name in ["range", "if-none-matches", "accept", "etag"] {
+			assert!(!conditional(name), "{name} is not a conditional");
+		}
+	}
 
 	/// A header sent more than once is not a curiosity: two `set-cookie` lines
 	/// are how a login hands out a session and a CSRF token in one response.

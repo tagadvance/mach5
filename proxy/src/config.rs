@@ -28,6 +28,7 @@ pub struct Config {
 	pub paths: Paths,
 	pub plugins: Plugins,
 	pub blocklist: Blocklist,
+	pub log: Log,
 	pub cosmetic: Cosmetic,
 	pub internal: Internal,
 	pub inject: Inject,
@@ -81,6 +82,32 @@ impl Default for Http {
 			compress: true,
 		}
 	}
+}
+
+/// How much of a URL is written to the log.
+///
+/// mach5 sees every request every device makes, so its log is a record of all
+/// of it. The query string is the part that carries tokens and session ids, and
+/// a log is kept long after they should have been forgotten.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UrlLogging {
+	/// Scheme, host and path. The default: enough to tell which page, without
+	/// the part that is usually a credential.
+	#[default]
+	Path,
+	/// Scheme and host only, for when even a path is too much — a magic link
+	/// carries its secret there.
+	Host,
+	/// Everything, including the query string. For debugging, not for a proxy
+	/// carrying real traffic.
+	Full,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct Log {
+	pub urls: UrlLogging,
 }
 
 /// Root certificate authority used to sign minted leaves. When either path is

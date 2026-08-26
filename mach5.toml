@@ -187,6 +187,27 @@ enabled = true
 # rather mach5 did not modify the page at all.
 # exclude = ["bank.example"]
 
+[log]
+# How much of a URL is written to the log.
+#
+# mach5 terminates TLS for every device pointed at it, so its log is a record of
+# everything those devices did — and the query string is where the dangerous
+# part of that lives: OAuth codes, password-reset tokens, session ids, presigned
+# signatures, search terms. Written at the default level into a container log
+# that is kept until the container is removed, those are credentials sitting on
+# disk long after they should have been forgotten.
+#
+#   "path"  scheme, host and path, without the query. The default.
+#   "host"  scheme and host only, for when even a path is too much — a magic
+#           link carries its secret there.
+#   "full"  everything. For debugging, not for a proxy carrying real traffic.
+#
+# This covers URLs mach5 logs itself, including the ones quoted back inside a
+# library's error message. It cannot cover what a plugin prints: plugin stderr
+# goes straight to this log, so a plugin that logs bodies or URLs is its own
+# decision to make.
+urls = "path"
+
 [tls]
 # Minted certs have no revocation path, so expiry is the only bound on a leaked
 # key. Keep the window short.

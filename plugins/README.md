@@ -165,7 +165,10 @@ large to hold.
 - **Always print exactly one line per line you receive**, and flush it. A plugin
   that goes quiet is abandoned after `plugin_timeout_seconds`.
 - Bodies are base64-encoded. Decode before inspecting, encode after modifying.
-- Write debug output to **stderr**, never stdout — stdout is the protocol.
+- Write debug output to **stderr**, never stdout — stdout is the protocol. Note
+  that stderr *is* the proxy's log: mach5 keeps query strings out of its own
+  lines by default, and a plugin printing URLs or bodies undoes that on a
+  machine that sees every request every device makes.
 - A plugin that crashes, hangs, or prints nonsense is dropped and traffic keeps
   flowing unmodified. Check the proxy log if a plugin stops taking effect.
 - Each proxy worker thread starts its own copy of every plugin, so a plugin may

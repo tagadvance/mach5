@@ -149,7 +149,7 @@ pub fn take(
 			log::warn!(
 				"{} {} is wanted in memory but exceeds max_request_body_mb",
 				request.method,
-				request.url
+				crate::redact::url(&request.url)
 			);
 
 			Err(Rejected {
@@ -158,7 +158,10 @@ pub fn take(
 			})
 		}
 		Err(TooLarge::Interrupted(e)) => {
-			log::debug!("upload interrupted for {}: {e}", request.url);
+			log::debug!(
+				"upload interrupted for {}: {e}",
+				crate::redact::url(&request.url)
+			);
 
 			Err(Rejected {
 				status: 400,

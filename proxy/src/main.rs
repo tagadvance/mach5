@@ -20,6 +20,7 @@ mod internal;
 mod interstitial;
 mod metrics;
 mod plugin;
+mod redact;
 mod tcp;
 mod upstream;
 
@@ -144,6 +145,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 	env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
 	let config = Arc::new(Config::load()?);
+	// Before anything has a URL to log.
+	redact::init(config.log.urls);
 	let listen = config.listen.0;
 
 	if let Err(e) = std::fs::create_dir_all(&config.paths.cache_dir) {
@@ -309,7 +312,7 @@ fn handle_job(
 			log::info!(
 				"short-circuited {} {}",
 				job.request.method,
-				job.request.url
+				redact::url(&job.request.url)
 			);
 			metrics.bytes_to_client.add(response.body.len() as u64);
 
@@ -353,7 +356,11 @@ fn handle_job(
 	};
 
 	if let Some(response) = answer {
-		log::info!("short-circuited {} {}", job.request.method, job.request.url);
+		log::info!(
+			"short-circuited {} {}",
+			job.request.method,
+			redact::url(&job.request.url)
+		);
 		metrics.bytes_to_client.add(response.body.len() as u64);
 
 		return send(Payload::Full(response));
@@ -365,7 +372,8 @@ fn handle_job(
 			let host = host_of(&job.request.url);
 			let page = match &failure {
 				upstream::FetchError::Tls(detail) => {
-					log::warn!("certificate validation failed for {host}: {detail}");
+					let logged = redact::detail(detail, &job.request.url);
+					log::warn!("certificate validation failed for {host}: {logged}");
 
 					interstitial::certificate_error(host, detail, config.bypass_phrase())
 				}
@@ -385,7 +393,10 @@ fn handle_job(
 	if interceptor.wants_body(&job.request, &head) {
 		let mut body = Vec::new();
 		if let Err(e) = resp.into_reader().read_to_end(&mut body) {
-			log::warn!("failed reading upstream body for {}: {e}", job.request.url);
+			log::warn!(
+				"failed reading upstream body for {}: {e}",
+				redact::url(&job.request.url)
+			);
 		}
 		metrics.bytes_from_origin.add(body.len() as u64);
 
@@ -447,7 +458,10 @@ fn handle_job(
 				send(Payload::Chunk(chunk))?;
 			}
 			Err(e) => {
-				log::warn!("upstream read failed for {}: {e}", job.request.url);
+				log::warn!(
+					"upstream read failed for {}: {e}",
+					redact::url(&job.request.url)
+				);
 
 				break;
 			}
@@ -855,7 +869,7 @@ fn dispatch(
 	log::info!(
 		"proxying stream={stream_id} {} {}{}",
 		request.method,
-		request.url,
+		redact::url(&request.url),
 		if upload.is_some() {
 			" (body streaming)"
 		} else {

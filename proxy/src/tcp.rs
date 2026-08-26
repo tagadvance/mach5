@@ -357,7 +357,7 @@ fn fetch_blocking(
 	log::info!(
 		"proxying tcp {} {} ({} body bytes)",
 		request.method,
-		request.url,
+		crate::redact::url(&request.url),
 		request.body.len()
 	);
 
@@ -380,7 +380,10 @@ fn fetch_blocking(
 	if interceptor.wants_body(&request, &head) {
 		let mut body = Vec::new();
 		if let Err(e) = resp.into_reader().read_to_end(&mut body) {
-			log::warn!("failed reading upstream body for {}: {e}", request.url);
+			log::warn!(
+				"failed reading upstream body for {}: {e}",
+				crate::redact::url(&request.url)
+			);
 		}
 		metrics.bytes_from_origin.add(body.len() as u64);
 
@@ -555,7 +558,11 @@ fn short_circuit(
 	mut response: ProxyResponse,
 	head_tx: tokio::sync::oneshot::Sender<Outcome>,
 ) {
-	log::info!("short-circuited {} {}", request.method, request.url);
+	log::info!(
+		"short-circuited {} {}",
+		request.method,
+		crate::redact::url(&request.url)
+	);
 	apply_alt_svc(&shared.config, &mut response.headers);
 	crate::metrics::shared()
 		.bytes_to_client
@@ -573,7 +580,8 @@ fn failure_page(
 
 	match failure {
 		upstream::FetchError::Tls(detail) => {
-			log::warn!("certificate validation failed for {host}: {detail}");
+			let logged = crate::redact::detail(detail, &request.url);
+			log::warn!("certificate validation failed for {host}: {logged}");
 
 			interstitial::certificate_error(host, detail, config.bypass_phrase())
 		}

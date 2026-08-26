@@ -61,6 +61,7 @@ button:hover { background: #1867cf; }
 <script>
 (() => {
 	const want = "thisisunsafe";
+	const token = "15f7f76a17ec00c4aa16d0ac993fb217464117f96c222c0b8c7f60f8ec3915d9";
 	let typed = '';
 	addEventListener('keypress', (e) => {
 		typed = (typed + String.fromCharCode(e.charCode || e.keyCode)).slice(-want.length);
@@ -68,8 +69,16 @@ button:hover { background: #1867cf; }
 			return;
 		}
 
-		const next = encodeURIComponent(location.pathname + location.search);
-		location.href = '/.mach5/bypass?next=' + next;
+		fetch('/.mach5/bypass', {
+			method: 'POST',
+			credentials: 'omit',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ token: token }),
+		}).then((r) => {
+			if (r.ok) {
+				location.reload();
+			}
+		}, () => {});
 	});
 })();
 </script>

@@ -144,8 +144,14 @@ impl Blocklist {
 
 	/// Whether two builds hold the same rules. A refresh that changed nothing
 	/// should say nothing, and this is the only way to know which it was.
+	/// Every set, not just two of them. A refresh in which only the
+	/// `$third-party` rules moved compared equal, so the new list was published
+	/// with the log saying nothing had changed.
 	fn same_as(&self, other: &Self) -> bool {
-		self.blocked == other.blocked && self.allowed == other.allowed
+		self.blocked == other.blocked
+			&& self.blocked_embedded == other.blocked_embedded
+			&& self.allowed == other.allowed
+			&& self.allowed_embedded == other.allowed_embedded
 	}
 
 	/// True when this host, or any domain it sits under, is listed — so
@@ -166,11 +172,24 @@ impl Blocklist {
 		covers(&self.blocked, host) || (embedded && covers(&self.blocked_embedded, host))
 	}
 
-	/// Whether this host is blocked outright, for callers with no request in
-	/// hand — the tests, and anything asking about a name rather than a fetch.
+	/// Whether a plain first-party request for this host is blocked.
+	///
+	/// A convenience for tests, and deliberately a *call* to the production
+	/// predicate rather than a second implementation of it: this used to
+	/// re-write the allow-beats-block rule by hand and leave the third-party
+	/// sets out entirely, so nothing anywhere asserted that an exception beats
+	/// a `$third-party` rule — the interaction that was being added at the
+	/// time.
 	#[cfg(test)]
 	pub fn blocks(&self, host: &str) -> bool {
-		!covers(&self.allowed, host) && covers(&self.blocked, host)
+		let plain = ProxyRequest {
+			method: "GET".to_string(),
+			url: format!("https://{host}/"),
+			headers: Vec::new(),
+			body: Vec::new(),
+		};
+
+		self.blocks_request(&plain, host)
 	}
 }
 

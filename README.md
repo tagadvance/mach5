@@ -156,6 +156,16 @@ Because every name resolves to the proxy, `/.mach5/` is reachable on any host:
 | `/.mach5/hidden.css` | this host's hidden elements, as a stylesheet |
 | `/.mach5/mach5.js` | the element picker |
 
+## Documentation
+
+| | |
+| --- | --- |
+| [`SECURITY.md`](SECURITY.md) | the threat model, and the rules for running it |
+| [`docs/architecture.md`](docs/architecture.md) | how it works: the life of a request, the chain order, backpressure |
+| [`docs/running.md`](docs/running.md) | what it costs in memory, CPU and disk — measured |
+| [`plugins/README.md`](plugins/README.md) | the plugin protocol |
+| `mach5.toml` | every setting, documented inline |
+
 ## Building
 
 Rust, on Cloudflare's [quiche](https://github.com/cloudflare/quiche). BoringSSL

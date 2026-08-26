@@ -29,6 +29,7 @@ pub struct Config {
 	pub plugins: Plugins,
 	pub blocklist: Blocklist,
 	pub log: Log,
+	pub images: Images,
 	pub passthrough: Passthrough,
 	pub cosmetic: Cosmetic,
 	pub internal: Internal,
@@ -81,6 +82,25 @@ impl Default for Http {
 			keep_alive: true,
 			idle_timeout_seconds: 60,
 			compress: true,
+		}
+	}
+}
+
+/// Re-encoding images to WebP on the way past.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Images {
+	pub enabled: bool,
+	/// WebP quality, 0-100. 80 is the usual "indistinguishable at a glance"
+	/// setting and is what the measurements behind this were taken at.
+	pub quality: u8,
+}
+
+impl Default for Images {
+	fn default() -> Self {
+		Self {
+			enabled: true,
+			quality: 80,
 		}
 	}
 }

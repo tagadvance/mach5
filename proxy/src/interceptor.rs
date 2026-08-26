@@ -142,6 +142,12 @@ impl Chain {
 			links.push(Box::new(crate::inject::Inject::new(config)));
 		}
 
+		// After injection and before the plugins: a plugin that wants to look at
+		// an image should see what the origin sent, not our re-encoding of it.
+		if config.images.enabled {
+			links.push(Box::new(crate::images::Images::new(config)));
+		}
+
 		if config.plugins.enabled {
 			for plugin in crate::plugin::load_all(config) {
 				links.push(Box::new(plugin));

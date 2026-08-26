@@ -79,6 +79,8 @@ pub struct Metrics {
 	/// the origin left in the clear: what the client would have had to read
 	/// otherwise.
 	pub bytes_saved_by_compression: Counter,
+	/// Bytes not sent because an image was re-encoded.
+	pub bytes_saved_by_images: Counter,
 	/// Time spent waiting on each plugin, by plugin name.
 	///
 	/// A locked map rather than the atomics above, because the keys are plugin
@@ -106,6 +108,7 @@ impl Default for Metrics {
 			bytes_from_origin: Counter::default(),
 			bytes_to_client: Counter::default(),
 			bytes_saved_by_compression: Counter::default(),
+			bytes_saved_by_images: Counter::default(),
 			plugins: Mutex::new(BTreeMap::new()),
 		}
 	}
@@ -144,6 +147,7 @@ impl Metrics {
 			bytes_from_origin: self.bytes_from_origin.get(),
 			bytes_to_client: self.bytes_to_client.get(),
 			bytes_saved_by_compression: self.bytes_saved_by_compression.get(),
+			bytes_saved_by_images: self.bytes_saved_by_images.get(),
 			plugins: self
 				.plugins
 				.lock()
@@ -198,6 +202,7 @@ pub struct Snapshot {
 	pub bytes_from_origin: u64,
 	pub bytes_to_client: u64,
 	pub bytes_saved_by_compression: u64,
+	pub bytes_saved_by_images: u64,
 	/// Keyed by plugin name — the one part of the JSON that is not flat,
 	/// because the set of plugins is not known until they are loaded.
 	pub plugins: BTreeMap<String, PluginStats>,

@@ -655,6 +655,7 @@ fn status_page(
 	let from_origin = metrics::bytes(counted.bytes_from_origin);
 	let to_client = metrics::bytes(counted.bytes_to_client);
 	let saved = metrics::bytes(counted.bytes_saved_by_compression);
+	let saved_images = metrics::bytes(counted.bytes_saved_by_images);
 	let plugins = plugin_table(&counted.plugins);
 	let certificates = if bypassed {
 		"<p>Certificate validation is <strong>bypassed</strong> for this site until \
@@ -705,6 +706,7 @@ fn status_page(
     <tr><th>Body bytes from origins</th><td>{from_origin}</td></tr>
     <tr><th>Body bytes to clients</th><td>{to_client}</td></tr>
     <tr><th>Bytes saved compressing</th><td>{saved}</td></tr>
+    <tr><th>Saved by re-encoding images</th><td>{saved_images}</td></tr>
   </table>
   {plugins}
   <h2>{host}</h2>

@@ -273,11 +273,21 @@ fn compressible(headers: &[(String, String)]) -> bool {
 /// What we served now depends on a request header, and a shared cache has to
 /// know that before it hands this body to a client that cannot read it.
 fn vary_on_accept_encoding(headers: &mut Vec<(String, String)>) {
+	vary_on(headers, ACCEPT_ENCODING);
+}
+
+/// The same, for a body chosen by what the client said it could display —
+/// which is [`crate::images`] re-encoding to WebP.
+pub fn vary_on_accept(headers: &mut Vec<(String, String)>) {
+	vary_on(headers, "accept");
+}
+
+fn vary_on(headers: &mut Vec<(String, String)>, header: &str) {
 	let Some((_, value)) = headers
 		.iter_mut()
 		.find(|(name, _)| name.eq_ignore_ascii_case(VARY))
 	else {
-		headers.push((VARY.to_string(), ACCEPT_ENCODING.to_string()));
+		headers.push((VARY.to_string(), header.to_string()));
 
 		return;
 	};
@@ -286,13 +296,13 @@ fn vary_on_accept_encoding(headers: &mut Vec<(String, String)>) {
 	// list, not replacing it.
 	if value
 		.split(',')
-		.any(|token| token.trim().eq_ignore_ascii_case(ACCEPT_ENCODING))
+		.any(|token| token.trim().eq_ignore_ascii_case(header))
 	{
 		return;
 	}
 
 	value.push_str(", ");
-	value.push_str(ACCEPT_ENCODING);
+	value.push_str(header);
 }
 
 fn decompress(coding: Coding, body: &[u8]) -> std::io::Result<Vec<u8>> {

@@ -476,7 +476,7 @@ fn handle_job(
 	let wants_chunks = interceptor.wants_chunks(&job.request, &head);
 	// Rewritten on the way past rather than held whole, so the client starts
 	// receiving a page while the origin is still writing it.
-	let mut rewriting = inject::streamer_for(config, &job.request, &head);
+	let mut rewriting = inject::streamer_for(config, &job.request, &mut head);
 	send(Payload::Head(head))?;
 
 	let mut reader = resp.into_reader();

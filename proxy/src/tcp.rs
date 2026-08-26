@@ -457,7 +457,7 @@ fn fetch_blocking(
 	let wants_chunks = interceptor.wants_chunks(&request, &head);
 	// A page is rewritten on its way past rather than held whole, so the client
 	// starts receiving it while the origin is still writing it.
-	let mut rewriting = crate::inject::streamer_for(&shared.config, &request, &head);
+	let mut rewriting = crate::inject::streamer_for(&shared.config, &request, &mut head);
 	if head_tx.send(Outcome::Streaming(head)).is_err() {
 		return;
 	}

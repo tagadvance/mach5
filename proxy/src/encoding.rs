@@ -396,6 +396,38 @@ impl Encoder {
 	}
 }
 
+/// What to compress a streaming body with, when the origin sent it in the
+/// clear.
+///
+/// The buffered path has [`ensure_compressed`] for this. A body that streams
+/// never reaches it, so without this an origin serving uncompressed HTML would
+/// have its page relayed uncompressed — which is what happened when injection
+/// stopped buffering, and cost sqlite.org's page a fifth of its size.
+///
+/// `None` means send it as it came: nothing worth compressing, or a client that
+/// takes no coding.
+pub fn streaming_coding(
+	request: &[(String, String)],
+	response: &[(String, String)],
+) -> Option<Coding> {
+	if has_content_encoding(response) || !compressible(response) {
+		return None;
+	}
+
+	negotiate(request)
+		.split(',')
+		.next()
+		.and_then(|token| Coding::parse(token.trim()))
+}
+
+/// Say that a body now carries a coding, and that what was served depended on
+/// what the client asked for.
+pub fn declare_coding(headers: &mut Vec<(String, String)>, coding: Coding) {
+	headers.retain(|(name, _)| !name.eq_ignore_ascii_case(CONTENT_ENCODING));
+	headers.push((CONTENT_ENCODING.to_string(), coding.token().to_string()));
+	vary_on_accept_encoding(headers);
+}
+
 /// The coding named by a `content-encoding`, if it is one we can work in.
 pub fn coding_of(headers: &[(String, String)]) -> Option<Coding> {
 	headers

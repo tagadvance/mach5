@@ -214,7 +214,7 @@ fn find_ascii(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 pub fn streamer_for(
 	config: &Config,
 	req: &ProxyRequest,
-	head: &ResponseHead,
+	head: &mut ResponseHead,
 ) -> Option<Streamer> {
 	if !config.inject.enabled {
 		return None;
@@ -225,13 +225,34 @@ pub fn streamer_for(
 		return None;
 	}
 
-	Streamer::new(
+	// A page the origin sent in the clear is compressed on its way out, which
+	// the buffered path used to do and this one has to do for itself. Decided
+	// here rather than inside the streamer because the headers have to say so
+	// before the head is sent, and the head goes out first.
+	let output = match crate::encoding::coding_of(&head.headers) {
+		Some(coding) => Some(coding),
+		None if config.http.compress => {
+			crate::encoding::streaming_coding(&req.headers, &head.headers)
+		}
+		None => None,
+	};
+
+	let streamer = Streamer::new(
 		&head.headers,
 		Lazy {
 			enabled: config.inject.lazy_images,
 			eager: config.inject.eager_images,
 		},
-	)
+		output,
+	)?;
+
+	if crate::encoding::coding_of(&head.headers).is_none() {
+		if let Some(coding) = output {
+			crate::encoding::declare_coding(&mut head.headers, coding);
+		}
+	}
+
+	Some(streamer)
 }
 
 /// One set of exclusions for the process, as with everything else built per
@@ -309,7 +330,11 @@ type Sink = Box<dyn FnMut(&[u8])>;
 impl Streamer {
 	/// `None` when this response is not one to rewrite on the fly, in which
 	/// case the caller relays it as it always did.
-	pub fn new(response_headers: &[(String, String)], lazy: Lazy) -> Option<Self> {
+	pub fn new(
+		response_headers: &[(String, String)],
+		lazy: Lazy,
+		output: Option<crate::encoding::Coding>,
+	) -> Option<Self> {
 		let coding = crate::encoding::coding_of(response_headers);
 		// A coding named but not understood cannot be decoded, so the bytes
 		// cannot be parsed, so there is nothing to do but pass them through.
@@ -327,12 +352,19 @@ impl Streamer {
 		// handlers fire in the order the elements appear.
 		let seen = Rc::new(Cell::new(0usize));
 
+		// Counted where it happens rather than where it was considered: the
+		// buffered path counts in `on_response`, and a streamed page never goes
+		// through it.
+		let counted = crate::metrics::shared();
+		let also_counted = counted.clone();
+
 		let sink = out.clone();
 		let settings = Settings::new()
 			.with_encoding(encoding)
 			.append_element_content_handler(element!("head", move |el| {
 				el.append(TAGS, ContentType::Html);
 				into_head.set(true);
+				counted.injected.increment();
 
 				Ok(())
 			}))
@@ -340,6 +372,7 @@ impl Streamer {
 				if !into_body.get() {
 					el.prepend(TAGS, ContentType::Html);
 					into_body.set(true);
+					also_counted.injected.increment();
 				}
 
 				Ok(())
@@ -351,8 +384,11 @@ impl Streamer {
 			}));
 
 		Some(Self {
+			// What arrived and what leaves are separate decisions: a page sent
+			// in the clear is compressed on the way out, and one that arrived
+			// compressed keeps the coding it came in.
 			decoder: coding.map(crate::encoding::Decoder::new),
-			encoder: coding.map(crate::encoding::Encoder::new),
+			encoder: output.map(crate::encoding::Encoder::new),
 			rewriter: HtmlRewriter::new(
 				settings,
 				Box::new(move |chunk: &[u8]| sink.borrow_mut().extend_from_slice(chunk)) as Sink,
@@ -705,7 +741,7 @@ mod tests {
 	/// Push a whole document through the streamer in one go, which is what the
 	/// front ends do a chunk at a time.
 	fn stream(html: &[u8], lazy: Lazy) -> String {
-		let mut streamer = Streamer::new(&headers(&[("content-type", "text/html")]), lazy)
+		let mut streamer = Streamer::new(&headers(&[("content-type", "text/html")]), lazy, None)
 			.expect("a page");
 		let mut out = streamer.push(html);
 		out.extend(streamer.finish());
@@ -796,7 +832,7 @@ mod tests {
 	fn only_a_html_page_is_rewritten() {
 		for content_type in ["text/html; charset=utf-8", "TEXT/HTML"] {
 			assert!(
-				Streamer::new(&headers(&[("content-type", content_type)]), lazily()).is_some(),
+				Streamer::new(&headers(&[("content-type", content_type)]), lazily(), None).is_some(),
 				"{content_type} is a page"
 			);
 		}

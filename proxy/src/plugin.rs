@@ -866,7 +866,7 @@ mod tests {
 	#[test]
 	fn a_plugin_does_not_get_to_set_the_framing() {
 		let (_dir, plugin) = plugin_from(
-			"#!/bin/sh\nread -r line\nprintf '{\"filter\":{}}\\n'\n\
+			"#!/bin/sh\nread -r line\nprintf '{\"match\":{}}\\n'\n\
 			 read -r line\n\
 			 printf '{\"headers\":[[\"content-length\",\"1000000\"],[\"transfer-encoding\",\"chunked\"],[\"x-plugin\",\"kept\"]],\"body_b64\":\"aGk=\"}\\n'\n\
 			 sleep 5\n",
@@ -904,7 +904,7 @@ mod tests {
 	#[test]
 	fn a_reply_that_does_not_parse_ends_the_conversation() {
 		let (_dir, plugin) = plugin_from(
-			"#!/bin/sh\nread -r line\nprintf '{\"filter\":{}}\\n'\n\
+			"#!/bin/sh\nread -r line\nprintf '{\"match\":{}}\\n'\n\
 			 read -r line\nprintf 'this is not json\\n'\n\
 			 sleep 5\n",
 			Duration::from_secs(3),
@@ -944,7 +944,7 @@ mod tests {
 	#[test]
 	fn a_chunk_plugin_is_never_handed_a_whole_body() {
 		let (_dir, plugin) = plugin_from(
-			"#!/bin/sh\nread -r line\nprintf '{\"filter\":{},\"chunks\":true}\\n'\n\
+			"#!/bin/sh\nread -r line\nprintf '{\"match\":{},\"chunks\":true}\\n'\n\
 			 read -r line\nprintf '{\"body_b64\":\"c2hvdWxkIG5vdCBoYXBwZW4=\"}\\n'\n\
 			 sleep 5\n",
 			Duration::from_secs(3),
@@ -978,6 +978,43 @@ mod tests {
 		assert_eq!(line, b"first", "and the newline is not part of it");
 	}
 
+	/// The filter is the thing that decides what a plugin sees, and until now no
+	/// live plugin in this suite had a non-empty one: every fixture declared it
+	/// under `"filter"`, which is not the key `InitReply` reads, so every one of
+	/// them ran with the default — which matches everything. `headers_match` was
+	/// well tested and connected to nothing.
+	#[test]
+	fn a_plugin_only_sees_what_its_filter_asks_for() {
+		let (_dir, plugin) = plugin_from(
+			"#!/bin/sh\nread -r line\n\
+			 printf '{\"match\":{\"response\":{\"content-type\":\"text/html\"}}}\\n'\n\
+			 while read -r line; do printf '{\"body_b64\":\"c2Vlbg==\"}\\n'; done\n",
+			Duration::from_secs(3),
+		);
+
+		assert!(
+			!plugin.filter.is_empty(),
+			"the fixture's filter has to have reached the plugin, or this test \
+			 proves nothing at all"
+		);
+
+		let mut html = ProxyResponse {
+			status: 200,
+			headers: vec![("content-type".to_string(), "text/html".to_string())],
+			body: b"original".to_vec(),
+		};
+		plugin.on_response(&req(), &mut html);
+		assert_eq!(html.body, b"seen", "the type it asked for");
+
+		let mut json = ProxyResponse {
+			status: 200,
+			headers: vec![("content-type".to_string(), "application/json".to_string())],
+			body: b"original".to_vec(),
+		};
+		plugin.on_response(&req(), &mut json);
+		assert_eq!(json.body, b"original", "and nothing else");
+	}
+
 	/// A plugin that answers `init` and then stops reading its stdin. The pipe
 	/// fills, and `write_all` on a full pipe waits for as long as it takes —
 	/// which the reply timeout never gets to see, because the worker is parked
@@ -987,7 +1024,7 @@ mod tests {
 	#[test]
 	fn a_plugin_that_stops_reading_does_not_take_the_worker_with_it() {
 		let (_dir, plugin) = plugin_from(
-			"#!/bin/sh\nread -r line\nprintf '{\"filter\":{}}\\n'\nsleep 60\n",
+			"#!/bin/sh\nread -r line\nprintf '{\"match\":{}}\\n'\nsleep 60\n",
 			Duration::from_secs(1),
 		);
 

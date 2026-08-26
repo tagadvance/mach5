@@ -190,7 +190,62 @@ impl Upload {
 
 type ClientMap = HashMap<quiche::ConnectionId<'static>, Client>;
 
+/// Flush left on purpose: a `\`-continued string literal strips the leading
+/// whitespace of each following line, which quietly un-indents help text.
+const HELP: &str = r#"
+An intercepting proxy. It is configured by a file, not by flags.
+
+Configuration is read from the first of these that exists:
+
+  $MACH5_CONFIG
+  ./mach5.toml
+  $XDG_CONFIG_HOME/mach5/mach5.toml
+
+Every setting is documented inline in the example mach5.toml.
+Set RUST_LOG=debug for handshake detail.
+
+Read SECURITY.md before running this on a network you share with anyone.
+"#;
+
+/// Answer `--version` and `--help` and nothing else.
+///
+/// Deliberately hand-rolled rather than a dependency: mach5 is configured by a
+/// file, so there are no options to parse — but "which build is this?" is the
+/// first question on any bug report, and a binary that cannot answer it makes
+/// every one of those a conversation.
+///
+/// Returns true when the caller should stop.
+fn answered_on_the_command_line() -> bool {
+	let asked: Vec<String> = std::env::args().skip(1).collect();
+
+	if asked.iter().any(|a| a == "--version" || a == "-V") {
+		println!("mach5-proxy {}", env!("CARGO_PKG_VERSION"));
+
+		return true;
+	}
+
+	if asked.iter().any(|a| a == "--help" || a == "-h") {
+		println!("mach5-proxy {}\n{HELP}", env!("CARGO_PKG_VERSION"));
+
+		return true;
+	}
+
+	if let Some(unknown) = asked.first() {
+		eprintln!("mach5-proxy: {unknown} is not an option; try --help");
+		// Non-zero, so a wrapper script or a unit file notices. Silently
+		// starting anyway would be worse: the operator thinks the flag did
+		// something.
+		std::process::exit(2);
+	}
+
+	false
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
+	if answered_on_the_command_line() {
+		return Ok(());
+	}
+
 	env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
 	let config = Arc::new(Config::load()?);
@@ -1610,6 +1665,26 @@ mod tests {
 		assert_eq!(authority_host("example.com"), "example.com");
 		assert_eq!(authority_host("[::1]:8443"), "[::1]");
 		assert_eq!(authority_host("[2001:db8::1]"), "[2001:db8::1]");
+	}
+
+	/// The first question on any bug report is which build, so `--version` has
+	/// to answer it and has to answer it with the version that was actually
+	/// compiled in — not a string somebody updates by hand and forgets.
+	#[test]
+	fn the_version_reported_is_the_version_built() {
+		let reported = env!("CARGO_PKG_VERSION");
+
+		assert!(!reported.is_empty());
+		assert_eq!(
+			reported,
+			std::env::var("CARGO_PKG_VERSION").as_deref().unwrap_or(reported),
+			"the compiled-in version and cargo's agree"
+		);
+		// Help text is worth nothing if it does not say where configuration
+		// comes from, which is the only thing a flagless binary needs to
+		// explain.
+		assert!(HELP.contains("MACH5_CONFIG"));
+		assert!(HELP.contains("SECURITY.md"));
 	}
 
 	#[test]

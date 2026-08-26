@@ -239,19 +239,29 @@ impl Interceptor for Chain {
 	}
 
 	/// Run the chunk hooks at all only if something in the chain wants them.
+	///
+	/// Deliberately not `any`: this is the one interest question that is not a
+	/// pure query. A plugin *records* its answer here, because the chunk hooks
+	/// carry no head to re-test against — so a link the short-circuit skipped
+	/// would keep the answer it gave for the previous response, and act on a
+	/// body it was never offered.
 	fn wants_chunks(&self, req: &ProxyRequest, head: &ResponseHead) -> bool {
-		self.links.iter().any(|link| link.wants_chunks(req, head))
+		let mut wanted = false;
+		for link in &self.links {
+			wanted |= link.wants_chunks(req, head);
+		}
+
+		wanted
 	}
 
 	/// Offers every chunk to every link, in order, each seeing what the previous
 	/// one produced.
 	///
 	/// Only the links that asked for chunks should act, but this hook carries no
-	/// [`ResponseHead`] to re-test their interest against, and remembering the
-	/// answer from `wants_chunks` would mean interior mutability on a chain that
-	/// outlives the response. So the chain stays stateless and each link
-	/// re-checks itself — cheap, since an uninterested link inherits an empty
-	/// default hook.
+	/// [`ResponseHead`] to re-test their interest against, so a link that needs
+	/// the answer has to have kept it from `wants_chunks` — which is why that
+	/// one is asked of every link and not short-circuited. Links with nothing
+	/// to say inherit an empty default hook, so the walk is cheap.
 	fn on_response_chunk(&self, req: &ProxyRequest, chunk: &mut Vec<u8>) {
 		for link in &self.links {
 			link.on_response_chunk(req, chunk);
@@ -348,6 +358,18 @@ mod tests {
 
 		fn on_response_end(&self, _req: &ProxyRequest) -> Option<Vec<u8>> {
 			Some(self.0.as_bytes().to_vec())
+		}
+	}
+
+	/// Records whether it was asked about chunks, which is the thing a
+	/// short-circuit takes away.
+	struct Asked(Arc<AtomicBool>);
+
+	impl Interceptor for Asked {
+		fn wants_chunks(&self, _req: &ProxyRequest, _head: &ResponseHead) -> bool {
+			self.0.store(true, Ordering::SeqCst);
+
+			false
 		}
 	}
 
@@ -567,6 +589,25 @@ mod tests {
 			status: 200,
 			headers: vec![("content-type".to_string(), "text/html".to_string())],
 		}
+	}
+
+	/// `wants_chunks` is the one interest question with a side effect: a plugin
+	/// records its answer, because the chunk hooks carry no head to re-test
+	/// against. `any` short-circuits, so a link behind one that said yes kept
+	/// whatever it had answered for the *previous* response — and then acted on
+	/// a body it was never offered, or stayed silent on one it was.
+	#[test]
+	fn every_link_is_asked_about_chunks_even_once_one_has_said_yes() {
+		let asked = Arc::new(AtomicBool::new(false));
+		let chain = Chain {
+			links: vec![Box::new(Tag("-first")), Box::new(Asked(asked.clone()))],
+		};
+
+		assert!(chain.wants_chunks(&request(), &head()));
+		assert!(
+			asked.load(Ordering::SeqCst),
+			"the link behind the one that said yes has to be asked too"
+		);
 	}
 
 	#[test]

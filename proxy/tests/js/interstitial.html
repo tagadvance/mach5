@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Your connection is not private</title>
+<style>
+:root { color-scheme: light dark; }
+body {
+  margin: 0; min-height: 100vh; display: flex; align-items: center;
+  justify-content: center; padding: 2rem;
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: #fff; color: #202124;
+}
+main { max-width: 42rem; }
+.mark { font-size: 3.5rem; line-height: 1; color: #b0b3b8; margin-bottom: 1rem; }
+h1 { font-size: 1.65rem; font-weight: 500; margin: 0 0 1rem; }
+.lede { font-size: 1.05rem; }
+p { margin: 0 0 1rem; }
+details { margin: 1.5rem 0; }
+summary { cursor: pointer; color: #1a73e8; }
+.detail { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .85rem; word-break: break-word; margin-top: .75rem; }
+.note { font-size: .9rem; color: #5f6368; }
+.actions { margin-top: 2rem; }
+button {
+  font: inherit; font-size: .95rem; padding: .55rem 1.1rem; border: 0;
+  border-radius: 4px; background: #1a73e8; color: #fff; cursor: pointer;
+}
+button:hover { background: #1867cf; }
+@media (prefers-color-scheme: dark) {
+  body { background: #202124; color: #e8eaed; }
+  .note { color: #9aa0a6; }
+  summary { color: #8ab4f8; }
+  button { background: #8ab4f8; color: #202124; }
+  button:hover { background: #aecbfa; }
+}
+</style>
+</head>
+<body>
+<main>
+  <div class="mark" aria-hidden="true">&#9888;</div>
+  <h1>Your connection is not private</h1>
+  <p class="lede">
+    <strong>localhost</strong> presented a certificate that mach5 could not verify,
+    so the connection was refused before any data was sent.
+  </p>
+  <p>The certificate could not be validated, so mach5 refused to continue.</p>
+  <details>
+    <summary>Technical details</summary>
+    <p class="detail">https://localhost/page: Connection Failed: tls connection init failed: invalid peer certificate: Other(OtherError(CaUsedAsEndEntity))</p>
+    <p class="note">
+      mach5 is intercepting this connection, so your browser cannot check this
+      certificate itself &mdash; it trusts mach5&rsquo;s own certificate
+      authority. That makes mach5 the only thing still validating the origin,
+      which is why it stopped here rather than letting the page load.
+    </p>
+  </details>
+  <p class="actions"><button onclick="location.reload()">Try again</button></p>
+</main>
+<script>
+(() => {
+	const want = "thisisunsafe";
+	let typed = '';
+	addEventListener('keypress', (e) => {
+		typed = (typed + String.fromCharCode(e.charCode || e.keyCode)).slice(-want.length);
+		if (typed !== want) {
+			return;
+		}
+
+		const next = encodeURIComponent(location.pathname + location.search);
+		location.href = '/.mach5/bypass?next=' + next;
+	});
+})();
+</script>
+</body>
+</html>

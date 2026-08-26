@@ -27,6 +27,7 @@ Two things to hold in mind when reading the result:
 """
 
 import argparse
+import html
 import json
 import pathlib
 import re
@@ -46,13 +47,25 @@ DEFAULT_PAGES = [
     "https://info.cern.ch/",
 ]
 
+IMAGE = re.compile(
+    rb"""<img\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']""",
+    re.IGNORECASE,
+)
 ASSET = re.compile(
-    rb"""<(?:script|link|img)\b[^>]*?\b(?:src|href)\s*=\s*["']([^"']+)["']""",
+    rb"""<(?:script|link)\b[^>]*?\b(?:src|href)\s*=\s*["']([^"']+)["']""",
     re.IGNORECASE,
 )
 
 # A browser's, so origins answer the way they would in real use.
 ACCEPT_ENCODING = "gzip, deflate, br, zstd"
+
+# Chrome's, for the same reason — and because it is what tells mach5 the client
+# can display WebP. curl's default `*/*` does not, so without this the image
+# re-encoding correctly does nothing and the benchmark cannot see it.
+ACCEPT = (
+    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+    "image/avif,image/webp,image/apng,*/*;q=0.8"
+)
 
 
 def curl(url, *, ca=None, resolve=None, decode=False, timeout=30):
@@ -74,6 +87,8 @@ def curl(url, *, ca=None, resolve=None, decode=False, timeout=30):
             "--show-error",
             "--max-time",
             str(timeout),
+            "--header",
+            f"accept: {ACCEPT}",
             "--write-out",
             "%{size_download} %{time_total} %{http_code}",
             "--output",
@@ -121,10 +136,19 @@ def through_proxy(url, host, port, ca, decode=False):
 
 
 def subresources(page_url, body, limit):
-    """Absolute URLs for what the page references, in document order."""
+    """Absolute URLs for what the page references.
+
+    Images first, then everything else. A page's stylesheets and scripts are all
+    declared in the head, so document order fills any modest budget with them
+    and never reaches the images — which are both the bulk of the bytes and the
+    thing most of mach5's work is aimed at.
+    """
     found = []
-    for raw in ASSET.findall(body):
-        url = urllib.parse.urljoin(page_url, raw.decode("utf-8", "replace"))
+    for raw in IMAGE.findall(body) + ASSET.findall(body):
+        # `&amp;` in the markup is `&` in the URL; fetching it literally gets a
+        # different resource, or an error that looks like a saving.
+        reference = html.unescape(raw.decode("utf-8", "replace"))
+        url = urllib.parse.urljoin(page_url, reference)
         if not url.startswith("https://") or url in found:
             continue
         found.append(url)
@@ -141,34 +165,45 @@ def median_of(runs):
 def measure(direct_urls, proxied_urls, host, port, ca, repeat):
     """Bytes and seconds for what each side fetches.
 
-    Both sides fetch the same list. The picker mach5 injects is not in it: it
-    buys a feature, and weighing a feature against its own absence says nothing
-    about whether the proxy makes the web lighter. What is measured here is the
-    same bytes, fetched both ways.
+    A URL counts only when **both** sides answered, and answered the same way.
+    Letting one side fail silently is how this reported an 83% saving that was
+    really a 502: the failing side contributes nothing and the other still
+    counts its bytes, so a broken fetch reads as an enormous win. Anything that
+    cannot be compared honestly is dropped from both totals and named.
     """
     direct_bytes = direct_time = 0
     proxied_bytes = proxied_time = 0
-    failures = []
+    skipped = []
 
+    # The lists differ only when a page pulls in something the other side does
+    # not; pair by URL so a mismatch cannot silently shift the totals.
     for url in direct_urls:
-        runs = [curl(url) for _ in range(repeat)]
-        if any(r is None for r in runs):
-            failures.append(url)
+        if url not in proxied_urls:
+            skipped.append((url, "not fetched both ways"))
             continue
 
-        direct_bytes += int(median_of([r[0] for r in runs]))
-        direct_time += median_of([r[1] for r in runs])
+        straight = [curl(url) for _ in range(repeat)]
+        through = [through_proxy(url, host, port, ca) for _ in range(repeat)]
 
-    for url in proxied_urls:
-        runs = [through_proxy(url, host, port, ca) for _ in range(repeat)]
-        if any(r is None for r in runs):
-            failures.append(url)
+        if any(r is None for r in straight):
+            skipped.append((url, "direct fetch failed"))
+            continue
+        if any(r is None for r in through):
+            skipped.append((url, "proxied fetch failed"))
             continue
 
-        proxied_bytes += int(median_of([r[0] for r in runs]))
-        proxied_time += median_of([r[1] for r in runs])
+        direct_status = straight[0][2]
+        proxied_status = through[0][2]
+        if direct_status != proxied_status:
+            skipped.append((url, f"status {direct_status} direct, {proxied_status} proxied"))
+            continue
 
-    return direct_bytes, direct_time, proxied_bytes, proxied_time, failures
+        direct_bytes += int(median_of([r[0] for r in straight]))
+        direct_time += median_of([r[1] for r in straight])
+        proxied_bytes += int(median_of([r[0] for r in through]))
+        proxied_time += median_of([r[1] for r in through])
+
+    return direct_bytes, direct_time, proxied_bytes, proxied_time, skipped
 
 
 def stats(host, port, ca):
@@ -231,6 +266,7 @@ def main():
     print("-" * 84)
 
     totals = [0, 0.0, 0, 0.0]
+    dropped = []
     for page in pages:
         direct_urls = [page]
         proxied_urls = [page]
@@ -249,7 +285,8 @@ def main():
         d_bytes, d_time, p_bytes, p_time, failed = measure(
             direct_urls, proxied_urls, args.host, args.port, args.ca, args.repeat
         )
-        if failed and len(failed) >= len(direct_urls):
+        dropped.extend(failed)
+        if len(failed) >= len(direct_urls):
             print(f"{page[:43]:<44}{'unreachable':>12}")
             continue
 
@@ -269,6 +306,14 @@ def main():
         f"{'total':<44}{human(totals[0]):>12}{human(totals[2]):>12}"
         f"{delta(totals[0], totals[2]):>8}{delta(totals[1], totals[3]):>8}"
     )
+
+    if dropped:
+        print(f"\n{len(dropped)} URL(s) left out of the totals, because a"
+              " comparison that includes a failure is not a comparison:")
+        for url, why in dropped[:10]:
+            print(f"  {why:<34}{url[:44]}")
+        if len(dropped) > 10:
+            print(f"  ...and {len(dropped) - 10} more")
 
     after = stats(args.host, args.port, args.ca)
     if before and after:

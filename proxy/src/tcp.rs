@@ -409,12 +409,19 @@ fn fetch_blocking(
 		upstream::Fetched::Live(live) => *live,
 	};
 
+	let declared = upstream::declared_length(&resp);
 	let mut head = ResponseHead {
 		status: resp.status(),
 		headers: upstream::response_headers(&resp),
 	};
 
-	if interceptor.wants_body(&request, &head) {
+	// Buffered either because something wants to look at it, or because it is
+	// worth keeping — a stylesheet nobody inspects still has to be held whole
+	// to be stored.
+	let worth_keeping =
+		upstream::should_store(&shared.agents, &shared.config, &request, head.status, &head.headers, declared);
+
+	if interceptor.wants_body(&request, &head) || worth_keeping {
 		let mut body = Vec::new();
 		if let Err(e) = resp.into_reader().read_to_end(&mut body) {
 			log::warn!(

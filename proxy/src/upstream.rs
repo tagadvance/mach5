@@ -310,6 +310,36 @@ fn lookup(agents: &Agents, req: &ProxyRequest) -> Option<Cached> {
 	None
 }
 
+/// Whether this response is worth holding whole so it can be cached.
+///
+/// Nothing else buffers a stylesheet — injection claims HTML and the re-encoder
+/// claims images, so an asset would otherwise stream past and never be offered
+/// to the cache at all. Caching one therefore means choosing to buffer it,
+/// which is only worth doing when it is going to be stored and is small enough
+/// to be worth the memory.
+pub fn should_store(
+	agents: &Agents,
+	config: &crate::config::Config,
+	req: &ProxyRequest,
+	status: u16,
+	headers: &[(String, String)],
+	declared: Option<u64>,
+) -> bool {
+	if agents.cache.is_none() || !crate::httpcache::eligible(req, status, headers) {
+		return false;
+	}
+
+	// An unknown length means a chunked response of unknown size, which is not
+	// something to take a chance on holding. It has to be passed in:
+	// `content-length` is hop-by-hop and `response_headers` has already dropped
+	// it by the time a caller has a header list.
+	let Some(length) = declared else {
+		return false;
+	};
+
+	length <= config.images.max_cacheable_mb as u64 * 1024 * 1024
+}
+
 /// Keep a response, if it is one that may be kept. Called by the front ends
 /// once the origin's own bytes are in hand and before anything has rewritten
 /// them.
@@ -339,6 +369,13 @@ fn failure(metrics: &crate::metrics::Metrics, message: String) -> FetchError {
 	metrics.upstream_failures.increment();
 
 	FetchError::Other(message)
+}
+
+/// What the origin said the body's length was, before that header is dropped
+/// for being hop-by-hop.
+pub fn declared_length(resp: &ureq::Response) -> Option<u64> {
+	resp.header("content-length")
+		.and_then(|value| value.trim().parse::<u64>().ok())
 }
 
 pub fn response_headers(resp: &ureq::Response) -> Vec<(String, String)> {

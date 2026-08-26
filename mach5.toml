@@ -261,11 +261,21 @@ cache_mb = 512
 # bytes where the image was three hundred thousand. Nothing is ever served
 # staler than the origin allowed.
 #
-# Only what is plainly public is stored at all: a 200, an image content-type, no
-# set-cookie, no `private`/`no-store`/`no-cache`, no authorization on the
-# request, no `vary` beyond accept and accept-encoding, and either a freshness
-# lifetime or a validator. Anything else is not cached rather than cached
-# carefully.
+# Stylesheets, scripts, fonts and images — the static furniture of a page.
+# HTML is deliberately absent and stays absent until mach5 knows who is asking,
+# because a page is where per-user content lives.
+#
+# Only what is plainly public is stored at all: a 200, no set-cookie, no
+# `private`/`no-store`/`no-cache`, no authorization on the request, and no
+# `vary` beyond accept and accept-encoding. Anything else is not cached rather
+# than cached carefully.
+#
+# One asymmetry worth knowing. An image may be cached on a validator alone,
+# because the worst a mistake costs is the wrong picture. A script may not:
+# sites serve bootstrap JavaScript carrying a user id or a CSRF token, and an
+# `etag` says only "here is how to check whether it changed" — never "this is
+# the same for everybody". Scripts, stylesheets and fonts therefore need the
+# origin to have declared a freshness lifetime.
 #
 # A browser's hard refresh works: shift-reload sends `cache-control: no-cache`,
 # which mach5 honours by revalidating before serving. The status page also has
@@ -273,6 +283,11 @@ cache_mb = 512
 #
 # 0 switches it off.
 origin_cache_mb = 256
+# Nothing else buffers a stylesheet — injection claims HTML and the re-encoder
+# claims images — so caching one means choosing to hold it whole. This is the
+# largest response worth that memory; anything bigger, or of unknown length,
+# streams past uncached.
+max_cacheable_mb = 8
 
 [passthrough]
 # Hosts mach5 must never decrypt.

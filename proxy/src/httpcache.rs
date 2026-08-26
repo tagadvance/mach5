@@ -73,7 +73,8 @@ pub fn eligible(req: &ProxyRequest, status: u16, headers: &[(String, String)]) -
 		return false;
 	}
 
-	if !is_image(headers) {
+	let kind = kind(headers);
+	if kind == Kind::Other {
 		return false;
 	}
 
@@ -112,11 +113,23 @@ pub fn eligible(req: &ProxyRequest, status: u16, headers: &[(String, String)]) -
 		}
 	}
 
-	// Something to go on: either it says how long it is good for, or it gives
-	// us a way to ask.
-	freshness(headers).is_some()
-		|| header(headers, "etag").is_some()
-		|| header(headers, "last-modified").is_some()
+	// Something to go on. For an image a validator alone is enough: the worst a
+	// mistake costs is a picture that should have been someone else's.
+	//
+	// A script is different in kind. Sites serve bootstrap JavaScript carrying a
+	// user id, a CSRF token or an API key, and a bare `etag` says only "here is
+	// how to check whether it changed" — never "this is the same for
+	// everybody". A declared freshness lifetime is the origin saying the latter
+	// out loud, so that is what an asset has to have.
+	match kind {
+		Kind::Image => {
+			freshness(headers).is_some()
+				|| header(headers, "etag").is_some()
+				|| header(headers, "last-modified").is_some()
+		}
+		Kind::Asset => freshness(headers).is_some(),
+		Kind::Other => false,
+	}
 }
 
 /// How long the origin said this stays good for, in seconds.
@@ -141,10 +154,57 @@ pub fn freshness(headers: &[(String, String)]) -> Option<Duration> {
 	None
 }
 
-fn is_image(headers: &[(String, String)]) -> bool {
-	header(headers, "content-type")
-		.map(|value| value.trim().to_ascii_lowercase().starts_with("image/"))
-		.unwrap_or(false)
+/// What may be cached at all: the static furniture of a page. Everything here
+/// is something a site serves identically to everybody, or says it does.
+///
+/// HTML is deliberately absent and should stay absent until mach5 knows who is
+/// asking. A page is where per-user content lives.
+const CACHEABLE: [&str; 12] = [
+	"text/css",
+	"application/javascript",
+	"text/javascript",
+	"application/x-javascript",
+	"font/woff",
+	"font/woff2",
+	"font/ttf",
+	"font/otf",
+	"font/collection",
+	"application/font-woff",
+	"application/vnd.ms-fontobject",
+	"application/x-font-ttf",
+];
+
+/// The kind of thing this is, which decides how much proof of publicness is
+/// wanted before storing it.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Kind {
+	Image,
+	/// A stylesheet, a script, a font.
+	Asset,
+	Other,
+}
+
+fn kind(headers: &[(String, String)]) -> Kind {
+	let Some(value) = header(headers, "content-type") else {
+		return Kind::Other;
+	};
+
+	let media = value
+		.split(';')
+		.next()
+		.unwrap_or_default()
+		.trim()
+		.to_ascii_lowercase();
+
+	if media.starts_with("image/") {
+		return Kind::Image;
+	}
+
+	if CACHEABLE.contains(&media.as_str()) {
+		return Kind::Asset;
+	}
+
+	Kind::Other
 }
 
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -415,6 +475,69 @@ mod tests {
 		let head = headers(&[("content-type", "image/png")]);
 
 		assert!(!eligible(&request(&[]), 200, &head));
+	}
+
+	fn asset(kind: &str, control: &str) -> Vec<(String, String)> {
+		headers(&[
+			("content-type", kind),
+			("cache-control", control),
+			("etag", "\"abc\""),
+		])
+	}
+
+	#[test]
+	fn the_static_furniture_of_a_page_is_eligible() {
+		for kind in [
+			"text/css",
+			"application/javascript",
+			"text/javascript; charset=utf-8",
+			"font/woff2",
+			"application/vnd.ms-fontobject",
+		] {
+			assert!(
+				eligible(&request(&[]), 200, &asset(kind, "public, max-age=600")),
+				"{kind} should be cacheable"
+			);
+		}
+	}
+
+	/// HTML is where per-user content lives, and stays out until mach5 knows
+	/// who is asking.
+	#[test]
+	fn a_page_is_never_eligible() {
+		for kind in ["text/html", "application/json", "text/plain", "video/mp4"] {
+			assert!(
+				!eligible(&request(&[]), 200, &asset(kind, "public, max-age=600")),
+				"{kind} must not be cached"
+			);
+		}
+	}
+
+	/// The asymmetry that matters. Sites serve bootstrap scripts carrying a
+	/// user id or a CSRF token, and an `etag` alone says only "here is how to
+	/// check whether it changed" — never "this is the same for everybody".
+	#[test]
+	fn a_script_needs_more_proof_than_an_image_does() {
+		let bare_validator = headers(&[
+			("content-type", "application/javascript"),
+			("etag", "\"abc\""),
+		]);
+		assert!(
+			!eligible(&request(&[]), 200, &bare_validator),
+			"a validator alone is not an origin calling this public"
+		);
+
+		let same_for_an_image = headers(&[("content-type", "image/png"), ("etag", "\"abc\"")]);
+		assert!(
+			eligible(&request(&[]), 200, &same_for_an_image),
+			"where the worst case is the wrong picture, a validator is enough"
+		);
+
+		assert!(eligible(
+			&request(&[]),
+			200,
+			&asset("application/javascript", "public, max-age=31536000")
+		));
 	}
 
 	#[test]

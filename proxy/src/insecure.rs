@@ -79,10 +79,16 @@ impl Bypasses {
 	/// which is what you want when the earlier tab has been abandoned.
 	pub fn offer(&self, host: &str) -> String {
 		let token = token();
-		self.offered
-			.lock()
-			.expect("bypass offers lock")
-			.insert(key(host), (token.clone(), Instant::now() + OFFER_TTL));
+		let now = Instant::now();
+
+		let mut offered = self.offered.lock().expect("bypass offers lock");
+		// Pruned here as well as in `redeem`, because an offer nobody takes up
+		// is the *common* case: every failed validation mints one, and if the
+		// phrase is never typed then `redeem` never runs and nothing was ever
+		// dropped, `OFFER_TTL` or no. A page fetching a few hundred thousand
+		// subdomains of a host with a bad certificate grew this without end.
+		offered.retain(|_, (_, expiry)| *expiry > now);
+		offered.insert(key(host), (token.clone(), now + OFFER_TTL));
 
 		token
 	}
@@ -238,6 +244,34 @@ mod tests {
 	use super::*;
 
 	const TTL: Duration = Duration::from_secs(60);
+
+	/// An offer nobody takes up is the common case — every failed validation
+	/// mints one — and `redeem` is the only thing that used to prune them, so
+	/// nothing was dropped until somebody typed the phrase. A page fetching
+	/// subdomains of a host with a bad certificate grew the map for free.
+	#[test]
+	fn offers_nobody_redeems_do_not_pile_up() {
+		let bypasses = Bypasses::default();
+
+		for n in 0..500 {
+			bypasses.offer(&format!("n{n}.bad.example"));
+		}
+		assert_eq!(
+			bypasses.offered.lock().unwrap().len(),
+			500,
+			"none of these has expired yet, so all of them are still live"
+		);
+
+		// Wind every one of them into the past, then offer once more.
+		for (_, expiry) in bypasses.offered.lock().unwrap().values_mut() {
+			*expiry = Instant::now() - Duration::from_secs(1);
+		}
+		bypasses.offer("one.more.example");
+
+		let offered = bypasses.offered.lock().unwrap();
+		assert_eq!(offered.len(), 1, "the expired ones go when the next is made");
+		assert!(offered.contains_key("one.more.example"));
+	}
 
 	#[test]
 	fn a_bypass_applies_to_the_host_it_was_given() {

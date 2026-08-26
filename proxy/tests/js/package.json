@@ -1,0 +1,11 @@
+{
+  "name": "mach5-client-tests",
+  "private": true,
+  "description": "jsdom harness for the JavaScript mach5 injects into pages",
+  "scripts": {
+    "test": "node panel.test.js && node interstitial.test.js && node status.test.js"
+  },
+  "devDependencies": {
+    "jsdom": "^26.0.0"
+  }
+}

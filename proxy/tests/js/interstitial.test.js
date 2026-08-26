@@ -9,7 +9,7 @@
  * an acceptance, which makes "does it fire when it should" and "does it stay
  * silent when it should not" worth more than the usual assertion.
  *
- *     npm install jsdom && node proxy/tests/js/interstitial.test.js [page.html]
+ *     npm install && node interstitial.test.js [page.html]
  */
 const fs = require('fs');
 const path = require('path');

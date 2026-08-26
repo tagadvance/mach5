@@ -16,9 +16,10 @@
  * throw, does it wire itself up, does it post what it claims to post, and does
  * it stay out of the way of the page it landed on.
  *
- * Needs node and jsdom, neither of which is in the container image:
+ * From this directory, `npm install` once and then `npm test` for all three
+ * files, or a single file directly:
  *
- *     npm install jsdom && node proxy/tests/js/panel.test.js
+ *     node panel.test.js
  */
 const path = require('path');
 const fs = require('fs');

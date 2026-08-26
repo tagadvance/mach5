@@ -6,7 +6,7 @@
  * failed POST was an unhandled rejection -- the last section below is the one
  * that caught it, and it now asserts the fix.
  *
- *     npm install jsdom && node proxy/tests/js/status.test.js [page.html]
+ *     npm install && node status.test.js [page.html]
  */
 const fs = require('fs');
 const path = require('path');

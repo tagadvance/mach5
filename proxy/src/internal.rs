@@ -823,6 +823,17 @@ fn status_page(page: Page) -> String {
 			v6 = metrics::thousands(counted.lookups_ipv6_only),
 		)
 	};
+	// Zero is the answer to expect, and saying so is more useful than a bare 0:
+	// it means no client has ever been slower than the origin feeding it, and
+	// the buffer bound is generous rather than load-bearing.
+	let parked = if counted.streams_parked == 0 {
+		r#"<td class="note">never — no client has fallen behind an origin</td>"#.to_string()
+	} else {
+		format!(
+			r#"<td>{parked} <span class="note">times a fetch waited for a client to catch up</span></td>"#,
+			parked = metrics::thousands(counted.streams_parked),
+		)
+	};
 	// The one control that has to live here rather than in the panel: turning
 	// injection off removes the panel, so the way back on cannot be inside it.
 	let injection = match live.inject {
@@ -894,6 +905,7 @@ fn status_page(page: Page) -> String {
     <tr><th>Other upstream failures</th><td>{upstream_failures}</td></tr>
     <tr><th>Body bytes from origins</th><td>{from_origin}</td></tr>
     <tr><th>Body bytes to clients</th><td>{to_client}</td></tr>
+    <tr><th>Streams held back</th>{parked}</tr>
     <tr><th>Bytes saved compressing</th><td>{saved}</td></tr>
     <tr><th>Saved by re-encoding images</th><td>{saved_images}</td></tr>
   </table>

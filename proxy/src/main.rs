@@ -8,6 +8,7 @@
 
 mod blocklist;
 mod body;
+mod budget;
 mod ca;
 mod config;
 mod disk;
@@ -62,6 +63,20 @@ struct FetchJob {
 	/// The body still arriving, when there is one, and the length the client
 	/// declared for it.
 	upload: Option<(tokio::sync::mpsc::Receiver<body::Chunk>, Option<u64>)>,
+	/// How much of the response may be in flight at once. See [`budget`].
+	budget: Arc<budget::Budget>,
+}
+
+/// Why a worker stopped handing pieces of a response over.
+///
+/// The distinction is the difference between one dead client and a worker pool
+/// that quietly shrinks: only [`Gone::Pool`] means this thread has nothing left
+/// to do. A stream that goes away — a client that closed the tab mid-download —
+/// ends the job and nothing else.
+#[derive(Debug, PartialEq, Eq)]
+enum Gone {
+	Stream,
+	Pool,
 }
 
 /// A fetched response on its way back to a client, in one of two shapes: a
@@ -70,6 +85,9 @@ struct FetchResult {
 	conn: quiche::ConnectionId<'static>,
 	stream_id: u64,
 	payload: Payload,
+	/// Carried alongside so the event loop can give room back as bytes leave,
+	/// and can let a worker go when there is nobody left to give them to.
+	budget: Arc<budget::Budget>,
 }
 
 enum Payload {
@@ -99,11 +117,22 @@ struct Pending {
 	/// `complete` because upstream often finishes *after* the last chunk has
 	/// already been written, leaving nothing to attach the fin to.
 	fin_sent: bool,
+	budget: Arc<budget::Budget>,
 }
 
 impl Pending {
 	fn is_finished(&self) -> bool {
 		self.headers_sent && self.fin_sent
+	}
+}
+
+impl Drop for Pending {
+	/// However this response ends — sent, failed, or dropped with the
+	/// connection — the worker behind it must not be left parked waiting for
+	/// room on a stream nobody is reading. There are only as many workers as
+	/// cores.
+	fn drop(&mut self) {
+		self.budget.close();
 	}
 }
 
@@ -283,7 +312,11 @@ fn spawn_workers(
 					Err(_) => break, // senders dropped: shut down
 				};
 
-				if handle_job(&agents, &config, &interceptor, job, &res_tx, &waker).is_err() {
+				// A stream that went away is this job's problem and nobody
+				// else's; only the event loop disappearing ends the worker.
+				if handle_job(&agents, &config, &interceptor, job, &res_tx, &waker)
+					== Err(Gone::Pool)
+				{
 					break;
 				}
 			}
@@ -306,7 +339,7 @@ fn handle_job(
 	mut job: FetchJob,
 	results: &Sender<FetchResult>,
 	waker: &mio::Waker,
-) -> Result<(), ()> {
+) -> Result<(), Gone> {
 	let metrics = metrics::shared();
 	metrics.requests.increment();
 
@@ -350,13 +383,25 @@ fn handle_job(
 
 	let send = |payload| {
 		let payload = if head_only { bodyless(payload) } else { payload };
+
+		// The one place a worker can be made to wait for the client. Claiming
+		// before the hand-off is what stops a stalled client turning into an
+		// unbounded queue on the event loop's side; `false` means the stream
+		// is gone, which reads to the caller exactly like a closed channel.
+		if let Payload::Chunk(chunk) = &payload {
+			if !job.budget.claim(chunk.len()) {
+				return Err(Gone::Stream);
+			}
+		}
+
 		results
 			.send(FetchResult {
 				conn: job.conn.clone(),
 				stream_id: job.stream_id,
 				payload,
+				budget: job.budget.clone(),
 			})
-			.map_err(|_| ())?;
+			.map_err(|_| Gone::Pool)?;
 		let _ = waker.wake();
 
 		Ok(())
@@ -604,7 +649,11 @@ fn drain_results(results: &Receiver<FetchResult>, clients: &mut ClientMap) {
 	while let Ok(result) = results.try_recv() {
 		let Some(client) = clients.get_mut(&result.conn) else {
 			// Client vanished while its fetch was in flight; drop the response.
+			// Closing here and not only in `Pending::drop` because a connection
+			// can go before the head arrives, leaving no `Pending` to drop and
+			// a worker parked on room that will never be given back.
 			log::debug!("dropping response for closed connection");
+			result.budget.close();
 
 			continue;
 		};
@@ -619,6 +668,7 @@ fn drain_results(results: &Receiver<FetchResult>, clients: &mut ClientMap) {
 				offset: 0,
 				complete: true,
 				fin_sent: false,
+				budget: result.budget,
 			}),
 			Payload::Head(head) => client.pending.push(Pending {
 				stream_id: result.stream_id,
@@ -629,12 +679,16 @@ fn drain_results(results: &Receiver<FetchResult>, clients: &mut ClientMap) {
 				offset: 0,
 				complete: false,
 				fin_sent: false,
+				budget: result.budget,
 			}),
 			Payload::Chunk(data) => {
 				match find_pending(client, result.stream_id) {
 					Some(pending) => pending.chunks.push_back(data),
 					// Its stream already failed and was dropped.
-					None => log::debug!("chunk for unknown stream {}", result.stream_id),
+					None => {
+						log::debug!("chunk for unknown stream {}", result.stream_id);
+						result.budget.close();
+					}
 				}
 			}
 			Payload::End => {
@@ -857,7 +911,7 @@ fn poll_requests(
 				match build_request(&list) {
 					Some((request, _)) if !more_frames => {
 						// No body to wait for.
-						dispatch(key, stream_id, request, None, jobs);
+						dispatch(key, stream_id, request, None, jobs, park_cap);
 					}
 					Some((request, length)) => {
 						// A body follows. The request goes to a worker now and
@@ -873,7 +927,7 @@ fn poll_requests(
 								finished: false,
 							},
 						);
-						dispatch(key, stream_id, request, Some((receiver, length)), jobs);
+						dispatch(key, stream_id, request, Some((receiver, length)), jobs, park_cap);
 					}
 					None => log::warn!("stream={stream_id} missing pseudo-headers; ignoring"),
 				}
@@ -1001,6 +1055,7 @@ fn dispatch(
 	request: ProxyRequest,
 	upload: Option<(tokio::sync::mpsc::Receiver<body::Chunk>, Option<u64>)>,
 	jobs: &Sender<FetchJob>,
+	stream_cap: usize,
 ) {
 	log::info!(
 		"proxying stream={stream_id} {} {}{}",
@@ -1018,6 +1073,7 @@ fn dispatch(
 		stream_id,
 		request,
 		upload,
+		budget: Arc::new(budget::Budget::new(stream_cap)),
 	};
 	if jobs.send(job).is_err() {
 		log::error!("worker pool is gone; cannot dispatch request");
@@ -1055,14 +1111,15 @@ fn send_full(
 	waker: &mio::Waker,
 	job: &FetchJob,
 	response: ProxyResponse,
-) -> Result<(), ()> {
+) -> Result<(), Gone> {
 	results
 		.send(FetchResult {
 			conn: job.conn.clone(),
 			stream_id: job.stream_id,
 			payload: Payload::Full(response),
+			budget: job.budget.clone(),
 		})
-		.map_err(|_| ())?;
+		.map_err(|_| Gone::Pool)?;
 	let _ = waker.wake();
 
 	Ok(())
@@ -1152,7 +1209,10 @@ fn send_pending(
 			Ok(n) => {
 				p.offset += n;
 				if p.offset >= chunk.len() {
-					p.chunks.pop_front();
+					// Room given back only once the bytes are quiche's problem,
+					// which is what makes the bound mean anything.
+					let sent = p.chunks.pop_front().map_or(0, |chunk| chunk.len());
+					p.budget.release(sent);
 					p.offset = 0;
 					// The fin rode along only if this really was the last byte.
 					p.fin_sent = last;

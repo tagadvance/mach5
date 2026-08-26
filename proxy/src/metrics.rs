@@ -92,6 +92,11 @@ pub struct Metrics {
 	pub bytes_saved_by_origin_cache: Counter,
 	pub image_cache_hits: Counter,
 	pub image_cache_misses: Counter,
+	/// Times a worker had to wait for a client to catch up before it could hand
+	/// over the next chunk of an h3 response. Zero means the backpressure bound
+	/// has never been reached and `stream_buffer_mb` could come down; a number
+	/// that climbs with no slow clients about means it is too low.
+	pub streams_parked: Counter,
 	pub lookups_ipv4_only: Counter,
 	pub lookups_ipv6_only: Counter,
 	pub lookups_dual: Counter,
@@ -129,6 +134,7 @@ impl Default for Metrics {
 			bytes_saved_by_origin_cache: Counter::default(),
 			image_cache_hits: Counter::default(),
 			image_cache_misses: Counter::default(),
+			streams_parked: Counter::default(),
 			lookups_ipv4_only: Counter::default(),
 			lookups_ipv6_only: Counter::default(),
 			lookups_dual: Counter::default(),
@@ -177,6 +183,7 @@ impl Metrics {
 			bytes_saved_by_origin_cache: self.bytes_saved_by_origin_cache.get(),
 			image_cache_hits: self.image_cache_hits.get(),
 			image_cache_misses: self.image_cache_misses.get(),
+			streams_parked: self.streams_parked.get(),
 			lookups_ipv4_only: self.lookups_ipv4_only.get(),
 			lookups_ipv6_only: self.lookups_ipv6_only.get(),
 			lookups_dual: self.lookups_dual.get(),
@@ -241,6 +248,9 @@ pub struct Snapshot {
 	pub bytes_saved_by_origin_cache: u64,
 	pub image_cache_hits: u64,
 	pub image_cache_misses: u64,
+	/// Times a worker had to wait for a client before it could hand over the
+	/// next chunk. See [`Metrics::streams_parked`].
+	pub streams_parked: u64,
 	pub lookups_ipv4_only: u64,
 	pub lookups_ipv6_only: u64,
 	pub lookups_dual: u64,

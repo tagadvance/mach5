@@ -471,9 +471,12 @@ pub struct Limits {
 	pub read_timeout_seconds: u64,
 	/// How long a plugin may take per hook before it is abandoned.
 	pub plugin_timeout_seconds: u64,
-	/// How much of a streaming response may sit in memory waiting for a slow
-	/// client before the upstream read pauses. This is the backpressure bound;
-	/// generous by design, since the box has RAM to spare.
+	/// How much of *one* streaming response may sit in memory waiting for a
+	/// slow client before the upstream read pauses. The backpressure bound on
+	/// both front ends — a bounded channel per response on TCP, a
+	/// [`crate::budget::Budget`] per stream on QUIC. Generous by design, since
+	/// the box has RAM to spare; `streams_parked` says whether it is ever
+	/// actually reached.
 	pub stream_buffer_mb: usize,
 }
 

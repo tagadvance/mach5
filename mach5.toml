@@ -413,8 +413,10 @@ connect_timeout_seconds = 10
 read_timeout_seconds = 30
 # How long a plugin may take per hook before it is abandoned.
 plugin_timeout_seconds = 10
-# Backpressure for streamed responses: how much may sit in memory waiting for a
-# slow client before the upstream read pauses. Generous on purpose.
+# Backpressure for streamed responses: how much of one may sit in memory waiting
+# for a slow client before the upstream read pauses. Per response, on both front
+# ends. Generous on purpose — see "Streams held back" on the status page, which
+# says how often it has actually been reached.
 stream_buffer_mb = 32
 
 [quic]

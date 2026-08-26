@@ -200,9 +200,7 @@ pub fn call(
 	let agent = agents.for_host(crate::host_of(&req.url));
 	let mut request = agent.request(&req.method, &req.url);
 	for (name, value) in &req.headers {
-		// Negotiated below instead: relaying the client's value verbatim invites
-		// a coding the interceptors cannot decode.
-		if name.eq_ignore_ascii_case("accept-encoding") {
+		if !forwarded(name, value) {
 			continue;
 		}
 
@@ -397,6 +395,26 @@ pub fn response_headers(resp: &ureq::Response) -> Vec<(String, String)> {
 		.collect()
 }
 
+/// Whether a header the client sent goes to the origin as it stands.
+///
+/// Two do not, for unrelated reasons:
+///
+/// - `accept-encoding` is renegotiated, because relaying the client's value
+///   verbatim invites a coding the interceptors cannot decode.
+/// - `expect: 100-continue` is settled between the client and this proxy before
+///   anything goes upstream — hyper answers it itself. Forwarding it asks the
+///   origin for an interim response ureq does not know about: it parses the
+///   `100 Continue` as *the* response and hands back a 100 with the real one
+///   still on the socket. Any other expectation is passed on, so an origin can
+///   refuse what it does not understand.
+fn forwarded(name: &str, value: &str) -> bool {
+	if name.eq_ignore_ascii_case("accept-encoding") {
+		return false;
+	}
+
+	!(name.eq_ignore_ascii_case("expect") && value.trim().eq_ignore_ascii_case("100-continue"))
+}
+
 /// Hop-by-hop headers are meaningful only on a single connection and must not
 /// be forwarded across the proxy (RFC 9110 §7.6.1), plus framing headers each
 /// front end sets for itself.
@@ -536,5 +554,22 @@ mod tests {
 		assert!(is_hop_by_hop("Content-Length"));
 		assert!(!is_hop_by_hop("content-type"));
 		assert!(!is_hop_by_hop("x-custom"));
+	}
+
+	/// ureq has no notion of an interim response: it reads the `100 Continue`
+	/// an origin sends back as the response itself, and the real one is left on
+	/// the socket. The expectation was answered by this proxy anyway.
+	#[test]
+	fn a_100_continue_expectation_is_not_forwarded() {
+		assert!(!forwarded("expect", "100-continue"));
+		assert!(!forwarded("Expect", " 100-Continue "));
+
+		// Anything else is the origin's to refuse.
+		assert!(forwarded("expect", "some-future-thing"));
+		assert!(forwarded("expect-ct", "max-age=0"));
+
+		// The other one that never goes as it came.
+		assert!(!forwarded("accept-encoding", "zstd"));
+		assert!(forwarded("accept", "text/html"));
 	}
 }

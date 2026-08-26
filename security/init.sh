@@ -15,11 +15,19 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-cert=mach5_root_cert.pem
-key=mach5_root_key.pem
-keystore=mach5.p12
+cert=${MACH5_CA_CERT:-mach5_root_cert.pem}
+key=${MACH5_CA_KEY:-mach5_root_key.pem}
+keystore=${MACH5_CA_KEYSTORE:-mach5.p12}
+days=${MACH5_CA_DAYS:-3650}
+
+# Whose root this is. It ends up in the certificate every device that trusts
+# this proxy will show, so it should say something true about *you* — this is
+# your certificate authority, not anybody else's.
+#
+#   MACH5_CA_SUBJECT="/CN=my mach5 root/O=My Homelab/C=GB" bash security/init.sh
+#
+# The default deliberately names nobody.
 subject=${MACH5_CA_SUBJECT:-/CN=mach5 root/O=mach5}
-days=3650
 
 if [[ -f $cert && -f $key ]]; then
 	echo "already present: $cert and $key"
@@ -29,16 +37,19 @@ fi
 
 if [[ -f $keystore ]]; then
 	echo "exporting the existing root from $keystore"
-	# The prototype's script hardcoded this password; -passin fails loudly and
-	# openssl prompts if yours differs.
+	# A migration path for one keystore that was never shared, and nothing else:
+	# the prototype that generated it hardcoded this password, so it is written
+	# here rather than pretended about. Override it if yours differs; -passin
+	# fails loudly rather than silently producing an empty key.
+	password=${MACH5_CA_KEYSTORE_PASSWORD:-password}
 	# Piped through x509/pkey to drop the "Bag Attributes" preamble openssl
 	# writes ahead of the PEM block, which strict parsers refuse.
-	openssl pkcs12 -in "$keystore" -passin pass:password -nokeys \
+	openssl pkcs12 -in "$keystore" -passin "pass:$password" -nokeys \
 		| openssl x509 -out "$cert"
 	# Through SEC1 and back into PKCS#8, which is not a detour: keytool writes a
 	# PKCS#8 EC key with no public-key point, and rcgen refuses those. SEC1
 	# carries the point, so the round trip is what puts it back.
-	openssl pkcs12 -in "$keystore" -passin pass:password -nocerts -noenc \
+	openssl pkcs12 -in "$keystore" -passin "pass:$password" -nocerts -noenc \
 		| openssl ec \
 		| openssl pkcs8 -topk8 -nocrypt -out "$key"
 else

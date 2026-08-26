@@ -1,5 +1,5 @@
 /*
- * mach5's in-page element picker.
+ * mach5's in-page control panel and element picker.
  *
  * Served from `/.mach5/mach5.js` and injected into every HTML page, so it runs
  * on sites that have never heard of it and must be able to fail without taking
@@ -11,6 +11,16 @@
  * every DNS query with the proxy's address they reach us as same-origin
  * requests, which is also why this is a `<script src>` rather than an inline
  * script: a site whose CSP is `script-src 'self'` still runs it.
+ *
+ * The panel lives in a shadow root. Without one, every site's stylesheet would
+ * reach into it and it would look different on each — and a site that styles
+ * `div { position: static !important }` would break it outright.
+ *
+ * What the panel can change is deliberately small: image quality, and the
+ * elements hidden here. Anything that would make mach5 *less safe* is not
+ * reachable from a page at all, because everything under `/.mach5/` is
+ * same-origin on every site and so is reachable by every site. See
+ * `settings.rs`.
  */
 (() => {
 	'use strict';
@@ -35,10 +45,56 @@
 
 	const HELP = 'mach5: click an element to hide it · u unhides all · Esc to stop';
 
+	/* Bottom right rather than top: on a phone that is where a thumb already
+	 * is. Sites put their own chat widgets here too, which is why this sits
+	 * quietly at low opacity until it is pointed at. */
+	const PANEL_STYLE = `
+		:host { all: initial }
+		#dot {
+			position: fixed; right: 16px; bottom: 16px; z-index: 2147483645;
+			width: 34px; height: 34px; border-radius: 50%; border: 0;
+			background: #202124; color: #fff; opacity: .45; cursor: pointer;
+			font: 600 12px/34px system-ui, sans-serif; text-align: center;
+			padding: 0; transition: opacity .15s;
+		}
+		#dot:hover, #dot:focus { opacity: 1 }
+		#panel {
+			position: fixed; right: 16px; bottom: 60px; z-index: 2147483646;
+			width: 230px; padding: 14px; border-radius: 10px; display: none;
+			background: #202124; color: #e8eaed; box-shadow: 0 6px 24px rgba(0,0,0,.4);
+			font: 13px/1.5 system-ui, -apple-system, sans-serif;
+		}
+		#panel.open { display: block }
+		h2 { font: 600 12px/1 system-ui, sans-serif; margin: 0 0 10px; opacity: .6;
+			letter-spacing: .06em; text-transform: uppercase }
+		fieldset { border: 0; margin: 0 0 12px; padding: 0 }
+		.tiers { display: flex; gap: 4px }
+		.tiers button {
+			flex: 1; border: 1px solid #5f6368; background: transparent; color: inherit;
+			border-radius: 5px; padding: 5px 0; font: inherit; cursor: pointer;
+		}
+		.tiers button[aria-pressed="true"] { background: #8ab4f8; color: #202124; border-color: #8ab4f8 }
+		.act { display: block; width: 100%; margin-top: 6px; border: 0; border-radius: 5px;
+			padding: 7px; font: inherit; cursor: pointer; background: #3c4043; color: inherit }
+		.act:hover { background: #4a4e51 }
+		a { color: #8ab4f8; display: inline-block; margin-top: 10px; font-size: 12px }
+		p { margin: 0 0 8px; opacity: .7; font-size: 12px }
+	`;
+
+	const TIERS = [
+		['auto', 'Auto'],
+		['high', 'High'],
+		['low', 'Low'],
+		['off', 'None'],
+	];
+
 	let picking = false;
 	let hovered = null;
 	let outline = null;
 	let badge = null;
+	let shadow = null;
+	let panel = null;
+	let settings = { image_quality: 'auto' };
 
 	/* A broken picker must never break the page it is sitting on. */
 	const guard = (fn) => (event) => {
@@ -207,6 +263,120 @@
 			body: body || null
 		});
 
+	/* The panel, in a shadow root so no site's CSS can reach it. Built once, on
+	 * the first frame after load — early enough to be there when wanted, late
+	 * enough not to compete with the page for the first paint. */
+	const buildPanel = () => {
+		if (shadow || !document.body) {
+			return;
+		}
+
+		const host = document.createElement('div');
+		host.setAttribute(OURS, 'panel');
+		shadow = host.attachShadow({ mode: 'closed' });
+
+		const style = document.createElement('style');
+		style.textContent = PANEL_STYLE;
+
+		const dot = document.createElement('button');
+		dot.id = 'dot';
+		dot.textContent = 'm5';
+		dot.title = 'mach5';
+		dot.setAttribute('aria-label', 'mach5 controls');
+
+		panel = document.createElement('div');
+		panel.id = 'panel';
+		panel.innerHTML = `
+			<h2>mach5</h2>
+			<fieldset>
+				<p>Image quality</p>
+				<div class="tiers"></div>
+			</fieldset>
+			<button class="act" data-act="pick">Hide an element</button>
+			<button class="act" data-act="clear">Unhide all here</button>
+			<a href="/.mach5/">Status and settings</a>
+		`;
+
+		const tiers = panel.querySelector('.tiers');
+		for (const [value, label] of TIERS) {
+			const button = document.createElement('button');
+			button.textContent = label;
+			button.dataset.tier = value;
+			tiers.append(button);
+		}
+
+		shadow.append(style, dot, panel);
+		document.body.append(host);
+
+		dot.addEventListener('click', guard(() => togglePanel()));
+		panel.addEventListener('click', guard(onPanelClick));
+
+		refreshTiers();
+	};
+
+	const togglePanel = (open) => {
+		if (!panel) {
+			return;
+		}
+
+		const wanted = open === undefined ? !panel.classList.contains('open') : open;
+		panel.classList.toggle('open', wanted);
+
+		if (wanted) {
+			// Read rather than assume: another tab may have changed these.
+			window
+				.fetch('/.mach5/settings', { credentials: 'omit' })
+				.then((r) => r.json())
+				.then((current) => {
+					settings = current;
+					refreshTiers();
+				})
+				.catch(() => {});
+		}
+	};
+
+	const refreshTiers = () => {
+		if (!panel) {
+			return;
+		}
+
+		for (const button of panel.querySelectorAll('[data-tier]')) {
+			const active = button.dataset.tier === settings.image_quality;
+			button.setAttribute('aria-pressed', active ? 'true' : 'false');
+		}
+	};
+
+	const onPanelClick = (event) => {
+		const tier = event.target.closest('[data-tier]');
+		if (tier) {
+			settings = Object.assign({}, settings, { image_quality: tier.dataset.tier });
+			refreshTiers();
+			post('/.mach5/settings', JSON.stringify(settings))
+				.then((r) => r.json())
+				.then((current) => {
+					settings = current;
+					refreshTiers();
+				})
+				.catch(() => {});
+
+			return;
+		}
+
+		const act = event.target.closest('[data-act]');
+		if (!act) {
+			return;
+		}
+
+		if (act.dataset.act === 'pick') {
+			togglePanel(false);
+			toggle(true);
+		} else if (act.dataset.act === 'clear') {
+			post('/.mach5/hidden/clear', null)
+				.then(() => window.location.reload())
+				.catch(() => {});
+		}
+	};
+
 	const track = (event) => {
 		if (!picking) {
 			return;
@@ -259,6 +429,10 @@
 			return;
 		}
 
+		if (!picking && event.code === 'Escape' && panel) {
+			togglePanel(false);
+		}
+
 		if (picking && event.code === 'KeyU' && !event.ctrlKey && !event.altKey && !event.metaKey) {
 			event.preventDefault();
 			post('/.mach5/hidden/clear', null)
@@ -270,11 +444,14 @@
 
 		if (event.ctrlKey && event.shiftKey && !event.altKey && !event.metaKey && event.code === 'KeyH') {
 			event.preventDefault();
-			toggle(!picking);
+			// The panel, not the picker: one shortcut to remember, and picking
+			// is a button inside it.
+			togglePanel();
 		}
 	};
 
 	try {
+		buildPanel();
 		document.addEventListener('keydown', guard(keys), true);
 		document.addEventListener('mousemove', guard(track), true);
 		document.addEventListener('click', guard(grab), true);

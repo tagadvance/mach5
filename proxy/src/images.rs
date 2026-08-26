@@ -37,14 +37,19 @@ const CONVERTIBLE: [&str; 4] = ["image/jpeg", "image/jpg", "image/png", "image/b
 const MIN_BYTES: usize = 3 * 1024;
 
 pub struct Images {
-	quality: f32,
+	/// What the configuration asked for. The panel moves around this rather
+	/// than replacing it, so the config stays the thing that sets the house
+	/// style.
+	configured: u8,
+	settings: Arc<crate::settings::Store>,
 	metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl Images {
 	pub fn new(config: &Config) -> Self {
 		Self {
-			quality: config.images.quality as f32,
+			configured: config.images.quality,
+			settings: crate::settings::shared(config),
 			metrics: crate::metrics::shared(),
 		}
 	}
@@ -58,7 +63,18 @@ impl Interceptor for Images {
 			return;
 		}
 
-		let Some(webp) = to_webp(&resp.body, self.quality) else {
+		// Asked per response rather than held, so a change from the panel takes
+		// effect on the next image and not the next restart.
+		let Some(quality) = self
+			.settings
+			.get()
+			.image_quality
+			.applied_to(self.configured)
+		else {
+			return;
+		};
+
+		let Some(webp) = to_webp(&resp.body, quality as f32) else {
 			return;
 		};
 
@@ -186,7 +202,10 @@ mod tests {
 
 	fn images() -> Images {
 		Images {
-			quality: 80.0,
+			configured: 80,
+			settings: Arc::new(crate::settings::Store::load(
+				std::env::temp_dir().join("mach5-images-test-settings.json"),
+			)),
 			metrics: Arc::new(crate::metrics::Metrics::default()),
 		}
 	}

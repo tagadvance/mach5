@@ -226,6 +226,7 @@ pub fn shared(config: &Config) -> Arc<Store> {
 /// Serves the endpoints under `/.mach5/`.
 pub struct Internal {
 	store: Arc<Store>,
+	settings: Arc<crate::settings::Store>,
 	bypasses: Arc<crate::insecure::Bypasses>,
 	/// How long a typed bypass lasts, or `None` when the mechanism is off.
 	bypass_ttl: Option<std::time::Duration>,
@@ -250,6 +251,7 @@ impl Internal {
 	pub fn new(config: &Config, ca: Arc<CertAuthority>) -> Self {
 		Self {
 			store: shared(config),
+			settings: crate::settings::shared(config),
 			bypasses: crate::insecure::bypasses(),
 			// `None` is the whole switch: no TTL, no endpoint.
 			bypass_ttl: config.bypass_phrase().map(|_| config.bypass_ttl()),
@@ -321,12 +323,15 @@ impl Internal {
 
 				empty(204)
 			}
+			("/.mach5/settings", "GET") => self.settings(),
+			("/.mach5/settings", "POST") => self.change_settings(body),
 			("/.mach5/hidden.css", "GET") => self.stylesheet(host),
 			("/.mach5/mach5.js", "GET") => script(),
 			(CERTIFICATE, "GET") => self.certificate(),
 			(
 				"/.mach5"
 				| "/.mach5/"
+				| "/.mach5/settings"
 				| "/.mach5/stats.json"
 				| "/.mach5/hidden"
 				| "/.mach5/hidden/remove"
@@ -344,23 +349,26 @@ impl Internal {
 	/// the counters are the same everywhere, but what is hidden and whether a
 	/// certificate bypass is running are answers only this origin can give.
 	fn status(&self, host: &str) -> ProxyResponse {
-		let page = status_page(
+		let page = status_page(Page {
 			host,
-			&self.metrics.snapshot(),
-			&self.store.selectors(host),
-			self.bypasses.allows(host),
+			counted: &self.metrics.snapshot(),
+			selectors: &self.store.selectors(host),
+			bypassed: self.bypasses.allows(host),
 			// A list that loaded nothing is not a working list, so it must not
 			// report as one.
-			self.blocklist
+			list: self
+				.blocklist
 				.as_ref()
 				.map(|lists| lists.current().status())
 				.filter(|list| list.domains > 0),
-			self.cosmetic
+			rules: self
+				.cosmetic
 				.as_ref()
 				.map(|rules| rules.current().status())
 				.filter(|rules| rules.rules > 0),
-			self.ca.is_ephemeral(),
-		);
+			ephemeral: self.ca.is_ephemeral(),
+			live: self.settings.get(),
+		});
 
 		let mut response = empty(200);
 		response.headers.push((
@@ -409,6 +417,32 @@ impl Internal {
 		response.body = body;
 
 		response
+	}
+
+	/// What the panel may read and change. Deliberately a small surface — see
+	/// [`crate::settings`] for why nothing dangerous is in it.
+	fn settings(&self) -> ProxyResponse {
+		let body = serde_json::to_vec(&self.settings.get()).expect("settings are serializable");
+
+		let mut response = empty(200);
+		response
+			.headers
+			.push(("content-type".to_string(), "application/json".to_string()));
+		response.body = body;
+
+		response
+	}
+
+	/// Replace them wholesale and hand back what is now in force, so the panel
+	/// never has to guess whether its change took.
+	fn change_settings(&self, body: &[u8]) -> ProxyResponse {
+		let Ok(wanted) = serde_json::from_slice::<crate::settings::Settings>(body) else {
+			return empty(400);
+		};
+
+		self.settings.set(wanted);
+
+		self.settings()
 	}
 
 	fn hidden(&self, host: &str) -> ProxyResponse {
@@ -544,6 +578,17 @@ struct Hide {
 	selector: String,
 }
 
+/// The value `[settings] image_quality` serialises as, for writing back into
+/// a control that must not silently reset it.
+fn quality_name(quality: crate::settings::Quality) -> &'static str {
+	match quality {
+		crate::settings::Quality::Auto => "auto",
+		crate::settings::Quality::High => "high",
+		crate::settings::Quality::Low => "low",
+		crate::settings::Quality::Off => "off",
+	}
+}
+
 /// The picker library. The only endpoint here that is the same for every host,
 /// and so the only one worth caching — briefly. Five minutes is long enough to
 /// keep it off the wire for a browsing session and short enough that a
@@ -591,15 +636,24 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 const REMOVE: &str = r#"<script>
 addEventListener('click', (e) => {
 	const control = e.target.closest('button[data-selector]');
-	if (!control) {
+	if (control) {
+		fetch('/.mach5/hidden/remove', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ selector: control.dataset.selector }),
+		}).then(() => location.reload());
+
 		return;
 	}
 
-	fetch('/.mach5/hidden/remove', {
-		method: 'POST',
-		headers: { 'content-type': 'application/json' },
-		body: JSON.stringify({ selector: control.dataset.selector }),
-	}).then(() => location.reload());
+	const setting = e.target.closest('button[data-set]');
+	if (setting) {
+		fetch('/.mach5/settings', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: setting.dataset.set,
+		}).then(() => location.reload());
+	}
 });
 </script>"#;
 
@@ -608,15 +662,31 @@ addEventListener('click', (e) => {
 /// `list` and `rules` are `None` when nothing of that kind is loaded, which is
 /// not the same thing as a list that has caught nothing: a bare zero there
 /// would read as "this is working and there was nothing to catch".
-fn status_page(
-	host: &str,
-	counted: &Snapshot,
-	selectors: &[String],
+/// Everything the status page reports on. A struct rather than eight
+/// arguments, which is what it had grown into.
+struct Page<'a> {
+	host: &'a str,
+	counted: &'a Snapshot,
+	selectors: &'a [String],
 	bypassed: bool,
 	list: Option<crate::blocklist::Status>,
 	rules: Option<crate::cosmetic::Status>,
 	ephemeral: bool,
-) -> String {
+	live: crate::settings::Settings,
+}
+
+fn status_page(page: Page) -> String {
+	let Page {
+		host,
+		counted,
+		selectors,
+		bypassed,
+		list,
+		rules,
+		ephemeral,
+		live,
+	} = page;
+
 	let host = escape(host);
 	let uptime = metrics::uptime(std::time::Duration::from_secs(counted.uptime_seconds));
 	let requests = metrics::thousands(counted.requests);
@@ -649,6 +719,18 @@ fn status_page(
 	let internal = metrics::thousands(counted.internal);
 	let injected = metrics::thousands(counted.injected);
 	let passed_through = metrics::thousands(counted.passed_through);
+	// The one control that has to live here rather than in the panel: turning
+	// injection off removes the panel, so the way back on cannot be inside it.
+	let injection = match live.inject {
+		crate::settings::Injection::On => format!(
+			r#"<td>on <button data-set='{{"image_quality":"{quality}","inject":"off"}}'>turn off</button></td>"#,
+			quality = quality_name(live.image_quality)
+		),
+		crate::settings::Injection::Off => format!(
+			r#"<td class="note">off — no panel on any page 			<button data-set='{{"image_quality":"{quality}","inject":"on"}}'>turn on</button></td>"#,
+			quality = quality_name(live.image_quality)
+		),
+	};
 	let bypasses = metrics::thousands(counted.bypassed);
 	let tls_failures = metrics::thousands(counted.tls_failures);
 	let upstream_failures = metrics::thousands(counted.upstream_failures);
@@ -700,6 +782,7 @@ fn status_page(
     <tr><th>mach5 endpoints</th><td>{internal}</td></tr>
     <tr><th>Pages injected</th><td>{injected}</td></tr>
     <tr><th>Passed through undecrypted</th><td>{passed_through}</td></tr>
+    <tr><th>Panel in pages</th>{injection}</tr>
     <tr><th>Fetched unvalidated</th><td>{bypasses}</td></tr>
     <tr><th>Certificate failures</th><td>{tls_failures}</td></tr>
     <tr><th>Other upstream failures</th><td>{upstream_failures}</td></tr>
@@ -887,6 +970,9 @@ mod tests {
 	fn internal_with(dir: &TempDir, ca: CertAuthority) -> Internal {
 		Internal {
 			store: Arc::new(Store::load(dir.path().join("hidden.json"))),
+			settings: Arc::new(crate::settings::Store::load(
+				dir.path().join("settings.json"),
+			)),
 			bypasses: Arc::new(crate::insecure::Bypasses::default()),
 			bypass_ttl: Some(std::time::Duration::from_secs(60)),
 			metrics: Arc::new(Metrics::default()),
@@ -927,6 +1013,66 @@ mod tests {
 
 	fn body_of(response: &ProxyResponse) -> String {
 		String::from_utf8(response.body.clone()).expect("responses are utf-8")
+	}
+
+	#[test]
+	fn the_settings_endpoint_reads_and_writes() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		let before = call(&internal, "GET", "https://example.com/.mach5/settings", "");
+		assert_eq!(before.status, 200);
+		assert!(body_of(&before).contains(r#""image_quality":"auto""#));
+
+		let changed = call(
+			&internal,
+			"POST",
+			"https://example.com/.mach5/settings",
+			r#"{"image_quality":"low"}"#,
+		);
+
+		assert_eq!(changed.status, 200);
+		assert!(
+			body_of(&changed).contains(r#""image_quality":"low""#),
+			"the reply is what is now in force, so the panel need not guess"
+		);
+		assert!(body_of(&call(&internal, "GET", "https://example.com/.mach5/settings", ""))
+			.contains(r#""image_quality":"low""#));
+	}
+
+	#[test]
+	fn a_malformed_settings_body_changes_nothing() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		assert_eq!(
+			call(&internal, "POST", "https://example.com/.mach5/settings", "not json").status,
+			400
+		);
+		assert!(body_of(&call(&internal, "GET", "https://example.com/.mach5/settings", ""))
+			.contains(r#""image_quality":"auto""#));
+	}
+
+	/// Turning injection off takes the panel away with it, so the way back on
+	/// has to be somewhere the panel is not.
+	#[test]
+	fn the_status_page_can_turn_injection_back_on() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+		call(
+			&internal,
+			"POST",
+			"https://example.com/.mach5/settings",
+			r#"{"image_quality":"auto","inject":"off"}"#,
+		);
+
+		let page = body_of(&call(&internal, "GET", "https://example.com/.mach5/", ""));
+
+		assert!(page.contains(r#""inject":"on""#), "a way back: {page}");
+		assert!(
+			page.contains(r#""image_quality":"auto""#),
+			"and it must not quietly reset the quality on the way"
+		);
 	}
 
 	#[test]

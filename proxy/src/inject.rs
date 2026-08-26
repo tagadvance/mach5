@@ -45,6 +45,7 @@ const MARKER: &[u8] = b"/.mach5/mach5.js";
 /// Adds the tags to HTML pages.
 pub struct Inject {
 	exclude: HashSet<String>,
+	settings: Arc<crate::settings::Store>,
 	metrics: Arc<crate::metrics::Metrics>,
 }
 
@@ -58,12 +59,16 @@ impl Inject {
 				.map(|host| host.trim().trim_end_matches('.').to_ascii_lowercase())
 				.filter(|host| !host.is_empty())
 				.collect(),
+			settings: crate::settings::shared(config),
 			metrics: crate::metrics::shared(),
 		}
 	}
 
 	fn excluded(&self, req: &ProxyRequest) -> bool {
-		crate::blocklist::covers(&self.exclude, crate::host_of(&req.url))
+		// Switched off from the panel counts as excluded everywhere, which is
+		// what somebody debugging a site is asking for.
+		self.settings.get().inject == crate::settings::Injection::Off
+			|| crate::blocklist::covers(&self.exclude, crate::host_of(&req.url))
 	}
 }
 
@@ -205,6 +210,9 @@ mod tests {
 	fn inject(exclude: &[&str]) -> Inject {
 		Inject {
 			exclude: exclude.iter().map(|host| host.to_string()).collect(),
+			settings: Arc::new(crate::settings::Store::load(
+				std::env::temp_dir().join("mach5-inject-test-settings.json"),
+			)),
 			metrics: Arc::new(crate::metrics::Metrics::default()),
 		}
 	}

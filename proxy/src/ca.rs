@@ -235,7 +235,11 @@ impl CertAuthority {
 		// waiting is the QUIC event loop, which is every connection at once.
 		// Two callers racing on one name mint twice and one of them throws its
 		// leaf away, which is far cheaper than the alternative.
-		let leaf = self.mint(sni)?;
+		// Minted from the *normalised* name, not the raw SNI. They used to
+		// disagree: a client sending `example.com.` had the cache keyed on
+		// `example.com` but the leaf's only SAN written as `example.com.`,
+		// which no client accepts — and it was then served for the whole TTL.
+		let leaf = self.mint(&key)?;
 		self.remember(key, leaf.clone());
 
 		Ok(leaf)
@@ -465,6 +469,26 @@ mod tests {
 		let shouted = ca.leaf_for("EXAMPLE.COM.").unwrap();
 		assert_eq!(first.cert.to_der().unwrap(), shouted.cert.to_der().unwrap());
 		assert_eq!(ca.cache.lock().unwrap().len(), 1);
+	}
+
+	/// The order matters, and hid a defect: minting `example.com` first made
+	/// the odd spelling a pure cache hit, so the raw name never reached `mint`.
+	/// Asked the other way round, the leaf's only SAN was written verbatim —
+	/// trailing dot and all — and no client accepts that, for the whole TTL.
+	#[test]
+	fn a_leaf_carries_the_name_a_client_will_check() {
+		let ca = CertAuthority::generate_dev(&Config::default()).unwrap();
+		let leaf = ca.leaf_for("EXAMPLE.COM.").unwrap();
+
+		let names: Vec<String> = leaf
+			.cert
+			.subject_alt_names()
+			.expect("a leaf has a SAN")
+			.iter()
+			.filter_map(|name| name.dnsname().map(str::to_string))
+			.collect();
+
+		assert_eq!(names, ["example.com"], "the name as a client will send it");
 	}
 
 	/// mach5 sits behind a resolver that answers every name with its own

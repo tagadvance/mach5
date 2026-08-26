@@ -1150,11 +1150,23 @@ fn send_full(
 	job: &FetchJob,
 	response: ProxyResponse,
 ) -> Result<(), Gone> {
+	// Through `bodyless` like everything else. This is the *other* place a
+	// response leaves the worker — it exists because the borrow of the job has
+	// not yet been handed to the closure that usually does this — and missing
+	// it meant an h3 HEAD to a blocked host, or to any `/.mach5/` endpoint, was
+	// answered with the whole body while TCP stripped it.
+	let payload = Payload::Full(response);
+	let payload = if job.request.method.eq_ignore_ascii_case("HEAD") {
+		bodyless(payload)
+	} else {
+		payload
+	};
+
 	results
 		.send(FetchResult {
 			conn: job.conn.clone(),
 			stream_id: job.stream_id,
-			payload: Payload::Full(response),
+			payload,
 			budget: job.budget.clone(),
 		})
 		.map_err(|_| Gone::Pool)?;

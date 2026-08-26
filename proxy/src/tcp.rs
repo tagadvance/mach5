@@ -699,12 +699,32 @@ async fn peek_server_name(stream: &mut tokio::net::TcpStream) -> Option<String> 
 			.ok()?
 			.ok()?;
 
+		// A half-closed socket peeks `Ok(0)` for ever, and `have_hello` on an
+		// empty buffer asks for more — so without this a client that connects
+		// and sends FIN held a task, a descriptor and five thousand timer
+		// wakeups for the whole window, which is the resource-hold the deadline
+		// was added to close rather than to create.
+		if read == 0 {
+			return None;
+		}
+
 		match crate::passthrough::have_hello(&buf[..read]) {
 			Hello::Complete => return crate::passthrough::server_name(&buf[..read]),
 			// Not TLS, or a hello larger than we will ever read. Either way
 			// there is nothing to wait for.
 			Hello::NotTls => return None,
-			Hello::Want(whole) if whole > buf.len() => return None,
+			// Bigger than we will ever read. Said out loud because the
+			// consequence is that a host on the passthrough list is decrypted,
+			// which is the one failure here nobody would otherwise notice.
+			Hello::Want(whole) if whole > buf.len() => {
+				log::warn!(
+					"a ClientHello of {whole} bytes is larger than the {} this reads, so \
+					 the connection will be terminated rather than passed through",
+					buf.len()
+				);
+
+				return None;
+			}
 			Hello::Want(_) => {}
 		}
 

@@ -49,6 +49,19 @@ pub fn certificate_error(
 			),
 			// Never let a warning page be cached in place of the real site.
 			("cache-control".to_string(), "no-store".to_string()),
+			// This page's whole job is to be a refusal that somebody looks at,
+			// and it is the one place a keystroke turns certificate validation
+			// off. Framed, it is a refusal nobody sees: an attacker who can
+			// make an origin's certificate fail puts it in an invisible frame,
+			// asks for twelve characters under some pretext, and the typing
+			// lands here — same-origin, so both the token and the
+			// `sec-fetch-site` check are satisfied.
+			(
+				"content-security-policy".to_string(),
+				"frame-ancestors 'none'".to_string(),
+			),
+			// For anything that predates frame-ancestors.
+			("x-frame-options".to_string(), "DENY".to_string()),
 		],
 		body: body.into_bytes(),
 	}
@@ -328,6 +341,28 @@ pub(crate) fn escape(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// The page's job is to be a refusal somebody looks at, and it is the one
+	/// place a keystroke turns certificate validation off. Framed, it is a
+	/// refusal nobody sees — and the typing that lands in the frame is
+	/// genuinely same-origin, so neither the token nor the `sec-fetch-site`
+	/// check notices anything wrong.
+	#[test]
+	fn the_warning_page_cannot_be_put_in_a_frame() {
+		let page = certificate_error("bank.example", "expired", Some(("thisisunsafe", "tok")));
+		let header = |name: &str| -> Option<&str> {
+			page.headers
+				.iter()
+				.find(|(header, _)| header.eq_ignore_ascii_case(name))
+				.map(|(_, value)| value.as_str())
+		};
+
+		assert_eq!(
+			header("content-security-policy"),
+			Some("frame-ancestors 'none'")
+		);
+		assert_eq!(header("x-frame-options"), Some("DENY"));
+	}
 
 	/// The mechanism has to be invisible when it is on and absent when it is
 	/// off. A page that hinted at it would be a page people click through.

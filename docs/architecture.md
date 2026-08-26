@@ -172,10 +172,51 @@ its own. Bind the wildcard resolver there and leave pi-hole on the LAN address.
 `MACH5_DNS_BIND` in `.env` is that address. Unset means "listen on everything",
 which is right when pi-hole is on another machine.
 
-A macvlan network is the other way to get an address without aliasing one — but
-a macvlan container is unreachable from its own host, *including packets the
-host forwards*, so it breaks the moment a VPN terminates on the same machine.
-That is why it is not the default.
+### The macvlan alternative
+
+A macvlan network is the other way to get an address without aliasing one. It is
+worth knowing about generally: the driver gives a container its own *MAC*
+address on a physical parent interface, so the switch sees it as a separate
+machine on the LAN. No NAT, no published ports — the container simply is on your
+network at an address of its own.
+
+```yaml
+networks:
+  lan:
+    driver: macvlan
+    driver_opts: { parent: eth0 }
+    ipam:
+      config: [{ subnet: 192.168.1.0/24, gateway: 192.168.1.1 }]
+
+services:
+  dns:
+    networks:
+      lan:
+        ipv4_address: 192.168.1.53    # fixed, which a client config needs
+```
+
+The address is static because `ipv4_address` pins it; without that, Docker's
+IPAM picks from the pool and it can move. Anything pointing at it by address —
+a WireGuard `DNS =` line, a DHCP option — needs it pinned.
+
+Four things that cost an evening if nobody says them:
+
+- **The address must be outside your DHCP pool**, or the router will eventually
+  lease it to something else. Reserve it.
+- **The parent has to be wired.** Wi-Fi generally cannot do this: an access point
+  rejects frames whose source MAC is not the station it associated with, so a
+  macvlan child never gets a reply.
+- **Virtualised NICs may refuse it** until the hypervisor's switch allows
+  promiscuous mode or MAC changes.
+- **The host cannot reach its own macvlan children** — including packets it
+  merely *forwards*. This is the one that matters here: a WireGuard client's
+  query arrives on `wg0`, is routed out `eth0`, and is dropped on the way to a
+  macvlan child of that same `eth0`. A fixed address does not rescue it. There
+  is a workaround — a macvlan shim interface on the host — but it is a manual,
+  non-persistent host change, which is exactly what macvlan was meant to avoid.
+
+So: macvlan is right when the Docker host is not also the VPN endpoint, and
+`MACH5_DNS_BIND` is right when it is.
 
 ## Writing a plugin
 

@@ -576,10 +576,25 @@ impl Interceptor for Plugin {
 		// A plugin that asked for chunks is never handed a whole body, whatever
 		// else caused this response to be buffered. `wants_body` says so, but
 		// the front ends buffer on `wants_body(..) || worth_keeping`, so a
-		// cacheable response reached here with the plugin's answer ignored —
-		// and it got the megabytes chunk mode exists to avoid, while its chunk
-		// hooks were never called at all.
+		// cacheable response reaches here with the plugin's answer ignored —
+		// and it would get the megabytes chunk mode exists to avoid.
+		//
+		// Said out loud, because what happens instead is that the plugin sees
+		// *nothing* for this response: the chunk hooks only run on the
+		// streaming branch, which `worth_keeping` took it off. Wrong either
+		// way, and silence is the worse of the two. Closing it properly is a
+		// contract decision — skip storing when a chunk plugin is interested,
+		// or run the chunk hooks over the buffered body at the point the
+		// encoding still matches — so it is written down rather than guessed
+		// at. See HANDOVER.md.
 		if self.chunks {
+			log::warn!(
+				"plugin {} takes chunks, but this response was buffered for the \
+				 cache, so it sees none of it: {}",
+				self.name,
+				crate::redact::url(&req.url)
+			);
+
 			return;
 		}
 

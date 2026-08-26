@@ -50,7 +50,12 @@ const CERTIFICATE_FILENAME: &str = "mach5-root.crt";
 /// Bounds on what one page can store. A selector is a handful of characters in
 /// practice; these exist so a buggy — or hostile — page cannot grow the file
 /// without limit.
-const MAX_SELECTOR_BYTES: usize = 512;
+/// A CSS selector is a handful of characters. 512 was chosen as "generous",
+/// but it multiplies: 500 hosts × 500 selectors × 512 bytes is a 128MB file,
+/// re-serialised and renamed whole on every single hide, under a lock every
+/// other hide waits on. 128 is past the longest selector the picker can
+/// generate and past anything in a filter list.
+const MAX_SELECTOR_BYTES: usize = 128;
 const MAX_SELECTORS_PER_HOST: usize = 500;
 /// And a bound on the *number* of hosts, which the per-host cap says nothing
 /// about. A page can only write its own host's list, which sounds like the

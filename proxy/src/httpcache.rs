@@ -113,21 +113,27 @@ pub fn eligible(req: &ProxyRequest, status: u16, headers: &[(String, String)]) -
 		}
 	}
 
-	// Something to go on. For an image a validator alone is enough: the worst a
-	// mistake costs is a picture that should have been someone else's.
+	// Something to go on, in proportion to what being wrong would cost.
 	//
-	// A script is different in kind. Sites serve bootstrap JavaScript carrying a
-	// user id, a CSRF token or an API key, and a bare `etag` says only "here is
-	// how to check whether it changed" — never "this is the same for
-	// everybody". A declared freshness lifetime is the origin saying the latter
-	// out loud, so that is what an asset has to have.
+	// Plenty of small sites set no cache headers at all — which is much of why
+	// mach5 exists — so demanding a freshness lifetime everywhere would cache
+	// nothing for exactly the origins that need the help. The answer is to ask
+	// for more proof only where a mistake is expensive.
+	let validated =
+		header(headers, "etag").is_some() || header(headers, "last-modified").is_some();
+
 	match kind {
-		Kind::Image => {
+		// Never personalised, and a mistake is the wrong picture or the wrong
+		// typeface.
+		Kind::Static | Kind::Style => freshness(headers).is_some() || validated,
+		// The one that carries user ids and CSRF tokens. Either the origin says
+		// out loud how long this is good for — which is a claim about everybody,
+		// not about this request — or the filename carries a content hash,
+		// which nobody puts on a file built per user.
+		Kind::Script => {
 			freshness(headers).is_some()
-				|| header(headers, "etag").is_some()
-				|| header(headers, "last-modified").is_some()
+				|| (validated && looks_fingerprinted(&req.url))
 		}
-		Kind::Asset => freshness(headers).is_some(),
 		Kind::Other => false,
 	}
 }
@@ -159,16 +165,14 @@ pub fn freshness(headers: &[(String, String)]) -> Option<Duration> {
 ///
 /// HTML is deliberately absent and should stay absent until mach5 knows who is
 /// asking. A page is where per-user content lives.
-const CACHEABLE: [&str; 12] = [
-	"text/css",
+const SCRIPTS: [&str; 3] = [
 	"application/javascript",
 	"text/javascript",
 	"application/x-javascript",
-	"font/woff",
-	"font/woff2",
-	"font/ttf",
-	"font/otf",
-	"font/collection",
+];
+
+/// The `font/*` types are caught by prefix; these are the older spellings.
+const FONTS: [&str; 3] = [
 	"application/font-woff",
 	"application/vnd.ms-fontobject",
 	"application/x-font-ttf",
@@ -176,11 +180,20 @@ const CACHEABLE: [&str; 12] = [
 
 /// The kind of thing this is, which decides how much proof of publicness is
 /// wanted before storing it.
+///
+/// Not all assets are equally risky, and treating them as if they were would
+/// mean caching nothing for exactly the small sites that set no cache headers
+/// and most need the help.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Kind {
-	Image,
-	/// A stylesheet, a script, a font.
-	Asset,
+	/// Images and fonts. Neither is ever personalised — a font is a build
+	/// artifact — and the worst a mistake costs is the wrong picture.
+	Static,
+	/// A stylesheet. Personalised ones exist but are rare, and being wrong
+	/// about one is cosmetic rather than a leaked credential.
+	Style,
+	/// A script. The one that carries user ids, CSRF tokens and API keys.
+	Script,
 	Other,
 }
 
@@ -196,15 +209,49 @@ fn kind(headers: &[(String, String)]) -> Kind {
 		.trim()
 		.to_ascii_lowercase();
 
-	if media.starts_with("image/") {
-		return Kind::Image;
+	if media.starts_with("image/") || media.starts_with("font/") || FONTS.contains(&media.as_str())
+	{
+		return Kind::Static;
 	}
 
-	if CACHEABLE.contains(&media.as_str()) {
-		return Kind::Asset;
+	if media == "text/css" {
+		return Kind::Style;
+	}
+
+	if SCRIPTS.contains(&media.as_str()) {
+		return Kind::Script;
 	}
 
 	Kind::Other
+}
+
+/// Whether the last path segment carries what looks like a content hash —
+/// `app.a1b2c3d4.js`, `main-4f3a9c2e.css`.
+///
+/// A strong signal that something is a shared build artifact: the whole point
+/// of fingerprinting is that the name changes when the bytes do, which is
+/// nonsense for a file built per user. Nobody fingerprints `config.js`.
+///
+/// Deliberately narrow. A segment has to be long, has to mix letters and
+/// digits, and has to be all hex or all lowercase alphanumeric — because the
+/// cost of calling something a build artifact when it is somebody's session is
+/// the whole point of the rules around it.
+fn looks_fingerprinted(url: &str) -> bool {
+	let path = url.split(['?', '#']).next().unwrap_or(url);
+	let Some(file) = path.rsplit('/').next() else {
+		return false;
+	};
+
+	file.split(['.', '-', '_']).any(|segment| {
+		let long_enough = (8..=64).contains(&segment.len());
+		let mixed = segment.chars().any(|c| c.is_ascii_digit())
+			&& segment.chars().any(|c| c.is_ascii_alphabetic());
+		let plausible = segment
+			.chars()
+			.all(|c| c.is_ascii_digit() || c.is_ascii_lowercase());
+
+		long_enough && mixed && plausible
+	})
 }
 
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -513,31 +560,101 @@ mod tests {
 		}
 	}
 
-	/// The asymmetry that matters. Sites serve bootstrap scripts carrying a
-	/// user id or a CSRF token, and an `etag` alone says only "here is how to
-	/// check whether it changed" — never "this is the same for everybody".
+	fn at(url: &str, pairs: &[(&str, &str)]) -> (ProxyRequest, Vec<(String, String)>) {
+		let mut req = request(&[]);
+		req.url = url.to_string();
+
+		(req, headers(pairs))
+	}
+
+	/// The case Tag pushed back on: a small site that sets no cache headers at
+	/// all is exactly the one mach5 is for, and demanding `max-age` everywhere
+	/// would cache nothing for it.
+	#[test]
+	fn a_stylesheet_or_font_with_only_a_validator_is_still_cached() {
+		for kind in ["text/css", "font/woff2", "application/vnd.ms-fontobject"] {
+			let (req, head) = at(
+				"https://small.example/style.css",
+				&[("content-type", kind), ("last-modified", "Mon, 1 Jan 2024 00:00:00 GMT")],
+			);
+
+			assert!(
+				eligible(&req, 200, &head),
+				"{kind} is never personalised, and a mistake is cosmetic"
+			);
+		}
+	}
+
+	/// A fingerprint is a claim about everybody: the name changes when the
+	/// bytes do, which is nonsense for a file built per user.
+	#[test]
+	fn a_fingerprinted_script_is_cached_on_a_validator() {
+		let (req, head) = at(
+			"https://small.example/assets/app.a1b2c3d4.js",
+			&[("content-type", "application/javascript"), ("etag", "\"v1\"")],
+		);
+
+		assert!(eligible(&req, 200, &head));
+	}
+
+	#[test]
+	fn a_plainly_named_script_is_not() {
+		let (req, head) = at(
+			"https://small.example/config.js",
+			&[("content-type", "application/javascript"), ("etag", "\"v1\"")],
+		);
+
+		assert!(
+			!eligible(&req, 200, &head),
+			"this is what a bootstrap script full of tokens looks like"
+		);
+	}
+
+	#[test]
+	fn what_counts_as_a_fingerprint_is_narrow() {
+		for yes in [
+			"https://e/app.a1b2c3d4.js",
+			"https://e/main-4f3a9c2e1b.css",
+			"https://e/chunk_8a7f6e5d.js",
+			"https://e/x/9f8e7d6c5b4a3f2e.js?v=2",
+		] {
+			assert!(looks_fingerprinted(yes), "{yes}");
+		}
+
+		for no in [
+			"https://e/config.js",
+			"https://e/session.js",
+			"https://e/app.js",
+			"https://e/jquery.min.js",
+			"https://e/analytics.js?user=12345678",
+			"https://e/abcdefghij.js",
+		] {
+			assert!(!looks_fingerprinted(no), "{no}");
+		}
+	}
+
+	/// The asymmetry that matters, stated as one test: the same headers on a
+	/// picture and on a plainly-named script get different answers.
 	#[test]
 	fn a_script_needs_more_proof_than_an_image_does() {
-		let bare_validator = headers(&[
-			("content-type", "application/javascript"),
-			("etag", "\"abc\""),
-		]);
-		assert!(
-			!eligible(&request(&[]), 200, &bare_validator),
-			"a validator alone is not an origin calling this public"
-		);
+		let validator_only = |kind: &str| headers(&[("content-type", kind), ("etag", "\"abc\"")]);
 
-		let same_for_an_image = headers(&[("content-type", "image/png"), ("etag", "\"abc\"")]);
 		assert!(
-			eligible(&request(&[]), 200, &same_for_an_image),
+			eligible(&request(&[]), 200, &validator_only("image/png")),
 			"where the worst case is the wrong picture, a validator is enough"
 		);
-
-		assert!(eligible(
-			&request(&[]),
-			200,
-			&asset("application/javascript", "public, max-age=31536000")
-		));
+		assert!(
+			!eligible(&request(&[]), 200, &validator_only("application/javascript")),
+			"where it could be somebody's token, it is not"
+		);
+		assert!(
+			eligible(
+				&request(&[]),
+				200,
+				&asset("application/javascript", "public, max-age=31536000")
+			),
+			"unless the origin says out loud how long it is good for"
+		);
 	}
 
 	#[test]

@@ -270,12 +270,22 @@ cache_mb = 512
 # `vary` beyond accept and accept-encoding. Anything else is not cached rather
 # than cached carefully.
 #
-# One asymmetry worth knowing. An image may be cached on a validator alone,
-# because the worst a mistake costs is the wrong picture. A script may not:
-# sites serve bootstrap JavaScript carrying a user id or a CSRF token, and an
-# `etag` says only "here is how to check whether it changed" — never "this is
-# the same for everybody". Scripts, stylesheets and fonts therefore need the
-# origin to have declared a freshness lifetime.
+# How much proof of publicness is wanted depends on what being wrong would cost,
+# because plenty of small sites set no cache headers at all — which is much of
+# why mach5 exists — and demanding a freshness lifetime everywhere would cache
+# nothing for exactly those origins.
+#
+#   images, fonts   an etag or last-modified is enough. Never personalised, and
+#                   a mistake is the wrong picture or the wrong typeface.
+#   stylesheets     the same. Per-user CSS exists but is rare, and being wrong
+#                   about it is cosmetic rather than a leaked credential.
+#   scripts         either the origin declares a freshness lifetime, or the
+#                   filename carries a content hash — `app.a1b2c3d4.js`. A
+#                   fingerprint is a claim about everybody, since the whole
+#                   point is that the name changes when the bytes do, and nobody
+#                   fingerprints a file built per user. A plainly-named
+#                   `config.js` with only an etag is not cached, because that is
+#                   exactly what a script full of tokens looks like.
 #
 # A browser's hard refresh works: shift-reload sends `cache-control: no-cache`,
 # which mach5 honours by revalidating before serving. The status page also has

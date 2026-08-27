@@ -263,6 +263,13 @@ pub struct Internal {
 	settings: Arc<crate::settings::Store>,
 	cache_dir: std::path::PathBuf,
 	bypasses: Arc<crate::insecure::Bypasses>,
+	/// Hosts mach5 has decided not to decrypt, which this page can add to and
+	/// remove from — for this host only. Absent in the tests that do not need
+	/// it, so they never touch a real state directory.
+	learned: Option<Arc<crate::passthrough::Learned>>,
+	/// The configured list, read-only here: the page reports what it says and
+	/// can never change it.
+	passthrough: Arc<crate::passthrough::Passthrough>,
 	/// How long a typed bypass lasts, or `None` when the mechanism is off.
 	bypass_ttl: Option<std::time::Duration>,
 	metrics: Arc<Metrics>,
@@ -289,6 +296,8 @@ impl Internal {
 			settings: crate::settings::shared(config),
 			cache_dir: config.paths.cache_dir.clone(),
 			bypasses: crate::insecure::bypasses(),
+			learned: Some(crate::passthrough::learned(config)),
+			passthrough: crate::passthrough::shared(config),
 			// `None` is the whole switch: no TTL, no endpoint.
 			bypass_ttl: config.bypass_phrase().map(|_| config.bypass_ttl()),
 			metrics: metrics::shared(),
@@ -369,6 +378,8 @@ impl Internal {
 			("/.mach5/cache/clear", "POST") => self.clear_caches(),
 			("/.mach5/settings", "GET") => self.settings(),
 			("/.mach5/settings", "POST") => self.change_settings(body),
+			("/.mach5/passthrough", "POST") => self.stop_decrypting(host),
+			("/.mach5/passthrough/remove", "POST") => self.resume_decrypting(host),
 			("/.mach5/hidden.css", "GET") => self.stylesheet(host),
 			("/.mach5/mach5.js", "GET") => script(),
 			(CERTIFICATE | CERTIFICATE_ALIAS, "GET") => self.certificate(),
@@ -381,6 +392,8 @@ impl Internal {
 				| "/.mach5/hidden"
 				| "/.mach5/hidden/remove"
 				| "/.mach5/hidden/clear"
+				| "/.mach5/passthrough"
+				| "/.mach5/passthrough/remove"
 				| "/.mach5/hidden.css"
 				| "/.mach5/mach5.js"
 				| CERTIFICATE
@@ -395,7 +408,14 @@ impl Internal {
 	/// the counters are the same everywhere, but what is hidden and whether a
 	/// certificate bypass is running are answers only this origin can give.
 	fn status(&self, host: &str) -> ProxyResponse {
+		let decryption = match self.learned.as_ref() {
+			Some(learned) if learned.holds(host) => Decryption::LearnedOff,
+			_ if self.passthrough.covers(host) => Decryption::ConfiguredOff,
+			_ => Decryption::On,
+		};
+
 		let page = status_page(Page {
+			decryption,
 			host,
 			counted: &self.metrics.snapshot(),
 			selectors: &self.store.selectors(host),
@@ -535,6 +555,40 @@ impl Internal {
 	/// duplicate, because they are the half of the file a person on this machine
 	/// actually chose; each half is sorted already, so the whole thing is stable
 	/// enough to diff between two fetches.
+	/// Stop decrypting this host, from this host's own page.
+	///
+	/// Host-scoped for the same reason the hidden-element store is: `/.mach5/`
+	/// is same-origin on every site mach5 handles, so a page could otherwise
+	/// reach in and change the answer for somebody else's. Scoped, the worst a
+	/// page achieves is exempting itself — and the configured `[passthrough]
+	/// hosts` list is not reachable from here at all, so nothing a page does can
+	/// make mach5 start decrypting a host its operator wrote down.
+	///
+	/// Takes effect on the next connection: whether to decrypt is decided from
+	/// the ClientHello, so the one in progress is already past it.
+	fn stop_decrypting(&self, host: &str) -> ProxyResponse {
+		let Some(learned) = self.learned.as_ref() else {
+			return empty(404);
+		};
+
+		if learned.add(host) {
+			log::info!("{host} will not be decrypted from the next connection on");
+		}
+
+		empty(204)
+	}
+
+	fn resume_decrypting(&self, host: &str) -> ProxyResponse {
+		let Some(learned) = self.learned.as_ref() else {
+			return empty(404);
+		};
+
+		learned.remove(host);
+		log::info!("{host} will be decrypted again from the next connection on");
+
+		empty(204)
+	}
+
 	fn stylesheet(&self, host: &str) -> ProxyResponse {
 		let mut selectors: Vec<String> = self
 			.store
@@ -776,6 +830,22 @@ struct Page<'a> {
 	rules: Option<crate::cosmetic::Status>,
 	ephemeral: bool,
 	live: crate::settings::Settings,
+	/// Whether this host is decrypted, and if not, whether that is something
+	/// this page is allowed to undo.
+	decryption: Decryption,
+}
+
+/// What the status page can say, and offer, about interception for one host.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Decryption {
+	/// Normal: mach5 reads this host's traffic.
+	On,
+	/// Learned from a bot challenge, or asked for here. Reversible from here.
+	LearnedOff,
+	/// From `[passthrough] hosts`. Deliberately not reversible from a web page:
+	/// somebody wrote that host down, and no page should be able to make mach5
+	/// start reading it.
+	ConfiguredOff,
 }
 
 fn status_page(page: Page) -> String {
@@ -788,6 +858,7 @@ fn status_page(page: Page) -> String {
 		rules,
 		ephemeral,
 		live,
+		decryption,
 	} = page;
 
 	let host = escape(host);
@@ -861,6 +932,28 @@ fn status_page(page: Page) -> String {
 			parked = metrics::thousands(counted.streams_parked),
 		)
 	};
+	// Reachable when nothing else is. mach5 serves this page itself, so it loads
+	// even when the origin is refusing the browser outright — which is exactly
+	// the situation a bot challenge creates, and exactly when somebody needs to
+	// turn interception off for a host. The panel cannot help there: the page
+	// never loads, so the injected script never runs.
+	let decrypting = match decryption {
+		Decryption::LearnedOff => concat!(
+			r#"<td>not decrypted <span class="note">· learned, and expires on its own</span> "#,
+			r#"<button data-post="/.mach5/passthrough/remove">decrypt it again</button></td>"#
+		)
+		.to_string(),
+		Decryption::ConfiguredOff => concat!(
+			r#"<td>not decrypted <span class="note">· from [passthrough] hosts, so not "#,
+			r#"changeable from here</span></td>"#
+		)
+		.to_string(),
+		Decryption::On => format!(
+			r#"<td>decrypted <button data-post="/.mach5/passthrough">stop decrypting {}</button></td>"#,
+			escape(&host)
+		),
+	};
+
 	// The one control that has to live here rather than in the panel: turning
 	// injection off removes the panel, so the way back on cannot be inside it.
 	let injection = match live.inject {
@@ -925,6 +1018,7 @@ fn status_page(page: Page) -> String {
     <tr><th>Pages injected</th><td>{injected}</td></tr>
     <tr><th>Passed through undecrypted</th><td>{passed_through}</td></tr>
     <tr><th>Panel in pages</th>{injection}</tr>
+    <tr><th>This host</th>{decrypting}</tr>
     <tr><th>Origins reachable</th>{families}</tr>
     <tr><th>Cache</th>{caching}</tr>
     <tr><th>Fetched unvalidated</th><td>{bypasses}</td></tr>
@@ -1146,6 +1240,12 @@ mod tests {
 			ca: Arc::new(ca),
 			blocklist: None,
 			cosmetic: None,
+			// Given its own file per test, so nothing here writes to a real
+			// state directory or leaks between tests.
+			learned: Some(Arc::new(crate::passthrough::Learned::load(
+				dir.path().join("passthrough.json"),
+			))),
+			passthrough: Arc::new(crate::passthrough::Passthrough::new(&Config::default())),
 		}
 	}
 
@@ -1905,6 +2005,63 @@ mod tests {
 
 	/// A regression guard on somebody later serving a "convenient" bundle: the
 	/// public certificate is the only thing that may ever leave this endpoint.
+	/// The endpoint has to be host-scoped, because `/.mach5/` is same-origin on
+	/// every site mach5 handles. Unscoped, a page on one host could reach in and
+	/// change whether somebody else's host is decrypted.
+	#[test]
+	fn a_page_can_only_change_decryption_for_its_own_host() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+		let learned = internal.learned.clone().expect("a store");
+
+		let stop = call(&internal, "POST", "https://news.example/.mach5/passthrough", "");
+		assert_eq!(stop.status, 204);
+		assert!(learned.holds("news.example"));
+
+		// The endpoint takes no host: it is always the one in the URL. A page on
+		// news.example asking again cannot name anybody else.
+		call(&internal, "POST", "https://other.example/.mach5/passthrough", "");
+		assert!(learned.holds("other.example"));
+		assert!(
+			learned.holds("news.example"),
+			"and it did not disturb the first"
+		);
+
+		let resume = call(
+			&internal,
+			"POST",
+			"https://news.example/.mach5/passthrough/remove",
+			"",
+		);
+		assert_eq!(resume.status, 204);
+		assert!(!learned.holds("news.example"));
+		assert!(learned.holds("other.example"), "only its own host");
+	}
+
+	/// The page has to be usable when the site behind it is not — a bot
+	/// challenge is exactly when somebody needs to turn interception off, and
+	/// exactly when no page of that site will load. mach5 serves this itself.
+	#[test]
+	fn the_status_page_offers_to_stop_decrypting_this_host() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		let before = body_of(&call(&internal, "GET", "https://news.example/.mach5/", ""));
+		assert!(
+			before.contains(r#"data-post="/.mach5/passthrough""#),
+			"a decrypted host is offered the switch: {before}"
+		);
+
+		call(&internal, "POST", "https://news.example/.mach5/passthrough", "");
+
+		let after = body_of(&call(&internal, "GET", "https://news.example/.mach5/", ""));
+		assert!(after.contains("not decrypted"), "{after}");
+		assert!(
+			after.contains(r#"data-post="/.mach5/passthrough/remove""#),
+			"and offered the way back: {after}"
+		);
+	}
+
 	/// A phone decides what a download is from its filename, and browsers take
 	/// that from the URL as often as from `content-disposition`. Served at
 	/// `/.mach5/ca`, Android saved a file called `ca` and its certificate

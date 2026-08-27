@@ -163,6 +163,18 @@ impl Default for Images {
 #[serde(deny_unknown_fields, default)]
 pub struct Passthrough {
 	pub hosts: Vec<String>,
+	/// Stop decrypting a host after its origin answers with a bot challenge.
+	///
+	/// mach5 is what causes those: the origin sees its TLS handshake and
+	/// HTTP/1.1 rather than the browser's, so a managed challenge fires and then
+	/// loops, because whatever passed the check is not what retries it. Noticing
+	/// and stepping aside is the only honest answer — the alternative is
+	/// pretending to be a browser, which is an arms race.
+	///
+	/// Learned hosts are kept separately from `hosts`, expire after a week, and
+	/// can be added or removed from the `/.mach5/` page of the host in question.
+	/// Nothing reachable from a web page can touch `hosts` itself.
+	pub learn_from_challenges: bool,
 	/// The port a passed-through connection is carried to. 443 unless mach5 is
 	/// listening somewhere unusual — a transparent deployment cannot recover a
 	/// nonstandard port without `SO_ORIGINAL_DST`, so this is the one knob.
@@ -173,6 +185,7 @@ impl Default for Passthrough {
 	fn default() -> Self {
 		Self {
 			hosts: Vec::new(),
+			learn_from_challenges: true,
 			port: 443,
 		}
 	}

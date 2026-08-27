@@ -322,6 +322,23 @@ max_cacheable_mb = 8
 # Where a passed-through connection is carried to. 443 unless mach5 is
 # listening somewhere unusual; a transparent deployment cannot recover a
 # nonstandard port without SO_ORIGINAL_DST.
+# Stop decrypting a host after its origin answers with a bot challenge.
+#
+# mach5 is what causes those. The origin sees mach5's TLS handshake and
+# HTTP/1.1 rather than the browser's, while the headers still say Chrome — a
+# textbook automation signature — so a managed challenge fires, and then loops,
+# because whatever passed the check is not what retries it.
+#
+# Noticing and stepping aside is the only honest answer; the alternative is
+# pretending to be a browser, which is an arms race.
+#
+# Learned hosts are kept apart from `hosts` above: they expire after a week,
+# they are exact rather than covering subdomains, and they can be added or
+# removed from the /.mach5/ page OF THAT HOST — which is reachable even when
+# the site itself will not load, because mach5 serves it. Nothing a web page
+# can reach touches `hosts`.
+learn_from_challenges = true
+
 port = 443
 
 [log]

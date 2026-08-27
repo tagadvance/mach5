@@ -278,6 +278,22 @@ fn main() -> Result<(), Box<dyn Error>> {
 	// Taken here so that a machine with no usable random source refuses to
 	// start, rather than panicking in the event loop on the first Retry.
 	let _ = token_key();
+	// Said at startup because it is state that survives restarts and changes
+	// what the proxy does, and nothing else would ever mention it. Deliberately
+	// not on the status page: that page is served on every host, so listing
+	// every host mach5 has stepped aside from would hand any site a slice of
+	// browsing history.
+	{
+		let learned = passthrough::learned(&config).all();
+		if !learned.is_empty() {
+			log::info!(
+				"not decrypting {} host(s) learned from bot challenges: {}",
+				learned.len(),
+				learned.join(", ")
+			);
+		}
+	}
+
 	let listen = config.listen.0;
 
 	// A cache mach5 cannot write is survivable — it works, just slower.
@@ -852,6 +868,7 @@ fn build_quic_config(
 	// Dynamic per-SNI certificate: mint a leaf for the requested host and install
 	// it before the handshake picks a certificate.
 	let passthrough = passthrough::shared(config);
+	let learned_hosts = passthrough::learned(config);
 	builder.set_servername_callback(move |ssl, alert| {
 		if let Some(sni) = ssl.servername(boring::ssl::NameType::HOST_NAME) {
 			let sni = sni.to_string();
@@ -863,7 +880,7 @@ fn build_quic_config(
 			// about h3 for this host by us in the first place — we never see its
 			// responses — so this only catches a client that learned about h3
 			// somewhere else.
-			if passthrough.covers(&sni) {
+			if crate::passthrough::never_decrypt(&passthrough, &learned_hosts, &sni) {
 				log::info!("refusing h3 for {sni} so it can be passed through over tcp");
 				*alert = boring::ssl::SslAlert::HANDSHAKE_FAILURE;
 

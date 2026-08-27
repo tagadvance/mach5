@@ -103,6 +103,7 @@ struct HttpSettings {
 struct Shared {
 	config: Arc<Config>,
 	passthrough: Arc<crate::passthrough::Passthrough>,
+	learned: Arc<crate::passthrough::Learned>,
 	pool: ChainPool,
 	agents: upstream::Agents,
 }
@@ -114,6 +115,7 @@ pub fn spawn(config: Arc<Config>, ca: Arc<CertAuthority>) -> std::io::Result<()>
 
 	let shared = Arc::new(Shared {
 		passthrough: crate::passthrough::shared(&config),
+		learned: crate::passthrough::learned(&config),
 		pool: ChainPool::new(config.worker_threads(), &config, &ca),
 		agents: upstream::agents(&config),
 		config,
@@ -206,9 +208,12 @@ async fn serve(
 	// Before anything is answered: the name is in the ClientHello, and a listed
 	// host must not be answered at all. Skipped entirely when nothing is
 	// listed, so the common case does not pay for a peek it cannot use.
-	if !shared.passthrough.is_empty() {
+	// Also when nothing is configured but something has been learned: a host
+	// that answered with a bot challenge is exactly the case where the list was
+	// empty until a moment ago.
+	if !shared.passthrough.is_empty() || shared.learned.any() {
 		if let Some(host) = peek_server_name(&mut stream).await {
-			if shared.passthrough.covers(&host) {
+			if crate::passthrough::never_decrypt(&shared.passthrough, &shared.learned, &host) {
 				return splice(stream, &host, shared.passthrough.port()).await;
 			}
 		}

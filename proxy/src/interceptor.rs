@@ -154,6 +154,15 @@ impl Chain {
 			}
 		}
 
+		// Last, and it changes nothing about this response: it only notices that
+		// the origin refused mach5 and remembers the host, so the *next*
+		// connection is spliced instead of decrypted. Placed here so it sees
+		// what the client will actually get, after every other link has had its
+		// say.
+		if !config.passthrough.hosts.is_empty() || config.passthrough.learn_from_challenges {
+			links.push(Box::new(crate::passthrough::Watcher::new(config)));
+		}
+
 		if config.plugins.stamp_responses {
 			links.push(Box::new(Stamp));
 		}

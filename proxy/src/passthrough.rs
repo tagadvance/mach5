@@ -18,8 +18,10 @@
 //! it cannot parse is not passed through: unrecognised means intercepted, the
 //! same direction every other decision here fails in.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashSet};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::config::Config;
 
@@ -27,12 +29,254 @@ use crate::config::Config;
 /// this; anything larger is not one we need to read the start of.
 pub const PEEK_BYTES: usize = 4096;
 
+/// How long a host learned from a challenge stays passed through.
+///
+/// It has to expire, and this is the only way back: once a host is passed
+/// through mach5 never sees its responses again, so it can never notice that
+/// the challenge stopped. A week is long enough to be useful on a trip and
+/// short enough that a site which fixed itself comes back.
+const LEARNED_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 const HANDSHAKE: u8 = 0x16;
 /// Content type, legacy version, and the two-byte record length.
 const RECORD_HEADER: usize = 5;
 const CLIENT_HELLO: u8 = 0x01;
 const EXTENSION_SERVER_NAME: u16 = 0x0000;
 const NAME_TYPE_HOST: u8 = 0x00;
+
+/// Hosts mach5 decided not to decrypt, as opposed to hosts it was told not to.
+///
+/// Kept apart from the configured list on purpose, and the separation is the
+/// security boundary rather than tidiness:
+///
+/// - The **configured** list is what somebody wrote down — a bank, a health
+///   provider — and nothing reachable from a web page may touch it. Removing an
+///   entry from it would mean a page could make mach5 start decrypting a host
+///   its operator had exempted.
+/// - This list is **learned**, expires, and is only ever changed for the host
+///   doing the asking, exactly as the hidden-element store is. A page on
+///   `evil.example` can add or remove `evil.example` and nothing else, and the
+///   worst it achieves is being decrypted, which is the default anyway.
+pub struct Learned {
+	path: PathBuf,
+	hosts: Mutex<BTreeMap<String, Instant>>,
+}
+
+impl Learned {
+	pub fn load(path: PathBuf) -> Self {
+		// Only the names are persisted, not the deadlines: a restart resets the
+		// clock, which is the forgiving direction — a host stays exempt a while
+		// longer rather than being decrypted unexpectedly.
+		let hosts = std::fs::read(&path)
+			.ok()
+			.and_then(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).ok())
+			.unwrap_or_default()
+			.into_iter()
+			.filter_map(|host| normalize_host(&host).map(|h| (h, Instant::now())))
+			.collect();
+
+		Self {
+			path,
+			hosts: Mutex::new(hosts),
+		}
+	}
+
+	fn live(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Instant>> {
+		let mut hosts = self.hosts.lock().expect("learned passthrough lock");
+		let now = Instant::now();
+		hosts.retain(|_, at| now.duration_since(*at) < LEARNED_TTL);
+
+		hosts
+	}
+
+	/// Whether this exact host was learned. Deliberately not the parent-domain
+	/// walk `covers` does: a challenge on one host says nothing about its
+	/// siblings, and widening it automatically would stop decrypting far more
+	/// than was observed.
+	pub fn holds(&self, host: &str) -> bool {
+		let Some(host) = normalize_host(host) else {
+			return false;
+		};
+
+		self.live().contains_key(&host)
+	}
+
+	/// Returns true when this is new, so the caller can say so once rather than
+	/// on every request.
+	pub fn add(&self, host: &str) -> bool {
+		let Some(host) = normalize_host(host) else {
+			return false;
+		};
+
+		let mut hosts = self.live();
+		let fresh = !hosts.contains_key(&host);
+		hosts.insert(host, Instant::now());
+		let names: Vec<String> = hosts.keys().cloned().collect();
+		drop(hosts);
+		self.save(&names);
+
+		fresh
+	}
+
+	pub fn remove(&self, host: &str) -> bool {
+		let Some(host) = normalize_host(host) else {
+			return false;
+		};
+
+		let mut hosts = self.live();
+		let removed = hosts.remove(&host).is_some();
+		let names: Vec<String> = hosts.keys().cloned().collect();
+		drop(hosts);
+		if removed {
+			self.save(&names);
+		}
+
+		removed
+	}
+
+	/// Whether anything has been learned at all, so the front ends can skip the
+	/// ClientHello peek when there is nothing either list could match.
+	pub fn any(&self) -> bool {
+		!self.live().is_empty()
+	}
+
+	/// Every learned host, for the status page.
+	pub fn all(&self) -> Vec<String> {
+		self.live().keys().cloned().collect()
+	}
+
+	fn save(&self, names: &[String]) {
+		let Ok(json) = serde_json::to_vec(names) else {
+			return;
+		};
+
+		if let Err(e) = crate::disk::replace(&self.path, &json) {
+			log::warn!(
+				"cannot save learned passthrough hosts to {}: {e}",
+				self.path.display()
+			);
+		}
+	}
+}
+
+/// Notices an origin refusing mach5, and remembers the host so the next
+/// connection is spliced rather than decrypted.
+///
+/// It changes nothing about the response it sees — the client still gets the
+/// challenge this time. There is no way to fix the current request: the
+/// decision not to decrypt is made from the ClientHello, long before any of
+/// this is known.
+pub struct Watcher {
+	learned: Arc<Learned>,
+	enabled: bool,
+}
+
+impl Watcher {
+	pub fn new(config: &Config) -> Self {
+		Self {
+			learned: learned(config),
+			enabled: config.passthrough.learn_from_challenges,
+		}
+	}
+}
+
+impl crate::interceptor::Interceptor for Watcher {
+	fn on_response_head(
+		&self,
+		req: &crate::interceptor::ProxyRequest,
+		head: &mut crate::interceptor::ResponseHead,
+	) {
+		if !self.enabled || !is_a_challenge(head.status, &head.headers) {
+			return;
+		}
+
+		let host = crate::host_of(&req.url);
+		if self.learned.add(host) {
+			log::warn!(
+				"{host} answered with a bot challenge, which mach5 is the cause of — \
+				 it will not be decrypted from the next connection on. Undo that at \
+				 https://{host}/.mach5/ if it is wrong."
+			);
+		}
+	}
+
+	/// Reads the head and nothing else, so it must never be the reason a body
+	/// is held in memory.
+	fn wants_body(
+		&self,
+		_req: &crate::interceptor::ProxyRequest,
+		_head: &crate::interceptor::ResponseHead,
+	) -> bool {
+		false
+	}
+}
+
+/// Whether a response is a bot-check standing between the client and the site.
+///
+/// The point of noticing is that mach5 *causes* these. The origin sees mach5's
+/// TLS handshake and HTTP/1.1 rather than the browser's, while the headers say
+/// Chrome — a textbook automation signature — so a managed challenge fires and
+/// then loops, because whatever passes the check is not what retries it.
+///
+/// `cf-mitigated` is Cloudflare saying so in as many words and is the signal
+/// worth trusting. The rest is a deliberately narrow fallback: a challenge
+/// status, from a server that says it is Cloudflare, with a challenge-platform
+/// path in the body. Narrow because a false positive means quietly not
+/// decrypting a site — which is safe, but also means no blocking on it, and
+/// that should not happen by accident.
+pub fn is_a_challenge(status: u16, headers: &[(String, String)]) -> bool {
+	let header = |name: &str| {
+		headers
+			.iter()
+			.find(|(h, _)| h.eq_ignore_ascii_case(name))
+			.map(|(_, v)| v.trim().to_ascii_lowercase())
+	};
+
+	if header("cf-mitigated").as_deref() == Some("challenge") {
+		return true;
+	}
+
+	if !matches!(status, 403 | 503) {
+		return false;
+	}
+
+	header("server").is_some_and(|s| s.contains("cloudflare"))
+		&& headers.iter().any(|(name, value)| {
+			name.eq_ignore_ascii_case("set-cookie") && value.to_ascii_lowercase().contains("cf_chl")
+		})
+}
+
+/// Whether this name must not be decrypted, for either reason.
+///
+/// The two lists are checked separately and differently on purpose. A
+/// configured entry covers its subdomains, because that is what somebody
+/// writing down a bank means. A learned one is exact: a challenge on one host
+/// says nothing about its siblings, and widening it automatically would stop
+/// decrypting far more than was ever observed.
+pub fn never_decrypt(configured: &Passthrough, learned: &Learned, host: &str) -> bool {
+	configured.covers(host) || learned.holds(host)
+}
+
+/// One per process, beside the configured list.
+pub fn learned(config: &Config) -> Arc<Learned> {
+	static SHARED: std::sync::OnceLock<Arc<Learned>> = std::sync::OnceLock::new();
+
+	SHARED
+		.get_or_init(|| {
+			Arc::new(Learned::load(
+				config.paths.state_dir.join("passthrough.json"),
+			))
+		})
+		.clone()
+}
+
+fn normalize_host(host: &str) -> Option<String> {
+	let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+
+	// The same rule the configured list follows: a name reaches the wire as
+	// ASCII, so anything else can never match what arrives.
+	(!host.is_empty() && host.contains('.') && host.is_ascii()).then_some(host)
+}
 
 /// The hosts never to decrypt.
 pub struct Passthrough {
@@ -282,6 +526,99 @@ mod tests {
 			"the punycode entry is the one that works"
 		);
 		assert_eq!(passthrough.hosts.len(), 1);
+	}
+
+	/// The signal has to be narrow. A false positive means quietly not
+	/// decrypting a site — safe, but it also means no blocking on it, and that
+	/// should never happen by accident.
+	#[test]
+	fn only_an_actual_challenge_counts_as_one() {
+		let h = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+			pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+		};
+
+		// Cloudflare saying so in as many words.
+		assert!(is_a_challenge(403, &h(&[("cf-mitigated", "challenge")])));
+		assert!(is_a_challenge(200, &h(&[("CF-Mitigated", "Challenge")])));
+
+		// The narrow fallback: challenge status, cloudflare, challenge cookie.
+		assert!(is_a_challenge(
+			403,
+			&h(&[("server", "cloudflare"), ("set-cookie", "cf_chl_2=abc; Path=/")])
+		));
+
+		// And everything that must not count.
+		assert!(!is_a_challenge(403, &h(&[("server", "cloudflare")])), "a plain 403 is just a 403");
+		assert!(
+			!is_a_challenge(403, &h(&[("set-cookie", "cf_chl_2=abc")])),
+			"a challenge cookie from something that is not cloudflare"
+		);
+		assert!(
+			!is_a_challenge(200, &h(&[("server", "cloudflare"), ("set-cookie", "cf_chl_2=abc")])),
+			"a 200 is a page, whatever cookies came with it"
+		);
+		assert!(!is_a_challenge(404, &h(&[])), "an ordinary error");
+		assert!(!is_a_challenge(200, &h(&[])));
+	}
+
+	/// The learned list is exact where the configured one covers subdomains. A
+	/// challenge on one host says nothing about its siblings, and widening it
+	/// automatically would stop decrypting far more than was ever observed.
+	#[test]
+	fn a_learned_host_does_not_drag_its_subdomains_with_it() {
+		let dir = tempfile::TempDir::new().unwrap();
+		let learned = Learned::load(dir.path().join("p.json"));
+
+		assert!(learned.add("www.merriam-webster.com"));
+		assert!(!learned.add("www.merriam-webster.com"), "already there, so not new");
+
+		assert!(learned.holds("www.merriam-webster.com"));
+		assert!(learned.holds("WWW.Merriam-Webster.COM."), "however it is spelled");
+		assert!(!learned.holds("merriam-webster.com"), "the parent is a different host");
+		assert!(!learned.holds("other.merriam-webster.com"));
+
+		// Whereas the configured list deliberately does cover them.
+		let configured = listing(&["example-bank.com"]);
+		assert!(configured.covers("secure.example-bank.com"));
+	}
+
+	/// The security boundary. `/.mach5/` is same-origin on every site, so if a
+	/// page could reach the *configured* list it could make mach5 start
+	/// decrypting a host somebody had written down. Only the learned list is
+	/// reachable, and `never_decrypt` still honours both.
+	#[test]
+	fn removing_a_learned_host_cannot_reach_the_configured_one() {
+		let dir = tempfile::TempDir::new().unwrap();
+		let learned = Learned::load(dir.path().join("p.json"));
+		let configured = listing(&["example-bank.com"]);
+
+		assert!(never_decrypt(&configured, &learned, "secure.example-bank.com"));
+
+		// Whatever a page does to the learned list, the configured entry stands.
+		learned.add("secure.example-bank.com");
+		learned.remove("secure.example-bank.com");
+		assert!(
+			never_decrypt(&configured, &learned, "secure.example-bank.com"),
+			"the configured list is not reachable from anything a page can call"
+		);
+	}
+
+	/// It has to survive a restart, or every trip re-learns the same hosts.
+	#[test]
+	fn learned_hosts_come_back_after_a_restart() {
+		let dir = tempfile::TempDir::new().unwrap();
+		let path = dir.path().join("p.json");
+
+		let first = Learned::load(path.clone());
+		first.add("news.example");
+		first.add("shop.example");
+		first.remove("shop.example");
+		drop(first);
+
+		let second = Learned::load(path);
+		assert!(second.holds("news.example"));
+		assert!(!second.holds("shop.example"), "a removal has to persist too");
+		assert_eq!(second.all(), vec!["news.example".to_string()]);
 	}
 
 	/// Whether the whole record has arrived is the question the caller has to

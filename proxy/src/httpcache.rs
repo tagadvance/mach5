@@ -84,6 +84,14 @@ pub fn eligible(req: &ProxyRequest, status: u16, headers: &[(String, String)]) -
 		return false;
 	}
 
+	// RFC 9111 §5.2.1.5: `no-store` on the *request* means store no part of
+	// this exchange. It was consulted when reading the cache and not when
+	// writing it, so a client that asked not to be cached was cached anyway —
+	// it simply did not get to read what it had left behind.
+	if client_wants(req) == ClientWants::Nothing {
+		return false;
+	}
+
 	// Whose request this was, rather than what came back.
 	if carries_credentials(req) {
 		return false;
@@ -1083,6 +1091,25 @@ mod tests {
 
 	/// A hard refresh is the escape hatch everybody already knows, and it is a
 	/// request header rather than anything to do with how fresh the entry is.
+	/// RFC 9111 §5.2.1.5. `no-store` was honoured when reading the cache and
+	/// not when writing it, so a client asking not to be cached was cached
+	/// anyway and only denied the reading of it.
+	#[test]
+	fn a_client_that_asked_not_to_be_stored_is_not_stored() {
+		let asked = request(&[("cache-control", "no-store")]);
+
+		assert_eq!(client_wants(&asked), ClientWants::Nothing);
+		assert!(
+			!eligible(&asked, 200, &public_image()),
+			"nothing about this exchange may be written down"
+		);
+
+		// The control: the same response for a client that said nothing is
+		// stored, so the assertion above is about the request and not about
+		// some other reason this response was refused.
+		assert!(eligible(&request(&[]), 200, &public_image()));
+	}
+
 	#[test]
 	fn a_hard_refresh_is_honoured() {
 		assert_eq!(client_wants(&request(&[])), ClientWants::Anything);

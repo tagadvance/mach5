@@ -25,9 +25,25 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 
-/// A ClientHello is the first thing a client sends and is comfortably inside
-/// this; anything larger is not one we need to read the start of.
-pub const PEEK_BYTES: usize = 4096;
+/// A TLS record carries at most 2^14 bytes plus its five-byte header, so this
+/// holds any single one of them whole.
+///
+/// It was 4096, which a real ClientHello can exceed — a browser offering a
+/// post-quantum key share sends around two kilobytes, and one with a long
+/// cipher list and many extensions goes further. Exceeding it meant the name
+/// could not be read, and a name that cannot be read means the connection is
+/// terminated rather than passed through. Sized to a maximal record, that
+/// failure is gone rather than made less likely.
+pub const PEEK_BYTES: usize = MAX_RECORD + RECORD_HEADER;
+
+/// The most a single TLS record may carry, from RFC 8446 §5.1.
+const MAX_RECORD: usize = 16384;
+
+/// A legal record must never be larger than what is read, or the name in it
+/// cannot be found and a listed host is decrypted. Checked at compile time
+/// rather than in a test, so replacing `PEEK_BYTES` with a smaller literal
+/// stops the build instead of quietly narrowing the promise.
+const _: () = assert!(PEEK_BYTES >= MAX_RECORD + RECORD_HEADER);
 
 /// How long a host learned from a challenge stays passed through.
 ///
@@ -63,6 +79,8 @@ const HANDSHAKE: u8 = 0x16;
 /// Content type, legacy version, and the two-byte record length.
 const RECORD_HEADER: usize = 5;
 const CLIENT_HELLO: u8 = 0x01;
+/// A handshake message header: one type byte and a 24-bit length.
+const HANDSHAKE_HEADER: usize = 4;
 const EXTENSION_SERVER_NAME: u16 = 0x0000;
 const NAME_TYPE_HOST: u8 = 0x00;
 
@@ -678,18 +696,104 @@ pub fn have_hello(bytes: &[u8]) -> Hello {
 		Some(_) => return Hello::NotTls,
 	}
 
-	if bytes.len() < RECORD_HEADER {
-		return Hello::Want(RECORD_HEADER);
+	let Some(assembled) = assemble(bytes) else {
+		return Hello::NotTls;
+	};
+
+	// The handshake header is four bytes: a type and a 24-bit length. Until
+	// they have all arrived there is nothing to size the wait against, so ask
+	// for whatever would finish the record now arriving — or, if none has
+	// started, for a header to read.
+	if assembled.payload.len() < HANDSHAKE_HEADER {
+		return Hello::Want(
+			assembled
+				.pending
+				.unwrap_or(assembled.consumed + RECORD_HEADER),
+		);
 	}
 
-	let length = u16::from_be_bytes([bytes[3], bytes[4]]) as usize;
-	let whole = RECORD_HEADER + length;
+	let declared = u32::from_be_bytes([
+		0,
+		assembled.payload[1],
+		assembled.payload[2],
+		assembled.payload[3],
+	]) as usize;
+	let needed = HANDSHAKE_HEADER + declared;
 
-	if bytes.len() >= whole {
-		Hello::Complete
-	} else {
-		Hello::Want(whole)
+	if assembled.payload.len() >= needed {
+		return Hello::Complete;
 	}
+
+	// A lower bound on what the socket must hold. Under-estimating only costs
+	// another turn of the caller's loop; over-estimating makes it give up on a
+	// hello that was still arriving, which for a listed host is the expensive
+	// direction — so this stays a bound and never a guess.
+	let missing = needed - assembled.payload.len();
+
+	Hello::Want(match assembled.pending {
+		// A record is already on its way and may carry all that is missing.
+		Some(pending) => pending.max(assembled.consumed + missing),
+		// Nothing started, so at least one more header on top of the bytes.
+		None => assembled.consumed + RECORD_HEADER + missing,
+	})
+}
+
+/// The handshake bytes carried by consecutive handshake records, joined.
+///
+/// A handshake message may be split across several TLS records — legal, and
+/// what defeated reading only the first one. Whether a listed host was
+/// decrypted then came down to how the client chose to frame its hello.
+struct Assembled {
+	payload: Vec<u8>,
+	/// How much of `bytes` the complete records accounted for, so a caller can
+	/// say what more it needs without recounting.
+	consumed: usize,
+	/// When a further record has begun arriving and its header can be read,
+	/// how many bytes from the start of `bytes` would complete it.
+	pending: Option<usize>,
+}
+
+fn assemble(bytes: &[u8]) -> Option<Assembled> {
+	let mut payload = Vec::new();
+	let mut consumed = 0;
+	let mut pending = None;
+
+	while bytes.len() - consumed >= RECORD_HEADER {
+		let header = &bytes[consumed..consumed + RECORD_HEADER];
+		if header[0] != HANDSHAKE {
+			// Something that is not more handshake. Whatever has been gathered
+			// is all the handshake there is going to be.
+			break;
+		}
+
+		let length = u16::from_be_bytes([header[3], header[4]]) as usize;
+		if length > MAX_RECORD {
+			// Longer than a record may be, so this is not a stream we have
+			// understood, and guessing at a name from it is the one thing this
+			// module must never do.
+			return None;
+		}
+
+		let end = consumed + RECORD_HEADER + length;
+		if end > bytes.len() {
+			// The record is still arriving. Stop here rather than reading a
+			// partial one, and leave `consumed` on the last whole record — but
+			// remember exactly what would finish this one, because that is a
+			// better answer than a guess.
+			pending = Some(end);
+
+			break;
+		}
+
+		payload.extend_from_slice(&bytes[consumed + RECORD_HEADER..end]);
+		consumed = end;
+	}
+
+	Some(Assembled {
+		payload,
+		consumed,
+		pending,
+	})
 }
 
 /// The server name from a TLS ClientHello, if this is one and it carries a
@@ -701,15 +805,11 @@ pub fn have_hello(bytes: &[u8]) -> Hello {
 /// strength of a name we invented. `None` means "carry on and terminate it",
 /// which is the safe direction to be wrong in.
 pub fn server_name(bytes: &[u8]) -> Option<String> {
-	let mut record = Reader::new(bytes);
-
-	if record.u8()? != HANDSHAKE {
-		return None;
-	}
-	// Legacy record version, then the record length.
-	record.skip(2)?;
-	let record_length = record.u16()? as usize;
-	let mut handshake = Reader::new(record.take(record_length)?);
+	// Joined across records first. A hello framed as several records is legal,
+	// and parsing only the first one read a truncated message, refused it, and
+	// so terminated a connection somebody had exempted.
+	let joined = assemble(bytes)?;
+	let mut handshake = Reader::new(&joined.payload);
 
 	if handshake.u8()? != CLIENT_HELLO {
 		return None;
@@ -929,6 +1029,85 @@ mod tests {
 	/// Whether the whole record has arrived is the question the caller has to
 	/// answer before parsing, because refusing a truncated one means "decrypt
 	/// it" — and a hello that spans two segments is now the ordinary case.
+	/// Re-frame a hello as several TLS records, which is legal and which
+	/// browsers do not do — but "the client happened not to" is not a security
+	/// argument, and reading only the first record meant a listed host was
+	/// decrypted whenever one did.
+	fn split_across_records(hello: &[u8], at: usize) -> Vec<u8> {
+		let body = &hello[RECORD_HEADER..];
+		let (first, second) = body.split_at(at);
+
+		let mut out = Vec::new();
+		for part in [first, second] {
+			out.extend_from_slice(&[HANDSHAKE, 0x03, 0x01]);
+			out.extend_from_slice(&(part.len() as u16).to_be_bytes());
+			out.extend_from_slice(part);
+		}
+
+		out
+	}
+
+	#[test]
+	fn a_hello_framed_as_several_records_still_gives_up_its_name() {
+		let hello = client_hello(b"bank.example");
+		let body = hello.len() - RECORD_HEADER;
+
+		// Every split point, including ones that cut the handshake header, the
+		// length, and the name itself in half.
+		for at in 1..body {
+			let split = split_across_records(&hello, at);
+
+			assert_eq!(
+				have_hello(&split),
+				Hello::Complete,
+				"split at {at} was not recognised as whole"
+			);
+			assert_eq!(
+				server_name(&split).as_deref(),
+				Some("bank.example"),
+				"split at {at} lost the name, so a listed host would be decrypted"
+			);
+		}
+	}
+
+	#[test]
+	fn a_second_record_still_arriving_is_waited_for() {
+		let hello = client_hello(b"bank.example");
+		let split = split_across_records(&hello, 20);
+
+		// Everything but the last byte of the second record.
+		let short = &split[..split.len() - 1];
+
+		match have_hello(short) {
+			Hello::Want(wanted) => assert!(
+				wanted <= split.len(),
+				"asking for {wanted} of a {} byte hello would make the caller \
+				 give up on one that was still arriving",
+				split.len()
+			),
+			other => panic!("a partial second record must be waited for, not {other:?}"),
+		}
+
+		assert_eq!(
+			server_name(short),
+			None,
+			"and it must not be parsed while incomplete"
+		);
+	}
+
+	#[test]
+	fn a_record_longer_than_a_record_may_be_is_refused() {
+		// 2^14 is the ceiling in RFC 8446 section 5.1. Anything claiming more
+		// is a stream we have not understood, and inventing a name from one is
+		// the single thing this module must never do.
+		let mut absurd = vec![HANDSHAKE, 0x03, 0x01];
+		absurd.extend_from_slice(&((MAX_RECORD + 1) as u16).to_be_bytes());
+		absurd.extend(std::iter::repeat_n(0u8, 64));
+
+		assert_eq!(have_hello(&absurd), Hello::NotTls);
+		assert_eq!(server_name(&absurd), None);
+	}
+
 	#[test]
 	fn a_truncated_hello_asks_for_the_rest_of_itself() {
 		let hello = client_hello(b"bank.example");

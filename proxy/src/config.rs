@@ -564,6 +564,13 @@ pub struct Limits {
 	/// the box has RAM to spare; `streams_parked` says whether it is ever
 	/// actually reached.
 	pub stream_buffer_mb: usize,
+	/// How long a client has to produce a ClientHello, and then to finish the
+	/// handshake, before it is dropped.
+	///
+	/// Worth raising on a link where clients dribble: reading the name is what
+	/// lets a `[passthrough]` host be spliced instead of refused, and running
+	/// out of patience is now the only way left for that read to fail.
+	pub hello_timeout_ms: u64,
 }
 
 impl Default for Limits {
@@ -576,6 +583,7 @@ impl Default for Limits {
 			read_timeout_seconds: 30,
 			plugin_timeout_seconds: 10,
 			stream_buffer_mb: 32,
+			hello_timeout_ms: 10_000,
 		}
 	}
 }

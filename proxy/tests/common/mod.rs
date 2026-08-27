@@ -66,7 +66,7 @@ pub fn run_until_exit(extra: &str) -> (std::process::ExitStatus, String) {
 
 	let status = Command::new(env!("CARGO_BIN_EXE_mach5-proxy"))
 		.env("MACH5_CONFIG", &config)
-		.env("RUST_LOG", "info")
+		.env("RUST_LOG", "debug")
 		.stdin(Stdio::null())
 		.stdout(Stdio::from(out))
 		.stderr(Stdio::from(err))
@@ -174,7 +174,7 @@ impl Proxy {
 
 		let child = Command::new(env!("CARGO_BIN_EXE_mach5-proxy"))
 			.env("MACH5_CONFIG", &config)
-			.env("RUST_LOG", "info")
+			.env("RUST_LOG", "debug")
 			.stdin(Stdio::null())
 			.stdout(Stdio::from(log))
 			.stderr(Stdio::from(stderr))

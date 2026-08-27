@@ -434,32 +434,45 @@ fn a_hello_split_across_segments_is_still_passed_through() {
 /// The backstop under the passthrough promise.
 ///
 /// `peek_server_name` reads the ClientHello by hand before anything is
-/// answered, and it is best-effort in three ways that all fail the same silent
-/// direction: it gives up after a timeout, it reads at most `PEEK_BYTES`, and
-/// it parses only the first TLS record. Each returns `None`, and `None` means
-/// "carry on and terminate it" — which for a host somebody deliberately
+/// answered, and when it works the connection is spliced. Its remaining way to
+/// fail is running out of patience — a client that dribbles its hello, which
+/// on bad mobile data is not hypothetical. It then returns `None`, and `None`
+/// means "carry on and terminate it", which for a host somebody deliberately
 /// exempted means decrypting their bank while nothing looks wrong, because the
 /// client trusts mach5's root.
 ///
-/// This drives the second of those: a hello too large for the peek to read.
+/// Half a hello and then silence is exactly that case.
 #[test]
-fn a_listed_host_the_peek_could_not_read_is_refused_not_decrypted() {
+fn a_listed_host_the_peek_gave_up_on_is_refused_not_decrypted() {
 	use std::io::{Read, Write};
 	use std::net::TcpStream;
 
-	let hello = common::padded_client_hello(b"localhost", 5000);
-	assert!(
-		hello.len() > 4096,
-		"the point is that it is larger than the peek will ever read"
+	let hello = common::padded_client_hello(b"localhost", 1800);
+
+	let proxy = Proxy::start_with(
+		BLOCKLIST,
+		// `hello_timeout_ms` first: the harness has already opened `[limits]`,
+		// so this lands in it rather than starting a duplicate section.
+		"hello_timeout_ms = 200\n[passthrough]\nhosts = [\"localhost\"]\nport = 1",
 	);
 
-	let proxy = Proxy::start_with(BLOCKLIST, "[passthrough]\nhosts = [\"localhost\"]\nport = 1");
-
 	let mut client = TcpStream::connect(("127.0.0.1", proxy.tcp_port())).expect("reach mach5");
-	client.write_all(&hello).expect("send a hello");
+	// Enough for the record header, so mach5 knows how much more is coming,
+	// and then a pause longer than its patience. The peek gives up and the
+	// connection carries on to the acceptor, which is the failure this is
+	// about — the rest then arrives, so BoringSSL reads the name our own peek
+	// never got to. A hello that never finishes proves nothing: nobody could
+	// read it, so there would be nothing to refuse.
+	client.write_all(&hello[..40]).expect("the start of a hello");
+	client.flush().unwrap();
+	std::thread::sleep(std::time::Duration::from_millis(1000));
+	client.write_all(&hello[40..]).expect("the rest, too late");
 	client.flush().unwrap();
 
 	let mut back = [0u8; 16];
+	client
+		.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+		.ok();
 	let read = client.read(&mut back).unwrap_or(0);
 	assert!(
 		read == 0 || back[0] != 0x16,
@@ -468,8 +481,7 @@ fn a_listed_host_the_peek_could_not_read_is_refused_not_decrypted() {
 	);
 
 	// On the wire a refusal mach5 chose and one BoringSSL reached by itself are
-	// the same fatal alert, so the log is what separates them — and what proves
-	// this test is not passing because the synthetic hello is malformed.
+	// the same fatal alert, so the log is what separates them.
 	assert!(
 		proxy.logged("refusing localhost", std::time::Duration::from_secs(5)),
 		"no refusal was logged, so whatever happened was not the passthrough \
@@ -482,26 +494,68 @@ fn a_listed_host_the_peek_could_not_read_is_refused_not_decrypted() {
 /// is *not* listed. Without this, that test would pass just as well if mach5
 /// refused every connection it could not peek at.
 #[test]
-fn an_unlisted_host_the_peek_could_not_read_is_not_refused() {
+fn an_unlisted_host_the_peek_gave_up_on_is_not_refused() {
 	use std::io::Write;
 	use std::net::TcpStream;
 
-	let hello = common::padded_client_hello(b"elsewhere.example", 5000);
+	let hello = common::padded_client_hello(b"elsewhere.example", 1800);
 
-	let proxy = Proxy::start_with(BLOCKLIST, "[passthrough]\nhosts = [\"localhost\"]\nport = 1");
+	let proxy = Proxy::start_with(
+		BLOCKLIST,
+		// `hello_timeout_ms` first: the harness has already opened `[limits]`,
+		// so this lands in it rather than starting a duplicate section.
+		"hello_timeout_ms = 200\n[passthrough]\nhosts = [\"localhost\"]\nport = 1",
+	);
 
 	let mut client = TcpStream::connect(("127.0.0.1", proxy.tcp_port())).expect("reach mach5");
-	client.write_all(&hello).expect("send a hello");
+	client.write_all(&hello[..40]).expect("the start of a hello");
+	client.flush().unwrap();
+	std::thread::sleep(std::time::Duration::from_millis(1000));
+	client.write_all(&hello[40..]).expect("the rest, too late");
 	client.flush().unwrap();
 
 	// It may still fail the handshake for reasons of BoringSSL's own — this
 	// hello is synthetic. What must not happen is mach5 deciding not to serve
 	// it, which is a decision reserved for hosts somebody listed.
-	std::thread::sleep(std::time::Duration::from_millis(500));
+	std::thread::sleep(std::time::Duration::from_millis(1500));
 	assert!(
 		!proxy.log().contains("refusing elsewhere.example"),
 		"an unlisted host was refused, so the backstop is firing for \
 		 everything the peek cannot read:\n{}",
+		proxy.log()
+	);
+}
+
+/// A client that starts a ClientHello and stalls must not be waited on for
+/// ever.
+///
+/// `timeout_at` polls its inner future before it looks at the deadline, and
+/// `peek` is ready the moment anything at all is buffered — so one byte and
+/// then silence was peeked at every two milliseconds indefinitely. The deadline
+/// fired only on a socket with nothing in it, which is the case it was least
+/// needed for, and the comment above it claimed the opposite.
+#[test]
+fn a_client_that_stalls_mid_hello_is_given_up_on() {
+	use std::io::Write;
+	use std::net::TcpStream;
+
+	let hello = common::padded_client_hello(b"localhost", 1800);
+	let proxy = Proxy::start_with(
+		BLOCKLIST,
+		"hello_timeout_ms = 200\n[passthrough]\nhosts = [\"localhost\"]\nport = 1",
+	);
+
+	let mut client = TcpStream::connect(("127.0.0.1", proxy.tcp_port())).expect("reach mach5");
+	client.write_all(&hello[..40]).expect("the start of a hello");
+	client.flush().unwrap();
+
+	// Well past the patience, and nothing more is ever sent.
+	assert!(
+		proxy.logged(
+			"gave up reading a ClientHello",
+			std::time::Duration::from_secs(5)
+		),
+		"a stalled hello was waited on past its deadline:\n{}",
 		proxy.log()
 	);
 }

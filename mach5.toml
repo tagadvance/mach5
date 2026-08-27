@@ -554,6 +554,20 @@ plugin_timeout_seconds = 10
 # says how often it has actually been reached.
 stream_buffer_mb = 32
 
+# How long to wait for a ClientHello to finish arriving before giving up on
+# reading the name out of it.
+#
+# Only matters when [passthrough] is in use: the name is what lets a listed
+# host be spliced rather than terminated, and running out of patience is the
+# one way left for that read to fail. Giving up does not mean the host is
+# decrypted — the acceptor checks the list again once BoringSSL has parsed the
+# hello properly, and refuses — but it does mean a connection that would have
+# worked is refused instead. Raise it on a link where clients dribble.
+#
+# Separate from the TLS handshake timeout, which is about how long a connection
+# may hold a task and a descriptor and has no bearing on the name.
+hello_timeout_ms = 10000
+
 [quic]
 max_datagram_size = 1350
 max_idle_timeout_ms = 30000

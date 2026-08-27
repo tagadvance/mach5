@@ -257,9 +257,24 @@ fn build_acceptor(
 	Ok(builder.build())
 }
 
-/// How long a client has to produce a ClientHello, and then to finish the
-/// handshake, before it is dropped.
-const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long to wait for a ClientHello to finish arriving before giving up on
+/// reading the name out of it. `[limits] hello_timeout_ms`.
+///
+/// Separate from the handshake timeout below, which used to be the same value
+/// and is a different question. This one governs how patient mach5 is about
+/// *reading a name*: give up early and a `[passthrough]` host that was still
+/// dribbling its hello gets refused instead of spliced. The other governs how
+/// long a connection may hold a task and a descriptor while doing nothing,
+/// which is about resources and has no bearing on the name.
+fn hello_timeout(config: &Config) -> std::time::Duration {
+	std::time::Duration::from_millis(config.limits.hello_timeout_ms)
+}
+
+/// How long the TLS handshake itself may take. Bounded because until it
+/// finishes hyper's own `header_read_timeout` is not armed, so a client that
+/// opens a socket and says nothing would hold a task and a file descriptor for
+/// as long as it liked, and opening a few thousand costs it nothing.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 async fn serve(
 	acceptor: Arc<SslAcceptor>,
@@ -276,18 +291,14 @@ async fn serve(
 	// that answered with a bot challenge is exactly the case where the list was
 	// empty until a moment ago.
 	if !shared.passthrough.is_empty() || shared.learned.any() {
-		if let Some(host) = peek_server_name(&mut stream).await {
+		if let Some(host) = peek_server_name(&mut stream, hello_timeout(&shared.config)).await {
 			if crate::passthrough::never_decrypt(&shared.passthrough, &shared.learned, &host) {
 				return splice(stream, &host, shared.passthrough.port()).await;
 			}
 		}
 	}
 
-	// Bounded, because until the handshake finishes hyper's own
-	// `header_read_timeout` is not armed: a client that opens a socket and says
-	// nothing would otherwise hold a task and a file descriptor for as long as
-	// it liked, and opening a few thousand costs it nothing.
-	let tls = tokio::time::timeout(HELLO_TIMEOUT, tokio_boring::accept(&acceptor, stream))
+	let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_boring::accept(&acceptor, stream))
 		.await
 		.map_err(|_| "tls handshake timed out".to_string())?
 		.map_err(|e| format!("tls handshake failed: {e}"))?;
@@ -864,11 +875,14 @@ fn apply_alt_svc(config: &Config, headers: &mut Vec<(String, String)>) {
 /// this goes the ClientHello is still there to be handled — by the TLS
 /// acceptor, or by the origin at the far end of a splice. Nothing has to be
 /// stitched back on.
-async fn peek_server_name(stream: &mut tokio::net::TcpStream) -> Option<String> {
+async fn peek_server_name(
+	stream: &mut tokio::net::TcpStream,
+	patience: std::time::Duration,
+) -> Option<String> {
 	use crate::passthrough::Hello;
 
 	let mut buf = [0u8; crate::passthrough::PEEK_BYTES];
-	let deadline = tokio::time::Instant::now() + HELLO_TIMEOUT;
+	let deadline = tokio::time::Instant::now() + patience;
 
 	// Not one peek. A ClientHello no longer fits in one segment — a browser
 	// offering a post-quantum key share sends about two kilobytes — so taking
@@ -877,6 +891,22 @@ async fn peek_server_name(stream: &mut tokio::net::TcpStream) -> Option<String> 
 	// means "terminate it": whether a listed bank was decrypted came down to
 	// TCP segmentation.
 	loop {
+		// Checked here rather than left to `timeout_at` alone, which is not
+		// enough on its own: it polls the inner future first and returns its
+		// value if it is ready, deadline or no deadline. `peek` is ready the
+		// moment *anything* is buffered, so a client that sent one byte and
+		// stalled was peeked at every two milliseconds for ever — the deadline
+		// only ever fired on a socket with nothing in it at all, which is the
+		// one case it was not needed for.
+		if tokio::time::Instant::now() >= deadline {
+			log::debug!(
+				"gave up reading a ClientHello after {patience:?}; the connection will be \
+				 terminated rather than passed through"
+			);
+
+			return None;
+		}
+
 		let read = tokio::time::timeout_at(deadline, stream.peek(&mut buf))
 			.await
 			.ok()?

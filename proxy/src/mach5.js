@@ -43,7 +43,12 @@
 	 * the stylesheet anyway — so a strange id is treated as no id at all. */
 	const PLAIN_ID = /^[A-Za-z_-][\w-]*$/;
 
-	const HELP = 'mach5: click an element to hide it · u unhides all · Esc to stop';
+	const HELP = 'mach5: tap an element to choose it · u unhides all · Esc to stop';
+
+	/* How long after a tap a click is still that tap's ghost. Preventing
+	 * touchend stops the compatibility click in every browser that follows the
+	 * spec, and this covers the ones that send it anyway. */
+	const GHOST = 500;
 
 	/* Bottom right rather than top: on a phone that is where a thumb already
 	 * is. Sites put their own chat widgets here too, which is why this sits
@@ -52,19 +57,29 @@
 		:host { all: initial }
 		#dot {
 			position: fixed; right: 16px; bottom: 16px; z-index: 2147483645;
-			width: 34px; height: 34px; border-radius: 50%; border: 0;
+			width: 40px; height: 40px; border-radius: 50%; border: 0;
 			background: #202124; color: #fff; opacity: .45; cursor: pointer;
-			font: 600 12px/34px system-ui, sans-serif; text-align: center;
+			font: 600 12px/40px system-ui, sans-serif; text-align: center;
 			padding: 0; transition: opacity .15s;
 		}
 		#dot:hover, #dot:focus { opacity: 1 }
 		#panel {
-			position: fixed; right: 16px; bottom: 60px; z-index: 2147483646;
+			position: fixed; right: 16px; bottom: 64px; z-index: 2147483646;
 			width: 230px; padding: 14px; border-radius: 10px; display: none;
 			background: #202124; color: #e8eaed; box-shadow: 0 6px 24px rgba(0,0,0,.4);
 			font: 13px/1.5 system-ui, -apple-system, sans-serif;
 		}
 		#panel.open { display: block }
+		/* The panel is parked over the bottom right corner, which on a phone is
+		 * exactly where sticky footers and ad slots live — so the thing being
+		 * confirmed is often underneath it. The away class sends it to the top
+		 * for as long as that is true; see place(). */
+		#panel.away { top: 16px; bottom: auto }
+		/* On a narrow screen 230px plus margins is most of the width anyway, so
+		 * stop pretending and use it: bigger buttons, less wrapped selector. */
+		@media (max-width: 420px) {
+			#panel { left: 16px; right: 16px; width: auto }
+		}
 		h2 { font: 600 12px/1 system-ui, sans-serif; margin: 0 0 10px; opacity: .6;
 			letter-spacing: .06em; text-transform: uppercase }
 		fieldset { border: 0; margin: 0 0 12px; padding: 0 }
@@ -74,11 +89,30 @@
 			border-radius: 5px; padding: 5px 0; font: inherit; cursor: pointer;
 		}
 		.tiers button[aria-pressed="true"] { background: #8ab4f8; color: #202124; border-color: #8ab4f8 }
-		.act { display: block; width: 100%; margin-top: 6px; border: 0; border-radius: 5px;
-			padding: 7px; font: inherit; cursor: pointer; background: #3c4043; color: inherit }
+		/* 40px because this is aimed at with a thumb now, not a mouse. */
+		.act { display: block; width: 100%; min-height: 40px; margin-top: 6px; border: 0;
+			border-radius: 5px; padding: 9px; font: inherit; cursor: pointer;
+			background: #3c4043; color: inherit }
 		.act:hover { background: #4a4e51 }
+		.act[disabled] { opacity: .4; cursor: default }
+		.act[disabled]:hover { background: #3c4043 }
+		#hide { background: #e11d48; color: #fff }
+		#hide:hover { background: #f43f5e }
+		#hide[disabled]:hover { background: #e11d48 }
 		a { color: #8ab4f8; display: inline-block; margin-top: 10px; font-size: 12px }
 		p { margin: 0 0 8px; opacity: .7; font-size: 12px }
+		/* Only one of these three is on screen at a time: the ordinary controls,
+		 * the confirmation for what was just tapped, or neither. The undo line
+		 * sits above the ordinary controls once there is something to undo. */
+		#confirm, #undo { display: none }
+		#panel.confirming #main { display: none }
+		#panel.confirming #confirm { display: block }
+		#panel.undoable #undo { display: block }
+		#what { opacity: .9; font-size: 13px; margin: 0 0 6px }
+		#sel, #hidden { display: block; margin: 0 0 10px; padding: 6px; border-radius: 4px;
+			background: #17181a; word-break: break-all; opacity: .85;
+			font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace }
+		#undo { margin: 0 0 14px }
 	`;
 
 	const TIERS = [
@@ -90,6 +124,16 @@
 
 	let picking = false;
 	let hovered = null;
+	/* What a tap chose and is waiting on Hide, Wider or Cancel. Aiming and
+	 * hiding used to be the same gesture, which is fine with a mouse — you can
+	 * see the outline before you commit — and unusable with a finger, where the
+	 * first feedback of any kind arrived after the element was already gone. */
+	let candidate = null;
+	let chosen = null;
+	/* The last thing hidden, kept so it can be taken back. This is what `u` used
+	 * to be for people with a keyboard. */
+	let undone = null;
+	let tapped = 0;
 	let outline = null;
 	let badge = null;
 	let shadow = null;
@@ -133,6 +177,18 @@
 		!element.hasAttribute(OURS) &&
 		element !== document.body &&
 		element !== document.documentElement;
+
+	/* Our own furniture, including everything inside the panel. A click there is
+	 * the user working the controls, not aiming at the page, and the picker has
+	 * to let it past untouched — its capture-phase handler runs first and would
+	 * otherwise swallow the click on Hide before the panel ever saw it.
+	 *
+	 * A click inside the shadow root reaches a listener out here retargeted to
+	 * the host, which carries the attribute; the root-node check covers a node
+	 * of ours that is aimed at directly. */
+	const mine = (node) =>
+		node instanceof Element &&
+		(node.closest('[' + OURS + ']') !== null || node.getRootNode() === shadow);
 
 	const unique = (selector) => {
 		try {
@@ -204,23 +260,54 @@
 		return null;
 	};
 
+	/* Keeps the panel off whatever is being confirmed, because a candidate in
+	 * the bottom right corner is otherwise underneath it and the outline the
+	 * user is being asked to check is the half they cannot see.
+	 *
+	 * Measured with `away` taken off first: left on, the panel would be scoring
+	 * the overlap against where it had already moved to and would flip back and
+	 * forth every time the page scrolled. */
+	const place = (box) => {
+		if (!panel) {
+			return;
+		}
+
+		panel.classList.remove('away');
+
+		const own = panel.getBoundingClientRect();
+		const overlaps =
+			box.left < own.right && box.right > own.left &&
+			box.top < own.bottom && box.bottom > own.top;
+
+		panel.classList.toggle('away', overlaps);
+	};
+
 	const draw = () => {
 		if (!outline) {
 			return;
 		}
 
-		if (!hovered) {
+		/* A candidate pins the outline. Once something is chosen the pointer or
+		 * the finger has to travel to the buttons, and an outline that kept
+		 * following would leave the user confirming something else. */
+		const target = candidate || hovered;
+
+		if (!target) {
 			outline.style.display = 'none';
 
 			return;
 		}
 
-		const box = hovered.getBoundingClientRect();
+		const box = target.getBoundingClientRect();
 		outline.style.display = 'block';
 		outline.style.left = box.left + 'px';
 		outline.style.top = box.top + 'px';
 		outline.style.width = box.width + 'px';
 		outline.style.height = box.height + 'px';
+
+		if (candidate) {
+			place(box);
+		}
 	};
 
 	const say = (text) => {
@@ -229,9 +316,14 @@
 		}
 
 		badge.textContent = text;
+		/* Shown even outside picker mode: Undo and the quality controls can both
+		 * fail with the badge parked, and a refusal nobody sees is a refusal
+		 * that looks like success. */
+		badge.style.display = 'block';
 		window.setTimeout(() => {
 			try {
 				badge.textContent = HELP;
+				badge.style.display = picking ? 'block' : 'none';
 			} catch (e) {
 				/* deliberately swallowed */
 			}
@@ -242,6 +334,12 @@
 		chrome();
 		picking = on;
 		hovered = null;
+		candidate = null;
+		chosen = null;
+
+		if (panel) {
+			panel.classList.remove('confirming', 'away');
+		}
 
 		if (badge) {
 			badge.textContent = HELP;
@@ -302,13 +400,27 @@
 		panel.id = 'panel';
 		panel.innerHTML = `
 			<h2>mach5</h2>
-			<fieldset>
-				<p>Image quality</p>
-				<div class="tiers"></div>
-			</fieldset>
-			<button class="act" data-act="pick">Hide an element</button>
-			<button class="act" data-act="clear">Unhide all here</button>
-			<a href="/.mach5/">Status and settings</a>
+			<div id="main">
+				<div id="undo">
+					<p>Hidden just now</p>
+					<code id="hidden"></code>
+					<button class="act" data-act="undo">Undo</button>
+				</div>
+				<fieldset>
+					<p>Image quality</p>
+					<div class="tiers"></div>
+				</fieldset>
+				<button class="act" data-act="pick">Hide an element</button>
+				<button class="act" data-act="clear">Unhide all here</button>
+				<a href="/.mach5/">Status and settings</a>
+			</div>
+			<div id="confirm">
+				<p id="what"></p>
+				<code id="sel"></code>
+				<button class="act" id="hide" data-act="hide">Hide</button>
+				<button class="act" data-act="wider">Wider</button>
+				<button class="act" data-act="cancel">Cancel</button>
+			</div>
 		`;
 
 		const tiers = panel.querySelector('.tiers');
@@ -361,6 +473,129 @@
 		}
 	};
 
+	/* Something a person can check the outline against. A selector on its own
+	 * does not answer the question that matters — did I get the advert or the
+	 * picture inside it — and a size does. */
+	const describe = (element) => {
+		const box = element.getBoundingClientRect();
+		/* SVG hands back an SVGAnimatedString rather than a string. */
+		const classes = typeof element.className === 'string' ? element.className.trim() : '';
+		const hint = element.id ? '#' + element.id : classes ? '.' + classes.split(/\s+/)[0] : '';
+
+		return element.localName + hint + ' · ' + Math.round(box.width) + ' × ' + Math.round(box.height);
+	};
+
+	const render = () => {
+		if (!panel) {
+			return;
+		}
+
+		panel.classList.toggle('confirming', !!candidate);
+		panel.classList.toggle('undoable', !!undone);
+
+		if (candidate) {
+			panel.querySelector('#what').textContent = describe(candidate);
+			panel.querySelector('#sel').textContent =
+				chosen || 'nothing unambiguous points at this one — try Wider';
+			// Nothing to store means nothing to hide; Wider is the way out.
+			panel.querySelector('[data-act="hide"]').disabled = !chosen;
+			panel.querySelector('[data-act="wider"]').disabled = !usable(candidate.parentElement);
+		}
+
+		if (undone) {
+			panel.querySelector('#hidden').textContent = undone.selector;
+		}
+	};
+
+	/* Chooses rather than hides. On a phone this is the first moment the user
+	 * can see what they are aiming at, so hiding here would mean hiding things
+	 * sight unseen — which is exactly what the old click-to-hide did. */
+	const choose = (element) => {
+		candidate = element;
+		chosen = selectorFor(element);
+		hovered = null;
+
+		if (panel) {
+			panel.classList.add('open');
+		}
+
+		render();
+		draw();
+	};
+
+	/* A finger cannot aim at a container rather than its contents: tapping an
+	 * advert lands on the image inside it every time. Walking up is how the
+	 * advert itself gets picked, and `usable` ends the walk below body — hiding
+	 * that would hide the site. */
+	const wider = () => {
+		if (candidate && usable(candidate.parentElement)) {
+			choose(candidate.parentElement);
+		}
+	};
+
+	const restore = (element, had) => {
+		if (had.display) {
+			element.style.setProperty('display', had.display, had.priority);
+		} else {
+			element.style.removeProperty('display');
+		}
+	};
+
+	const hide = () => {
+		if (!candidate || !chosen) {
+			return;
+		}
+
+		const element = candidate;
+		const selector = chosen;
+		/* What the page had, so that Undo and a refusal can both put it back
+		 * rather than guessing at `display: block`. */
+		const had = {
+			display: element.style.getPropertyValue('display'),
+			priority: element.style.getPropertyPriority('display')
+		};
+
+		// Hide it here as well as storing it: the stylesheet only runs on the
+		// next load, and waiting until then to see anything happen is horrible.
+		element.style.setProperty('display', 'none', 'important');
+		candidate = null;
+		chosen = null;
+		render();
+		draw();
+
+		post('/.mach5/hidden', JSON.stringify({ selector }))
+			.then(() => {
+				undone = { selector, element, had };
+				render();
+			})
+			.catch(() => {
+				/* Nothing was stored, so leaving it hidden is a lie that lasts
+				 * until the next load quietly brings it back. */
+				restore(element, had);
+				say('mach5: could not save that selector');
+			});
+	};
+
+	/* The same endpoint the status page's remove button uses, so one selector
+	 * goes and the rest of this host's list stays. It sits in the panel until
+	 * it is used or something else is hidden, because the moment you want it is
+	 * a second or two after you look up and see the wrong thing missing. */
+	const undo = () => {
+		if (!undone) {
+			return;
+		}
+
+		const { selector, element, had } = undone;
+
+		post('/.mach5/hidden/remove', JSON.stringify({ selector }))
+			.then(() => {
+				restore(element, had);
+				undone = null;
+				render();
+			})
+			.catch(() => say('mach5: could not undo that'));
+	};
+
 	const onPanelClick = (event) => {
 		const tier = event.target.closest('[data-tier]');
 		if (tier) {
@@ -391,6 +626,10 @@
 			return;
 		}
 
+		if (act.disabled) {
+			return;
+		}
+
 		if (act.dataset.act === 'pick') {
 			togglePanel(false);
 			toggle(true);
@@ -398,11 +637,22 @@
 			post('/.mach5/hidden/clear', null)
 				.then(() => window.location.reload())
 				.catch(() => say('mach5: could not clear this site'));
+		} else if (act.dataset.act === 'hide') {
+			hide();
+		} else if (act.dataset.act === 'wider') {
+			wider();
+		} else if (act.dataset.act === 'cancel') {
+			// Out of picker mode entirely, and nothing hidden. The panel goes
+			// with it: it is only open because something was being confirmed.
+			toggle(false);
+			panel.classList.remove('open');
+		} else if (act.dataset.act === 'undo') {
+			undo();
 		}
 	};
 
 	const track = (event) => {
-		if (!picking) {
+		if (!picking || candidate) {
 			return;
 		}
 
@@ -410,35 +660,87 @@
 		draw();
 	};
 
+	/* Touch has no hover, so the outline follows the finger while it is down and
+	 * the tap that ends the gesture chooses whatever it was last over. That is
+	 * the whole reason the picker was unusable on a phone: mousemove never
+	 * fires, so the first feedback of any kind used to be the element vanishing.
+	 *
+	 * Registered passive, and it never calls preventDefault: picking must not
+	 * stop the page scrolling, which is the only way to reach anything below the
+	 * fold on a phone. */
+	const finger = (event) => {
+		if (!picking || candidate) {
+			return;
+		}
+
+		const touch = event.touches[0];
+		if (!touch) {
+			return;
+		}
+
+		/* touchmove keeps reporting the element the gesture started on, so what
+		 * is under the finger now has to be hit-tested for. */
+		const element = document.elementFromPoint(touch.clientX, touch.clientY);
+		hovered = usable(element) ? element : null;
+		draw();
+	};
+
+	/* Lifting is what chooses, rather than the click the browser sends after a
+	 * tap: that click is aimed at the element the finger came down on, which
+	 * after any drag at all is not the one the outline has been showing. Hit
+	 * testing where the finger left instead is the only way the preview above
+	 * and the thing chosen are the same element.
+	 *
+	 * Preventing it also stops that compatibility click, which is why this one
+	 * cannot be passive. */
+	const lift = (event) => {
+		if (!picking || mine(event.target)) {
+			return;
+		}
+
+		const touch = event.changedTouches[0];
+		if (!touch) {
+			return;
+		}
+
+		event.preventDefault();
+		tapped = Date.now();
+
+		const element = document.elementFromPoint(touch.clientX, touch.clientY);
+		if (usable(element)) {
+			choose(element);
+		}
+	};
+
 	const grab = (event) => {
 		if (!picking) {
 			return;
 		}
 
-		// Capture phase, so the page never sees the click that hid its element.
+		/* Before the preventDefault below, not after: this handler is on the
+		 * capture phase, and stopping a click on Hide or Cancel here would kill
+		 * the panel's own listener before it ran. */
+		if (mine(event.target)) {
+			return;
+		}
+
+		// Capture phase, so the page never sees the click that chose an element.
 		event.preventDefault();
 		event.stopPropagation();
+
+		/* A tap that touchend has already dealt with. Swallowed rather than
+		 * acted on, because a ghost click carries the element the finger
+		 * started on and would quietly re-choose what the user dragged away
+		 * from. */
+		if (Date.now() - tapped < GHOST) {
+			return;
+		}
 
 		if (!usable(event.target)) {
 			return;
 		}
 
-		const selector = selectorFor(event.target);
-		if (!selector) {
-			say('mach5: no unambiguous selector for that element');
-
-			return;
-		}
-
-		// Hide it here as well as storing it: the stylesheet only runs on the
-		// next load, and waiting until then to see anything happen is horrible.
-		event.target.style.setProperty('display', 'none', 'important');
-		hovered = null;
-		draw();
-
-		post('/.mach5/hidden', JSON.stringify({ selector })).catch(() => {
-			say('mach5: could not save that selector');
-		});
+		choose(event.target);
 	};
 
 	/* Only one global shortcut, because every combination is somebody's already:
@@ -491,6 +793,9 @@
 		buildWhenThereIsABody();
 		document.addEventListener('keydown', guard(keys), true);
 		document.addEventListener('mousemove', guard(track), true);
+		document.addEventListener('touchstart', guard(finger), { capture: true, passive: true });
+		document.addEventListener('touchmove', guard(finger), { capture: true, passive: true });
+		document.addEventListener('touchend', guard(lift), true);
 		document.addEventListener('click', guard(grab), true);
 		window.addEventListener('scroll', guard(draw), true);
 		window.addEventListener('resize', guard(draw), true);

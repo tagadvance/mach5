@@ -11,7 +11,15 @@
  * stub and nothing here can tell you the panel looks right; no CSS cascade, so
  * the shadow root's isolation is assumed rather than demonstrated; and the
  * shadow root is forced open below because a closed one cannot be inspected
- * from outside. What it does have is a real DOM, real events and a real
+ * from outside.
+ *
+ * Two consequences worth naming, because the picker is now aimed at a phone.
+ * Nothing here can say where anything is on screen: where a rectangle matters
+ * — the outline, and the panel moving out from under what is being confirmed —
+ * the test feeds getBoundingClientRect a fixture and checks the arithmetic
+ * done with it, which is not the same as checking it looks right. And there is
+ * no touch: jsdom builds a TouchEvent but has no elementFromPoint, so the
+ * hit-test the touch handler depends on is stubbed too. What it does have is a real DOM, real events and a real
  * engine, which is enough to answer the questions that matter first: does it
  * throw, does it wire itself up, does it post what it claims to post, and does
  * it stay out of the way of the page it landed on.
@@ -92,6 +100,39 @@ const click = (w, el) => {
   el.dispatchEvent(e);
   return e;
 };
+const move = (w, el) => {
+  const e = new w.MouseEvent('mousemove', { bubbles: true, cancelable: true });
+  Object.defineProperty(e, 'target', { value: el });
+  w.document.dispatchEvent(e);
+  return e;
+};
+// jsdom has TouchEvent but no Touch, and accepts plain objects in `touches`.
+// It has no elementFromPoint at all, so the caller stubs that; see `hit`.
+const touch = (w, type, x, y, el) => {
+  const spot = [{ clientX: x, clientY: y }];
+  const e = new w.TouchEvent(type, {
+    bubbles: true, cancelable: true,
+    touches: type === 'touchend' ? [] : spot,
+    changedTouches: spot,
+  });
+  (el || w.document).dispatchEvent(e);
+  return e;
+};
+const hit = (p, el) => { p.d.elementFromPoint = () => el; };
+// A fixture rectangle for one element. There is no layout here, so this is the
+// only way anything geometric can be exercised at all.
+const rect = (el, [left, top, width, height]) => {
+  el.getBoundingClientRect = () => ({
+    left, top, width, height, right: left + width, bottom: top + height, x: left, y: top,
+  });
+};
+const act = (p, name) => p.shadow().querySelector(`[data-act="${name}"]`);
+const text = (p, id) => { const el = p.shadow().getElementById(id); return el ? el.textContent : ''; };
+const outline = (p) => p.d.querySelector('[data-mach5="outline"]');
+const pick = (p) => {
+  key(p.w, 'KeyH', { ctrlKey: true, shiftKey: true });
+  click(p.w, act(p, 'pick'));
+};
 const tick = () => new Promise(r => setImmediate(r));
 
 const NORMAL = `<!doctype html><html><head><title>t</title></head><body>
@@ -156,12 +197,11 @@ console.log('\n=== 4. choosing a quality tier ===');
   ok('and unpresses the rest', others.every(b => b.getAttribute('aria-pressed') === 'false'));
 }
 
-console.log('\n=== 5. picking an element to hide ===');
+console.log('\n=== 5. tapping an element chooses it, and Hide hides it ===');
 {
   const p = makePage(NORMAL);
   const sh = p.shadow();
-  key(p.w, 'KeyH', { ctrlKey: true, shiftKey: true });
-  click(p.w, sh.querySelector('[data-act="pick"]'));
+  pick(p);
   ok('picker armed, panel closed', !sh.getElementById('panel').classList.contains('open'));
   ok('crosshair cursor', p.d.documentElement.style.cursor === 'crosshair');
   ok('help badge shown', p.d.querySelector('[data-mach5="badge"]').style.display === 'block');
@@ -170,21 +210,262 @@ console.log('\n=== 5. picking an element to hide ===');
   const ev = click(p.w, target);
   await tick();
   ok('the page never sees the click', ev.defaultPrevented);
-  ok('element hidden immediately', target.style.display === 'none');
+  ok('nothing hidden yet', target.style.display === '');
+  ok('and nothing posted yet', !p.calls.some(c => c.path === '/.mach5/hidden'));
+  ok('the panel opens to confirm', sh.getElementById('panel').classList.contains('open'));
+  ok('in confirm mode', sh.getElementById('panel').classList.contains('confirming'));
+  ok('showing the selector', text(p, 'sel') === '#ad-slot', text(p, 'sel'));
+  ok('and what it is, in words', /^aside#ad-slot · \d+ × \d+$/.test(text(p, 'what')), text(p, 'what'));
+  ok('outline on the candidate', outline(p).style.display === 'block');
+
+  click(p.w, act(p, 'hide'));
+  await tick();
+  ok('Hide hides it', target.style.display === 'none');
   const hid = p.calls.find(c => c.path === '/.mach5/hidden' && c.method === 'POST');
   ok('selector posted', !!hid);
   ok('selector is the unique id', hid && JSON.parse(hid.body).selector === '#ad-slot', hid && hid.body);
   ok('and it actually matches one element', hid && p.d.querySelectorAll(JSON.parse(hid.body).selector).length === 1);
+  ok('omits credentials', hid && hid.credentials === 'omit');
+  ok('the confirm view is done with', !sh.getElementById('panel').classList.contains('confirming'));
+  ok('and the picker is still armed for the next one', p.d.documentElement.style.cursor === 'crosshair');
+}
+
+console.log('\n=== 5b. Wider walks up the tree, and stops before body ===');
+{
+  const p = makePage(NORMAL);
+  pick(p);
+  const target = p.d.querySelectorAll('#wrap p')[1];
+  click(p.w, target);
+  const first = text(p, 'sel');
+  ok('starts on what was tapped', p.d.querySelector(first) === target, first);
+  ok('Wider is offered', act(p, 'wider').disabled === false);
+
+  click(p.w, act(p, 'wider'));
+  ok('it moves to the parent', text(p, 'sel') === '#wrap', text(p, 'sel'));
+  ok('which is not where it started', text(p, 'sel') !== first);
+  ok('and the description follows', /^div#wrap · /.test(text(p, 'what')), text(p, 'what'));
+  ok('the outline is redrawn on it', outline(p).style.display === 'block');
+
+  // #wrap's parent is body, which nothing may ever aim at.
+  ok('Wider is refused at the top', act(p, 'wider').disabled === true);
+  click(p.w, act(p, 'wider'));
+  ok('and clicking it anyway changes nothing', text(p, 'sel') === '#wrap');
+
+  click(p.w, act(p, 'hide'));
+  await tick();
+  const hid = p.calls.find(c => c.path === '/.mach5/hidden');
+  ok('the widened selector is what gets posted', hid && JSON.parse(hid.body).selector === '#wrap', hid && hid.body);
+  ok('body itself was never hidden', p.d.body.style.display === '');
+}
+
+console.log('\n=== 5c. Cancel hides nothing ===');
+{
+  const p = makePage(NORMAL);
+  pick(p);
+  const target = p.d.getElementById('ad-slot');
+  click(p.w, target);
+  ok('there is a candidate to cancel', p.shadow().getElementById('panel').classList.contains('confirming'));
+
+  click(p.w, act(p, 'cancel'));
+  await tick();
+  ok('nothing was posted', !p.calls.some(c => c.path.startsWith('/.mach5/hidden')));
+  ok('nothing was hidden', target.style.display === '');
+  ok('picker mode left', p.d.documentElement.style.cursor === '');
+  ok('panel closed', !p.shadow().getElementById('panel').classList.contains('open'));
+  ok('outline gone', outline(p).style.display === 'none');
+  const after = click(p.w, target);
+  ok('and the page has its clicks back', !after.defaultPrevented);
+}
+
+console.log('\n=== 5d. Undo takes back the last hide, and only that one ===');
+{
+  const p = makePage(NORMAL);
+  pick(p);
+  const target = p.d.getElementById('ad-slot');
+  click(p.w, target);
+  ok('nothing to undo before a hide', !p.shadow().getElementById('panel').classList.contains('undoable'));
+
+  click(p.w, act(p, 'hide'));
+  await tick();
+  ok('undo offered after one', p.shadow().getElementById('panel').classList.contains('undoable'));
+  ok('naming what went', text(p, 'hidden') === '#ad-slot', text(p, 'hidden'));
+
+  click(p.w, act(p, 'undo'));
+  await tick();
+  const gone = p.calls.find(c => c.path === '/.mach5/hidden/remove');
+  ok('posts to the remove endpoint', !!gone, JSON.stringify(p.calls.map(c => c.path)));
+  ok('naming just that selector', gone && JSON.parse(gone.body).selector === '#ad-slot', gone && gone.body);
+  ok('omits credentials', gone && gone.credentials === 'omit');
+  ok('the element comes back', target.style.display === '');
+  ok('the offer goes away with it', !p.shadow().getElementById('panel').classList.contains('undoable'));
+  ok('and the rest of the host is untouched', !p.calls.some(c => c.path === '/.mach5/hidden/clear'));
+
+  // An element the page had already given an inline display: putting it back
+  // means putting that back, not guessing at block.
+  const q = makePage(NORMAL);
+  const flex = q.d.getElementById('wrap');
+  flex.style.setProperty('display', 'flex');
+  pick(q);
+  click(q.w, flex);
+  click(q.w, act(q, 'hide'));
+  await tick();
+  ok('hidden over the page\'s own display', flex.style.display === 'none');
+  click(q.w, act(q, 'undo'));
+  await tick();
+  ok('undo puts back what the page had', flex.style.display === 'flex');
+}
+
+console.log('\n=== 5e. a finger moves the outline ===');
+{
+  // The part jsdom cannot answer: there is no hit-testing here, so
+  // elementFromPoint is stubbed and the rectangles are fixtures. What this does
+  // test is that a touch reaches the picker at all and redraws the outline from
+  // whatever was under it — the thing mousemove alone could never do on a phone.
+  const p = makePage(NORMAL);
+  pick(p);
+  const target = p.d.getElementById('ad-slot');
+  rect(target, [12, 300, 320, 250]);
+  ok('nothing outlined to begin with', outline(p).style.display === 'none');
+
+  hit(p, target);
+  touch(p.w, 'touchstart', 20, 310, target);
+  ok('touchstart outlines what is under the finger', outline(p).style.display === 'block');
+  ok('at that element', outline(p).style.left === '12px' && outline(p).style.width === '320px',
+    `${outline(p).style.left} ${outline(p).style.width}`);
+
+  const other = p.d.getElementById('wrap');
+  rect(other, [5, 6, 40, 30]);
+  hit(p, other);
+  touch(p.w, 'touchmove', 8, 8, target);
+  ok('touchmove follows it', outline(p).style.left === '5px' && outline(p).style.width === '40px',
+    `${outline(p).style.left} ${outline(p).style.width}`);
+  ok('and none of that hid anything', !p.calls.some(c => c.path === '/.mach5/hidden'));
+
+  // Lifting is what chooses. The finger came down on #ad-slot and left on
+  // #wrap: the compatibility click a browser sends after a tap carries the
+  // element the gesture STARTED on, so choosing from that click would mean the
+  // outline the user watched and the thing chosen are two different elements.
+  hit(p, other);
+  const end = touch(p.w, 'touchend', 8, 8, target);
+  ok('touchend chooses what the finger left on', text(p, 'sel') === '#wrap', text(p, 'sel'));
+  ok('and the page never sees the tap', end.defaultPrevented);
+  ok('a tap alone still hides nothing', !p.calls.some(c => c.path === '/.mach5/hidden'));
+
+  // The ghost click a stubborn browser sends anyway, aimed where the finger
+  // came down. Whether any real browser still sends one is not testable here;
+  // that it cannot change the choice if it does, is.
+  const ghost = click(p.w, target);
+  ok('a ghost click does not re-choose', text(p, 'sel') === '#wrap', text(p, 'sel'));
+  ok('and the page does not see it either', ghost.defaultPrevented);
+}
+
+console.log('\n=== 5e2. a tap on the panel belongs to the panel ===');
+{
+  // touchend is prevented for the page, which would leave the panel's own
+  // buttons untappable if it did not let ours past first.
+  const p = makePage(NORMAL);
+  pick(p);
+  hit(p, p.d.getElementById('ad-slot'));
+  const host = p.d.querySelector('[data-mach5="panel"]');
+  const own = touch(p.w, 'touchend', 300, 700, host);
+  ok('not prevented', !own.defaultPrevented);
+  ok('and it chose nothing', !p.shadow().getElementById('panel').classList.contains('confirming'));
+}
+
+console.log('\n=== 5f. hover still previews, and a candidate pins the outline ===');
+{
+  const p = makePage(NORMAL);
+  pick(p);
+  const a = p.d.getElementById('ad-slot');
+  const b = p.d.getElementById('wrap');
+  rect(a, [12, 300, 320, 250]);
+  rect(b, [5, 6, 40, 30]);
+
+  ok('nothing outlined to begin with', outline(p).style.display === 'none');
+  move(p.w, a);
+  ok('mousemove still previews', outline(p).style.display === 'block' && outline(p).style.left === '12px');
+  move(p.w, b);
+  ok('and follows the pointer', outline(p).style.left === '5px');
+
+  click(p.w, a);
+  ok('a click pins the outline to the candidate', outline(p).style.left === '12px');
+  move(p.w, b);
+  ok('and hover no longer moves it', outline(p).style.left === '12px', outline(p).style.left);
+}
+
+console.log('\n=== 5g. the panel gets out from under the candidate ===');
+{
+  // jsdom has no layout: both rectangles are fixtures, so this is the overlap
+  // arithmetic and the class it sets. Whether the panel then looks right on a
+  // phone is not a question this harness can be asked.
+  const p = makePage(NORMAL);
+  const panel = p.shadow().getElementById('panel');
+  rect(panel, [200, 400, 230, 200]);
+  pick(p);
+  ok('panel starts where it normally sits', !panel.classList.contains('away'));
+
+  const low = p.d.getElementById('ad-slot');
+  rect(low, [180, 380, 300, 260]);
+  click(p.w, low);
+  ok('a candidate underneath moves it', panel.classList.contains('away'));
+
+  const high = p.d.getElementById('wrap');
+  rect(high, [0, 0, 100, 100]);
+  click(p.w, high);
+  ok('one that is nowhere near does not', !panel.classList.contains('away'));
+}
+
+console.log('\n=== 5h. the panel keeps working while the picker is armed ===');
+{
+  // The capture-phase click handler eats every click on the page while picking.
+  // If it ate the panel's too, Hide and Cancel would be unreachable — which is
+  // the one way this whole flow could be dead on arrival.
+  const p = makePage(NORMAL);
+  pick(p);
+  click(p.w, p.d.getElementById('ad-slot'));
+  const hideButton = act(p, 'hide');
+  const seen = [];
+  hideButton.addEventListener('click', () => seen.push('panel'));
+  click(p.w, hideButton);
+  await tick();
+  ok('the click reaches the panel', seen.length === 1);
+  ok('and does its job', p.calls.some(c => c.path === '/.mach5/hidden'));
+}
+
+console.log('\n=== 5i. an element nothing unambiguous points at ===');
+{
+  // Both p's are the first of their type inside #deep, so every prefix the
+  // walk tries matches two elements and it gives up rather than hide the wrong
+  // one. Before Wider there was nothing a user could do about that.
+  const p = makePage(`<!doctype html><html><body>
+    <div id="deep"><p>one</p><section><p>two</p></section></div></body></html>`);
+  pick(p);
+  const target = p.d.querySelector('#deep p');
+  click(p.w, target);
+  ok('it says so instead of a selector', /nothing unambiguous/.test(text(p, 'sel')), text(p, 'sel'));
+  ok('Hide is refused', act(p, 'hide').disabled === true);
+  ok('but Wider is not', act(p, 'wider').disabled === false);
+
+  click(p.w, act(p, 'hide'));
+  await tick();
+  ok('and clicking Hide anyway posts nothing', !p.calls.some(c => c.path === '/.mach5/hidden'));
+
+  click(p.w, act(p, 'wider'));
+  ok('one step up there is one', text(p, 'sel') === '#deep', text(p, 'sel'));
+  ok('and Hide is offered again', act(p, 'hide').disabled === false);
+  click(p.w, act(p, 'hide'));
+  await tick();
+  const hid = p.calls.find(c => c.path === '/.mach5/hidden');
+  ok('which posts the container', hid && JSON.parse(hid.body).selector === '#deep', hid && hid.body);
 }
 
 console.log('\n=== 6. a selector for an element with no id ===');
 {
   const p = makePage(NORMAL);
-  const sh = p.shadow();
-  key(p.w, 'KeyH', { ctrlKey: true, shiftKey: true });
-  click(p.w, sh.querySelector('[data-act="pick"]'));
+  pick(p);
   const target = p.d.querySelectorAll('#wrap p')[1];
   click(p.w, target);
+  click(p.w, act(p, 'hide'));
   await tick();
   const hid = p.calls.find(c => c.path === '/.mach5/hidden');
   ok('posted a selector', !!hid);
@@ -201,9 +482,14 @@ console.log('\n=== 7. Escape and u ===');
   const sh = p.shadow();
   key(p.w, 'KeyH', { ctrlKey: true, shiftKey: true });
   click(p.w, sh.querySelector('[data-act="pick"]'));
+  click(p.w, p.d.getElementById('ad-slot'));
+  ok('a candidate is waiting to be confirmed', sh.getElementById('panel').classList.contains('confirming'));
   key(p.w, 'Escape');
   ok('Escape leaves picker mode', p.d.documentElement.style.cursor === '');
   ok('badge hidden again', p.d.querySelector('[data-mach5="badge"]').style.display === 'none');
+  ok('the candidate goes with it', !sh.getElementById('panel').classList.contains('confirming'));
+  ok('outline gone', outline(p).style.display === 'none');
+  ok('and nothing was hidden on the way out', p.d.getElementById('ad-slot').style.display === '');
 
   const q = makePage(NORMAL);
   const qs = q.shadow();
@@ -268,14 +554,20 @@ console.log('\n=== 9b. a proxy that answers and says no ===');
   };
 
   const p = makePage(NORMAL, { fetchRefuses: 409 });
-  key(p.w, 'KeyH', { ctrlKey: true, shiftKey: true });
-  click(p.w, p.shadow().querySelector('[data-act="pick"]'));
+  pick(p);
   await tick();
   const target = p.d.querySelector('#ad-slot');
+  // Dispatched raw, without the target override the helper does, so this one
+  // also exercises jsdom's own retargeting on the way to the picker.
   target.dispatchEvent(new p.w.MouseEvent('click', { bubbles: true, cancelable: true }));
+  click(p.w, act(p, 'hide'));
+  ok('hidden on the spot, before the proxy has answered', target.style.display === 'none');
   await tick();
   ok('a refused selector does not throw', p.errors.length === 0, p.errors.map(e => e.message).join('; '));
   ok('and says so', /could not save/.test(badge(p)), `badge said: ${badge(p)}`);
+  // Nothing was stored, so leaving it hidden would be a lie until the next load.
+  ok('and puts the element back', target.style.display === '', target.style.display);
+  ok('with nothing to undo', !p.shadow().getElementById('panel').classList.contains('undoable'));
 
   // The panel has no badge on screen, so a refused quality change reports
   // itself by putting the button back where it was.

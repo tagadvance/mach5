@@ -266,8 +266,25 @@ impl Proxy {
 		);
 	}
 
-	fn log(&self) -> String {
+	pub fn log(&self) -> String {
 		std::fs::read_to_string(self.dir.path().join("proxy.log")).unwrap_or_default()
+	}
+
+	/// Wait for something to appear in the proxy's log, or give up.
+	///
+	/// The log is the only way a test can tell *why* mach5 refused a
+	/// connection: on the wire a refusal it chose and a refusal BoringSSL
+	/// arrived at on its own are the same fatal alert.
+	pub fn logged(&self, needle: &str, within: std::time::Duration) -> bool {
+		let deadline = std::time::Instant::now() + within;
+		while std::time::Instant::now() < deadline {
+			if self.log().contains(needle) {
+				return true;
+			}
+			std::thread::sleep(std::time::Duration::from_millis(20));
+		}
+
+		false
 	}
 }
 

@@ -417,3 +417,78 @@ fn a_hello_split_across_segments_is_still_passed_through() {
 		 answering with a certificate of its own"
 	);
 }
+
+/// The backstop under the passthrough promise.
+///
+/// `peek_server_name` reads the ClientHello by hand before anything is
+/// answered, and it is best-effort in three ways that all fail the same silent
+/// direction: it gives up after a timeout, it reads at most `PEEK_BYTES`, and
+/// it parses only the first TLS record. Each returns `None`, and `None` means
+/// "carry on and terminate it" — which for a host somebody deliberately
+/// exempted means decrypting their bank while nothing looks wrong, because the
+/// client trusts mach5's root.
+///
+/// This drives the second of those: a hello too large for the peek to read.
+#[test]
+fn a_listed_host_the_peek_could_not_read_is_refused_not_decrypted() {
+	use std::io::{Read, Write};
+	use std::net::TcpStream;
+
+	let hello = common::padded_client_hello(b"localhost", 5000);
+	assert!(
+		hello.len() > 4096,
+		"the point is that it is larger than the peek will ever read"
+	);
+
+	let proxy = Proxy::start_with(BLOCKLIST, "[passthrough]\nhosts = [\"localhost\"]\nport = 1");
+
+	let mut client = TcpStream::connect(("127.0.0.1", proxy.tcp_port())).expect("reach mach5");
+	client.write_all(&hello).expect("send a hello");
+	client.flush().unwrap();
+
+	let mut back = [0u8; 16];
+	let read = client.read(&mut back).unwrap_or(0);
+	assert!(
+		read == 0 || back[0] != 0x16,
+		"mach5 answered a listed host with a handshake of its own: {:02x?}",
+		&back[..read]
+	);
+
+	// On the wire a refusal mach5 chose and one BoringSSL reached by itself are
+	// the same fatal alert, so the log is what separates them — and what proves
+	// this test is not passing because the synthetic hello is malformed.
+	assert!(
+		proxy.logged("refusing localhost", std::time::Duration::from_secs(5)),
+		"no refusal was logged, so whatever happened was not the passthrough \
+		 backstop:\n{}",
+		proxy.log()
+	);
+}
+
+/// The control for the test above: the same unreadable hello, for a host that
+/// is *not* listed. Without this, that test would pass just as well if mach5
+/// refused every connection it could not peek at.
+#[test]
+fn an_unlisted_host_the_peek_could_not_read_is_not_refused() {
+	use std::io::Write;
+	use std::net::TcpStream;
+
+	let hello = common::padded_client_hello(b"elsewhere.example", 5000);
+
+	let proxy = Proxy::start_with(BLOCKLIST, "[passthrough]\nhosts = [\"localhost\"]\nport = 1");
+
+	let mut client = TcpStream::connect(("127.0.0.1", proxy.tcp_port())).expect("reach mach5");
+	client.write_all(&hello).expect("send a hello");
+	client.flush().unwrap();
+
+	// It may still fail the handshake for reasons of BoringSSL's own — this
+	// hello is synthetic. What must not happen is mach5 deciding not to serve
+	// it, which is a decision reserved for hosts somebody listed.
+	std::thread::sleep(std::time::Duration::from_millis(500));
+	assert!(
+		!proxy.log().contains("refusing elsewhere.example"),
+		"an unlisted host was refused, so the backstop is firing for \
+		 everything the peek cannot read:\n{}",
+		proxy.log()
+	);
+}

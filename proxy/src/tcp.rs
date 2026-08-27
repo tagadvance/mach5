@@ -19,7 +19,7 @@ use std::io::Read;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-use boring::ssl::{AlpnError, NameType, SslAcceptor, SslMethod};
+use boring::ssl::{AlpnError, NameType, SniError, SslAcceptor, SslAlert, SslMethod};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Body, Frame, Incoming};
@@ -115,12 +115,14 @@ struct Shared {
 
 /// Start the listener. Returns once its runtime thread is spawned.
 pub fn spawn(config: Arc<Config>, ca: Arc<CertAuthority>) -> std::io::Result<()> {
-	let acceptor = Arc::new(build_acceptor(&ca)?);
+	let passthrough = crate::passthrough::shared(&config);
+	let learned = crate::passthrough::learned(&config);
+	let acceptor = Arc::new(build_acceptor(&ca, &passthrough, &learned)?);
 	let addr = config.listen_tcp.0;
 
 	let shared = Arc::new(Shared {
-		passthrough: crate::passthrough::shared(&config),
-		learned: crate::passthrough::learned(&config),
+		passthrough,
+		learned,
 		pool: ChainPool::new(config.worker_threads(), &config, &ca),
 		agents: upstream::agents(&config),
 		links: crate::link::shared(&config),
@@ -176,17 +178,58 @@ pub fn spawn(config: Arc<Config>, ca: Arc<CertAuthority>) -> std::io::Result<()>
 
 /// Build the TLS acceptor, wired to the same on-the-fly certificate authority
 /// the QUIC listener uses.
-fn build_acceptor(ca: &Arc<CertAuthority>) -> std::io::Result<SslAcceptor> {
+fn build_acceptor(
+	ca: &Arc<CertAuthority>,
+	passthrough: &Arc<crate::passthrough::Passthrough>,
+	learned: &Arc<crate::passthrough::Learned>,
+) -> std::io::Result<SslAcceptor> {
 	let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls())
 		.map_err(|e| std::io::Error::other(e.to_string()))?;
 
 	let ca = ca.clone();
-	builder.set_servername_callback(move |ssl, _alert| {
-		if let Some(sni) = ssl.servername(NameType::HOST_NAME) {
-			let sni = sni.to_string();
-			if !ca.install(ssl, &sni) {
-				log::warn!("serving default certificate for {sni}");
-			}
+	let passthrough = passthrough.clone();
+	let learned = learned.clone();
+	builder.set_servername_callback(move |ssl, alert| {
+		let Some(sni) = ssl.servername(NameType::HOST_NAME) else {
+			return Ok(());
+		};
+		let sni = sni.to_string();
+
+		// The backstop for the whole passthrough promise, and the reason it is
+		// checked twice.
+		//
+		// `peek_server_name` reads the ClientHello by hand before anything is
+		// answered, and when it succeeds the connection is spliced and this is
+		// never reached. But it is best-effort in three ways that all fail the
+		// same silent direction — it gives up after `HELLO_TIMEOUT`, which a
+		// phone dribbling a hello over bad mobile data can hit; it reads at
+		// most `PEEK_BYTES`; and it parses only the first TLS record, so a
+		// hello fragmented across several defeats it. Every one of those
+		// returns `None`, and `None` means "carry on and terminate it" — which
+		// for a host somebody deliberately exempted means decrypting their bank
+		// and nothing looking wrong, because the client trusts our root.
+		//
+		// By the time this callback runs, BoringSSL has parsed that same hello
+		// properly: any size, any fragmentation, no deadline of ours. So the
+		// name here is authoritative where the peek was a guess, and refusing
+		// is free. It cannot splice this late — the hello has been consumed and
+		// replaying it is not worth the complexity — so a listed host gets a
+		// hard failure instead of a working connection. That is the right way
+		// round: for a bank, refusing beats intercepting, and this only ever
+		// fires for a host that was listed.
+		if crate::passthrough::never_decrypt(&passthrough, &learned, &sni) {
+			log::warn!(
+				"refusing {sni}: it is on the passthrough list but reading the ClientHello \
+				 by hand did not catch it, so it cannot be spliced — failing the handshake \
+				 rather than decrypting a host that was exempted"
+			);
+			*alert = SslAlert::HANDSHAKE_FAILURE;
+
+			return Err(SniError::ALERT_FATAL);
+		}
+
+		if !ca.install(ssl, &sni) {
+			log::warn!("serving default certificate for {sni}");
 		}
 
 		Ok(())

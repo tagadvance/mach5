@@ -152,7 +152,15 @@ console.log('\n=== 1. it loads on an ordinary page without throwing ===');
   ok('shadow root created', !!sh);
   ok('the dot exists', !!(sh && sh.getElementById('dot')));
   ok('the dot says m5', sh && sh.getElementById('dot').textContent === 'm5');
-  ok('four quality tiers rendered', sh && sh.querySelectorAll('[data-tier]').length === 4);
+  // Ordered so that left to right is monotonically fewer bytes, which is what
+  // makes it read as one scale. `off` sitting past `low` while being the
+  // highest quality of the lot is what made "None" mean the opposite of None.
+  ok('five quality tiers rendered', sh && sh.querySelectorAll('[data-tier]').length === 5);
+  ok('ordered biggest to smallest',
+    sh && [...sh.querySelectorAll('[data-tier]')].map(b => b.dataset.tier).join() === 'off,high,auto,low,none',
+    sh && [...sh.querySelectorAll('[data-tier]')].map(b => b.dataset.tier).join());
+  ok('and none of them is labelled the opposite of what it does',
+    sh && sh.querySelector('[data-tier="off"]').textContent !== 'None');
   ok('panel starts closed', sh && !sh.getElementById('panel').classList.contains('open'));
 }
 
@@ -432,31 +440,72 @@ console.log('\n=== 5h. the panel keeps working while the picker is armed ===');
   ok('and does its job', p.calls.some(c => c.path === '/.mach5/hidden'));
 }
 
-console.log('\n=== 5i. an element nothing unambiguous points at ===');
+console.log('\n=== 5i. an element the short walk cannot name, named exactly ===');
 {
   // Both p's are the first of their type inside #deep, so every prefix the
-  // walk tries matches two elements and it gives up rather than hide the wrong
-  // one. Before Wider there was nothing a user could do about that.
+  // descendant walk tries matches two elements. `>` between the steps pins
+  // each one to its actual parent, which separates them.
   const p = makePage(`<!doctype html><html><body>
     <div id="deep"><p>one</p><section><p>two</p></section></div></body></html>`);
   pick(p);
   const target = p.d.querySelector('#deep p');
   click(p.w, target);
-  ok('it says so instead of a selector', /nothing unambiguous/.test(text(p, 'sel')), text(p, 'sel'));
-  ok('Hide is refused', act(p, 'hide').disabled === true);
-  ok('but Wider is not', act(p, 'wider').disabled === false);
 
-  click(p.w, act(p, 'hide'));
-  await tick();
-  ok('and clicking Hide anyway posts nothing', !p.calls.some(c => c.path === '/.mach5/hidden'));
+  const sel = text(p, 'sel');
+  ok('a selector is offered', !/nothing unambiguous/.test(sel), sel);
+  ok('anchored at the id, with child steps', sel === '#deep > p:nth-of-type(1)', sel);
+  ok('and it matches only what was tapped', p.d.querySelectorAll(sel).length === 1 && p.d.querySelector(sel) === target);
+  ok('so Hide is offered', act(p, 'hide').disabled === false);
 
-  click(p.w, act(p, 'wider'));
-  ok('one step up there is one', text(p, 'sel') === '#deep', text(p, 'sel'));
-  ok('and Hide is offered again', act(p, 'hide').disabled === false);
   click(p.w, act(p, 'hide'));
   await tick();
   const hid = p.calls.find(c => c.path === '/.mach5/hidden');
-  ok('which posts the container', hid && JSON.parse(hid.body).selector === '#deep', hid && hid.body);
+  ok('and it posts that selector', hid && JSON.parse(hid.body).selector === sel, hid && hid.body);
+  ok('the other p is untouched', p.d.querySelector('#deep section p').style.display === '');
+}
+
+console.log('\n=== 5j. a wrapper in a chain of only-children ===');
+{
+  // The shape most of the modern web is built from, and the one that sent
+  // every tap to "try Wider": a descendant path for a middle wrapper is also
+  // a path to everything nested under it, so the count never reaches one.
+  // Wider walks straight into these, which is where it mattered most.
+  const p = makePage(`<!doctype html><html><body>
+    <div><div><div><div><span>t</span></div></div></div></div></body></html>`);
+  // Excluding the panel's own host, which the picker refuses to aim at.
+  const wrappers = [...p.d.querySelectorAll('div:not([data-mach5])')];
+  ok('four of them', wrappers.length === 4, String(wrappers.length));
+
+  for (let i = 0; i < wrappers.length; i++) {
+    pick(p);
+    click(p.w, wrappers[i]);
+    const sel = text(p, 'sel');
+    ok(`wrapper ${i + 1} is nameable`, !/nothing unambiguous/.test(sel), sel);
+    ok(`wrapper ${i + 1} selector matches only itself`,
+      p.d.querySelectorAll(sel).length === 1 && p.d.querySelector(sel) === wrappers[i], sel);
+    click(p.w, act(p, 'cancel'));
+    await tick();
+  }
+}
+
+console.log('\n=== 5k. the short selector is still preferred over the exact one ===');
+{
+  const p = makePage(NORMAL);
+  pick(p);
+
+  // An id is taken on its own — no path, no child steps.
+  click(p.w, p.d.getElementById('ad-slot'));
+  ok('an id wins outright', text(p, 'sel') === '#ad-slot', text(p, 'sel'));
+  click(p.w, act(p, 'cancel'));
+  await tick();
+
+  // And where a short descendant path is already unique, it is not replaced
+  // by a longer exact one — a shorter path survives the page being rebuilt.
+  pick(p);
+  click(p.w, p.d.querySelectorAll('#wrap p')[1]);
+  const sel = text(p, 'sel');
+  ok('a unique short path is kept', !sel.includes('>'), sel);
+  ok('and still matches one element', p.d.querySelectorAll(sel).length === 1, sel);
 }
 
 console.log('\n=== 6. a selector for an element with no id ===');
@@ -581,9 +630,11 @@ console.log('\n=== 9b. a proxy that answers and says no ===');
   };
   const before = chosen(q);
   ok('a tier is marked to begin with', before !== null);
-  const third = [...q.shadow().querySelectorAll('[data-tier]')][2];
-  ok('and it is not the one about to be clicked', third.dataset.tier !== before);
-  click(q.w, third);
+  // Any tier but the current one; picking by position broke the moment the
+  // order changed.
+  const other = [...q.shadow().querySelectorAll('[data-tier]')].find((b) => b.dataset.tier !== before);
+  ok('and there is another to click', !!other);
+  click(q.w, other);
   await tick();
   ok('a refused quality change puts the choice back', chosen(q) === before, `now: ${chosen(q)}, was: ${before}`);
 
@@ -592,9 +643,14 @@ console.log('\n=== 9b. a proxy that answers and says no ===');
   const accepted = makePage(NORMAL);
   key(accepted.w, 'KeyH', { ctrlKey: true, shiftKey: true });
   await tick();
-  click(accepted.w, [...accepted.shadow().querySelectorAll('[data-tier]')][2]);
+  // Not by position, and explicitly not the one already marked, or the
+  // assertion would hold whether or not the click did anything.
+  const wanted = [...accepted.shadow().querySelectorAll('[data-tier]')]
+    .find((b) => b.dataset.tier !== chosen(accepted));
+  ok('and it is not already the chosen one', wanted.dataset.tier !== chosen(accepted));
+  click(accepted.w, wanted);
   await tick();
-  ok('an accepted one sticks', chosen(accepted) === third.dataset.tier, `now: ${chosen(accepted)}`);
+  ok('an accepted one sticks', chosen(accepted) === wanted.dataset.tier, `now: ${chosen(accepted)}`);
 
   const r2 = makePage(NORMAL, { fetchRefuses: 500 });
   key(r2.w, 'KeyH', { ctrlKey: true, shiftKey: true });
@@ -640,6 +696,24 @@ console.log('\n=== 9c. a page whose body is not there yet ===');
   w.document.dispatchEvent(new w.Event('DOMContentLoaded'));
   ok('the panel is built once the body exists', captured !== null);
   ok('and the dot is in it', !!(captured && captured.getElementById('dot')));
+}
+
+console.log('\n=== 9d. the tier that means no images at all ===');
+{
+  const p = makePage(NORMAL);
+  const sh = p.shadow();
+  const none = sh.querySelector('[data-tier="none"]');
+  ok('there is a tier for it', !!none);
+  ok('and it is the last one', none === sh.querySelectorAll('[data-tier]')[4]);
+
+  click(p.w, none);
+  await tick();
+  const posted = p.calls.find(c => c.path === '/.mach5/settings' && c.method === 'POST');
+  ok('posts it', posted && JSON.parse(posted.body).image_quality === 'none', posted && posted.body);
+  ok('and marks it', none.getAttribute('aria-pressed') === 'true');
+  ok('unpressing the rest',
+    [...sh.querySelectorAll('[data-tier]')].filter(b => b !== none)
+      .every(b => b.getAttribute('aria-pressed') === 'false'));
 }
 
 console.log('\n=== 10. runs once, and only in the top frame ===');

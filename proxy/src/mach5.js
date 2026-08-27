@@ -84,8 +84,10 @@
 			letter-spacing: .06em; text-transform: uppercase }
 		fieldset { border: 0; margin: 0 0 12px; padding: 0 }
 		.tiers { display: flex; gap: 4px }
+		/* Five of them now, so they may not fit one row on a narrow phone. */
+		.tiers { flex-wrap: wrap }
 		.tiers button {
-			flex: 1; border: 1px solid #5f6368; background: transparent; color: inherit;
+			flex: 1 1 3.2em; white-space: nowrap; border: 1px solid #5f6368; background: transparent; color: inherit;
 			border-radius: 5px; padding: 5px 0; font: inherit; cursor: pointer;
 		}
 		.tiers button[aria-pressed="true"] { background: #8ab4f8; color: #202124; border-color: #8ab4f8 }
@@ -115,11 +117,19 @@
 		#undo { margin: 0 0 14px }
 	`;
 
+	/* Labelled by what you get rather than by what mach5 does internally, and
+	 * ordered so that left to right is monotonically fewer bytes.
+	 *
+	 * Both were wrong. `off` was shown as "None", which reads as "no images"
+	 * and means the exact opposite — leave the origin's images alone. And it
+	 * sat to the right of "Low" in what looks like a quality scale, while
+	 * being the *highest* quality of the lot. */
 	const TIERS = [
-		['auto', 'Auto'],
+		['off', 'As-is'],
 		['high', 'High'],
+		['auto', 'Auto'],
 		['low', 'Low'],
-		['off', 'None'],
+		['none', 'None'],
 	];
 
 	let picking = false;
@@ -227,16 +237,8 @@
 	 * path is more specific than it needs to be and breaks sooner the next time
 	 * the page is rebuilt. An ancestor with a unique id ends the walk either
 	 * way: it is a better root than `body`, and nothing above it can narrow the
-	 * match any further.
-	 *
-	 * Returning null when nothing is unambiguous is the point. A selector that
-	 * matches two elements would hide something nobody asked to hide. */
-	const selectorFor = (element) => {
-		const direct = byId(element);
-		if (direct) {
-			return direct;
-		}
-
+	 * match any further. */
+	const shortest = (element) => {
 		const path = [];
 
 		for (
@@ -259,6 +261,48 @@
 
 		return null;
 	};
+
+	/* The same path with `>` between every step instead of a space, which is
+	 * always unique and so is what we fall back to.
+	 *
+	 * The descendant walk above cannot name a wrapper in a chain of only-children
+	 * — `body div:nth-of-type(1) div:nth-of-type(1)` matches the wrapper *and*
+	 * everything nested below it, because a space permits gaps. That shape is
+	 * most of the modern web, and `Wider` walks straight into it, so refusing
+	 * there meant refusing exactly where a finger needs the most help.
+	 *
+	 * Child steps pin each level to its actual parent, so tag plus position among
+	 * its siblings identifies one element and no other. The cost is a selector
+	 * that breaks when the page is rebuilt, which is why it is second choice
+	 * rather than first. */
+	const exact = (element) => {
+		const path = [];
+
+		for (
+			let node = element;
+			node && node !== document.documentElement;
+			node = node.parentElement
+		) {
+			const anchor = byId(node);
+			if (anchor) {
+				path.unshift(anchor);
+				return path.join(' > ');
+			}
+
+			if (node === document.body) {
+				path.unshift('body');
+				return path.join(' > ');
+			}
+
+			path.unshift(step(node));
+		}
+
+		return null;
+	};
+
+	/* Returning null still has to mean something, so it is kept for the one case
+	 * that is genuinely unnameable: an element that is not under `body` at all. */
+	const selectorFor = (element) => byId(element) || shortest(element) || exact(element);
 
 	/* Keeps the panel off whatever is being confirmed, because a candidate in
 	 * the bottom right corner is otherwise underneath it and the outline the

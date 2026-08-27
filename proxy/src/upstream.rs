@@ -584,6 +584,7 @@ mod tests {
 			url: "https://example.com/index.html".to_string(),
 			headers,
 			body: Vec::new(),
+			peer: None,
 		}
 	}
 

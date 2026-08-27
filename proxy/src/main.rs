@@ -23,6 +23,7 @@ mod insecure;
 mod interceptor;
 mod internal;
 mod interstitial;
+mod link;
 mod metrics;
 mod passthrough;
 mod plugin;
@@ -57,6 +58,11 @@ const TOKEN_TTL_SECONDS: u64 = 30;
 const EXPIRY_BYTES: usize = 8;
 /// HMAC-SHA256.
 const TAG_BYTES: usize = 32;
+
+/// How often the QUIC loop copies each connection's delivery rate into the link
+/// store. Twice a second is far more often than a tier can move and far less
+/// often than the loop runs.
+const LINK_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How much of a streaming body to relay per chunk.
 const STREAM_CHUNK_SIZE: usize = 64 * 1024;
@@ -151,6 +157,11 @@ struct Client {
 	conn: quiche::Connection,
 	http3: Option<quiche::h3::Connection>,
 	pending: Vec<Pending>,
+	/// Where the client was when it arrived. Kept here rather than read back
+	/// out of the connection on every request: it is only ever used to decide
+	/// picture quality, so a client that migrates and keeps the old address for
+	/// the rest of the connection costs nothing worth the lookup.
+	peer: SocketAddr,
 	/// Bodies still arriving, keyed by stream id. The request itself went to a
 	/// worker the moment its headers landed; this is the tap still running.
 	uploads: HashMap<u64, Upload>,
@@ -348,9 +359,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 	log::info!("listening on {listen} (UDP/QUIC)");
 
 	let park_cap = config.stream_buffer_bytes();
+	let links = link::shared(&config);
 	let mut buf = [0u8; 65535];
 	let mut out = vec![0u8; config.quic.max_datagram_size];
 	let mut clients: ClientMap = HashMap::new();
+	let mut sample_links_at = std::time::Instant::now();
 
 	loop {
 		let timeout = clients.values().filter_map(|c| c.conn.timeout()).min();
@@ -391,6 +404,16 @@ fn main() -> Result<(), Box<dyn Error>> {
 		drive_http3(&h3_config, &mut clients, &jobs, park_cap);
 		flush(&socket, &mut out, &mut clients);
 
+		// On a clock rather than every tick. This loop runs for every
+		// connection on the process every time a packet arrives, and walking
+		// them all to copy out path statistics is exactly the kind of work that
+		// has no business being in it more often than it is useful.
+		let now = std::time::Instant::now();
+		if now >= sample_links_at {
+			sample_links(&links, &clients);
+			sample_links_at = now + LINK_SAMPLE_INTERVAL;
+		}
+
 		clients.retain(|_, c| {
 			if c.conn.is_closed() {
 				log::info!("connection closed: {:?}", c.conn.stats());
@@ -400,6 +423,26 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 			true
 		});
+	}
+}
+
+/// How fast each client is, straight off its congestion controller.
+///
+/// Free in the sense that matters: nothing here measures anything, it only
+/// reads what QUIC already knew. `delivery_rate` is derived from what the
+/// *client* acknowledged, so unlike the TCP side there is no risk of a slow
+/// origin being mistaken for a slow client — the origin is not on this path.
+fn sample_links(links: &link::Links, clients: &ClientMap) {
+	for client in clients.values() {
+		let Some(path) = client.conn.path_stats().find(|path| path.active) else {
+			continue;
+		};
+
+		if let Some(kbps) = link::from_delivery_rate(path.delivery_rate, path.sent_bytes) {
+			// The port is dropped: the same phone reaches mach5 over QUIC and
+			// over TCP on different ports, and it is one link either way.
+			links.record(path.peer_addr.ip(), kbps);
+		}
 	}
 }
 
@@ -992,6 +1035,7 @@ fn recv_packet(
 					conn,
 					http3: None,
 					pending: Vec::new(),
+					peer: from,
 					uploads: HashMap::new(),
 				},
 			);
@@ -1040,6 +1084,7 @@ fn drive_http3(
 		poll_requests(
 			&key,
 			&mut client.conn,
+			client.peer,
 			http3,
 			&mut client.uploads,
 			jobs,
@@ -1052,6 +1097,7 @@ fn drive_http3(
 fn poll_requests(
 	key: &quiche::ConnectionId<'static>,
 	conn: &mut quiche::Connection,
+	peer: SocketAddr,
 	http3: &mut quiche::h3::Connection,
 	uploads: &mut HashMap<u64, Upload>,
 	jobs: &Sender<FetchJob>,
@@ -1072,7 +1118,7 @@ fn poll_requests(
 					continue;
 				}
 
-				match build_request(conn.server_name(), &list) {
+				match build_request(conn.server_name(), peer, &list) {
 					Some((request, _)) if !more_frames => {
 						// No body to wait for.
 						dispatch(key, stream_id, request, None, jobs, park_cap);
@@ -1506,6 +1552,7 @@ fn flush(socket: &mio::net::UdpSocket, out: &mut [u8], clients: &mut ClientMap) 
 /// what keeps an upload out of chunked encoding.
 fn build_request(
 	sni: Option<&str>,
+	peer: SocketAddr,
 	list: &[quiche::h3::Header],
 ) -> Option<(ProxyRequest, Option<u64>)> {
 	let mut method = None;
@@ -1553,6 +1600,7 @@ fn build_request(
 			url,
 			headers,
 			body: Vec::new(),
+			peer: Some(peer),
 		},
 		length,
 	))
@@ -1742,6 +1790,27 @@ mod tests {
 		assert!(HELP.contains("SECURITY.md"));
 	}
 
+	fn a_client() -> SocketAddr {
+		"192.0.2.10:51000".parse().unwrap()
+	}
+
+	#[test]
+	fn a_request_carries_the_address_it_arrived_from() {
+		let list = vec![
+			quiche::h3::Header::new(b":method", b"GET"),
+			quiche::h3::Header::new(b":scheme", b"https"),
+			quiche::h3::Header::new(b":authority", b"example.com"),
+			quiche::h3::Header::new(b":path", b"/"),
+			// A header naming somebody else, which must not be what is
+			// believed: this decides what that page is served.
+			quiche::h3::Header::new(b"x-forwarded-for", b"203.0.113.9"),
+		];
+
+		let (req, _) = build_request(None, a_client(), &list).expect("should parse");
+
+		assert_eq!(req.peer, Some(a_client()));
+	}
+
 	#[test]
 	fn build_request_from_pseudo_headers() {
 		let list = vec![
@@ -1754,7 +1823,7 @@ mod tests {
 			quiche::h3::Header::new(b"connection", b"keep-alive"),
 		];
 
-		let (req, length) = build_request(None, &list).expect("should parse");
+		let (req, length) = build_request(None, a_client(), &list).expect("should parse");
 
 		assert_eq!(length, None, "a GET declares no body length");
 		assert_eq!(req.method, "GET");
@@ -1879,12 +1948,13 @@ mod tests {
 			quiche::h3::Header::new(b":path", b"/account"),
 		];
 
-		let (req, _) = build_request(Some("innocent.example"), &list).expect("should parse");
+		let (req, _) =
+			build_request(Some("innocent.example"), a_client(), &list).expect("should parse");
 		assert_eq!(req.url, "https://innocent.example/account");
 
 		// And with no SNI at all — which no browser does, but a hand-written
 		// client can — the authority is all there is.
-		let (req, _) = build_request(None, &list).expect("should parse");
+		let (req, _) = build_request(None, a_client(), &list).expect("should parse");
 		assert_eq!(req.url, "https://secure.bank.example/account");
 	}
 
@@ -1892,6 +1962,6 @@ mod tests {
 	fn build_request_needs_authority_and_path() {
 		let list = vec![quiche::h3::Header::new(b":method", b"GET")];
 
-		assert!(build_request(None, &list).is_none());
+		assert!(build_request(None, a_client(), &list).is_none());
 	}
 }

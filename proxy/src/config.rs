@@ -30,6 +30,7 @@ pub struct Config {
 	pub blocklist: Blocklist,
 	pub log: Log,
 	pub images: Images,
+	pub link: Link,
 	pub upstream: Upstream,
 	pub passthrough: Passthrough,
 	pub cosmetic: Cosmetic,
@@ -151,6 +152,44 @@ impl Default for Images {
 			cache_mb: 512,
 			origin_cache_mb: 256,
 			max_cacheable_mb: 8,
+		}
+	}
+}
+
+/// Measuring how fast each client is, and turning that into a tier.
+///
+/// The floors are the ladder: a client is served the best tier whose floor its
+/// measured speed still clears. They are clamped into descending order at
+/// startup, so a file that names them out of order still yields a ladder.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Link {
+	pub enabled: bool,
+	pub full_kbps: u32,
+	pub reduced_kbps: u32,
+	pub grey_kbps: u32,
+	pub placeholder_kbps: u32,
+	/// How long a measurement stands for. Long enough that a phone is not
+	/// re-measured on every page, short enough that an address which has moved
+	/// to another network is not judged by the old one.
+	pub ttl_minutes: u32,
+	/// The most clients to remember at once. Keyed by peer address, so on a
+	/// proxy that runs for months this is the difference between a cache and a
+	/// leak.
+	pub max_clients: usize,
+}
+
+impl Default for Link {
+	fn default() -> Self {
+		Self {
+			enabled: true,
+			// Roughly: better than DSL, DSL, 3G, 2G, and worse.
+			full_kbps: 2_000,
+			reduced_kbps: 700,
+			grey_kbps: 250,
+			placeholder_kbps: 80,
+			ttl_minutes: 10,
+			max_clients: 1024,
 		}
 	}
 }

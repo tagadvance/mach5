@@ -229,6 +229,36 @@ fn an_unknown_endpoint_or_method_is_refused() {
 /// `/.mach5/hidden` is the one endpoint here that does. The harness caps that
 /// at a megabyte, so this is the cap doing its job rather than a limit on what
 /// can be uploaded at all.
+/// The link estimate has to be reportable from the device being measured —
+/// that is the only place it can be checked against a real network — so both
+/// the page and the JSON have to carry it.
+///
+/// Nothing is measured here and that is the assertion: a loopback client never
+/// makes the proxy wait, so no sample is invented for it. What this pins down
+/// is the shape — the counters stayed flat, the row is on the page, and an
+/// unmeasured client is reported as unmeasured rather than as a fast one.
+#[test]
+fn the_link_estimate_is_reported_to_the_client_being_measured() {
+	let proxy = Proxy::start(BLOCKLIST);
+
+	let page = proxy.get("example.com", "/.mach5/");
+	assert_eq!(page.status, 200);
+	let page = String::from_utf8_lossy(&page.body);
+	assert!(page.contains("This client&rsquo;s link"), "{page}");
+	assert!(page.contains("not measured yet"), "{page}");
+
+	let stats = proxy.get("example.com", "/.mach5/stats.json");
+	assert_eq!(stats.status, 200);
+	let stats = String::from_utf8_lossy(&stats.body);
+	assert!(stats.contains("\"link_clients\""), "{stats}");
+	assert!(
+		!stats.contains("\"link_tier\""),
+		"an unmeasured client must be absent rather than guessed at: {stats}"
+	);
+	// The counters are still there and still flat beside it.
+	assert!(stats.contains("\"requests\""), "{stats}");
+}
+
 #[test]
 fn a_body_something_wants_to_read_is_capped() {
 	let proxy = Proxy::start(BLOCKLIST);

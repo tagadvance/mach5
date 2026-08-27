@@ -11,6 +11,11 @@ pub struct ProxyRequest {
 	pub url: String,
 	pub headers: Vec<(String, String)>,
 	pub body: Vec<u8>,
+	/// Where the client is, as the socket saw it — never anything the request
+	/// could name. It is here rather than in a header because a header is
+	/// something a page can write, and this decides what that page is served.
+	/// `None` in tests, and wherever a request was not built from a connection.
+	pub peer: Option<std::net::SocketAddr>,
 }
 
 /// A response coming back from upstream.
@@ -402,6 +407,7 @@ mod tests {
 			url: "https://example.com/".to_string(),
 			headers: Vec::new(),
 			body: Vec::new(),
+			peer: None,
 		}
 	}
 
@@ -420,6 +426,7 @@ mod tests {
 			url: "https://example.com/".to_string(),
 			headers: Vec::new(),
 			body: Vec::new(),
+			peer: None,
 		};
 		let mut resp = response();
 

@@ -587,6 +587,7 @@ mod tests {
 			url: "https://example.com/logo.png".to_string(),
 			headers: headers(pairs),
 			body: Vec::new(),
+			peer: None,
 		}
 	}
 

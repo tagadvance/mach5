@@ -821,6 +821,7 @@ mod tests {
 			url: "https://example.com/".to_string(),
 			headers: Vec::new(),
 			body: Vec::new(),
+			peer: None,
 		};
 		assert!(chain.on_request(&mut req).is_none());
 		assert_eq!(req.url, "https://example.com/");
@@ -892,6 +893,7 @@ mod tests {
 			url: "https://example.com/".to_string(),
 			headers: Vec::new(),
 			body: Vec::new(),
+			peer: None,
 		}
 	}
 

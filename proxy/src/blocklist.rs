@@ -187,6 +187,7 @@ impl Blocklist {
 			url: format!("https://{host}/"),
 			headers: Vec::new(),
 			body: Vec::new(),
+			peer: None,
 		};
 
 		self.blocks_request(&plain, host)
@@ -630,6 +631,7 @@ mod tests {
 			url: url.to_string(),
 			headers: vec![("accept".to_string(), accept.to_string())],
 			body: Vec::new(),
+			peer: None,
 		}
 	}
 

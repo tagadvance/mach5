@@ -295,6 +295,56 @@ origin_cache_mb = 256
 # streams past uncached.
 max_cacheable_mb = 8
 
+[link]
+# How fast the client is, and what that is allowed to mean.
+#
+# mach5 sits between two links and only one of them is worth reacting to. A CDN
+# having a bad minute is not a reason to serve you grey boxes; your phone having
+# one bar is. So both measurements here are ones only a client can cause: over
+# QUIC it is the congestion controller's own delivery rate, derived from what
+# the client acknowledged, and over TCP it is time mach5 spent parked waiting
+# for the client to drain a response it had already fetched. Neither can be
+# produced by a slow origin.
+#
+# What comes out is a tier — full quality, reduced quality, greyscale, a
+# dimension-preserving placeholder, nothing — shown on `/.mach5/` for whichever
+# client is reading it, which is how you check this from a phone on a real
+# network. Nothing consumes the tier yet: it is measured and reported, and what
+# it does to an image is a separate decision that has not been made here.
+#
+# Off means every client is assumed fast and nothing is stored.
+enabled = true
+
+# The ladder, in kilobits per second. A client is served the best tier whose
+# floor its measured speed still clears; below the last floor it is served
+# nothing. Roughly: better than DSL, DSL, 3G, 2G, and worse.
+#
+# They are clamped into descending order at startup, so naming them out of order
+# gives you an odd ladder rather than a proxy that will not start.
+#
+# A tier is sticky, and moving back up needs more evidence than moving down: a
+# page half in colour and half in grey looks broken, so a link that has only
+# just crossed a floor is not yet treated as being on the other side of it.
+full_kbps = 2000
+reduced_kbps = 700
+grey_kbps = 250
+placeholder_kbps = 80
+
+# How long a measurement stands for. Long enough that a phone is not
+# re-measured on every page; short enough that an address which has moved to
+# another network is not judged by the old one. A client with no measurement is
+# assumed fast — the first thing a connection carries is a document rather than
+# an image, and carrying it is itself a measurement, so the guess is wrong for
+# about one document.
+ttl_minutes = 10
+
+# The most clients to remember at once. Keyed by peer address, so on a proxy
+# that runs for months this is the difference between a cache and a leak. The
+# key is the address and nothing else: it is wrong for a NAT'd household and
+# wrong for a phone that moves, and it is wrong cheaply — the cost of confusing
+# two clients is that one gets pictures chosen for the other.
+max_clients = 1024
+
 [passthrough]
 # Hosts mach5 must never decrypt.
 #

@@ -39,6 +39,10 @@ use crate::upstream;
 
 const STREAM_CHUNK_SIZE: usize = 64 * 1024;
 
+/// How often a running download reports what the client is managing, so a long
+/// one moves the estimate rather than only confirming it at the end.
+const LINK_SAMPLE_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
 /// A fixed set of interceptor chains, borrowed for the duration of a request.
@@ -106,6 +110,7 @@ struct Shared {
 	learned: Arc<crate::passthrough::Learned>,
 	pool: ChainPool,
 	agents: upstream::Agents,
+	links: Arc<crate::link::Links>,
 }
 
 /// Start the listener. Returns once its runtime thread is spawned.
@@ -118,6 +123,7 @@ pub fn spawn(config: Arc<Config>, ca: Arc<CertAuthority>) -> std::io::Result<()>
 		learned: crate::passthrough::learned(&config),
 		pool: ChainPool::new(config.worker_threads(), &config, &ca),
 		agents: upstream::agents(&config),
+		links: crate::link::shared(&config),
 		config,
 	});
 
@@ -157,7 +163,7 @@ pub fn spawn(config: Arc<Config>, ca: Arc<CertAuthority>) -> std::io::Result<()>
 				let acceptor = acceptor.clone();
 				let shared = shared.clone();
 				tokio::spawn(async move {
-					if let Err(e) = serve(acceptor, shared, stream).await {
+					if let Err(e) = serve(acceptor, shared, stream, peer).await {
 						log::debug!("tcp connection from {peer} ended: {e}");
 					}
 				});
@@ -202,6 +208,7 @@ async fn serve(
 	acceptor: Arc<SslAcceptor>,
 	shared: Arc<Shared>,
 	mut stream: tokio::net::TcpStream,
+	peer: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 	stream.set_nodelay(true)?;
 
@@ -241,7 +248,7 @@ async fn serve(
 		let shared = shared.clone();
 		let sni = sni.clone();
 
-		async move { Ok::<_, Infallible>(handle(shared, sni, req).await) }
+		async move { Ok::<_, Infallible>(handle(shared, sni, peer, req).await) }
 	});
 
 	// Auto-negotiates h2 or h1.1 from the connection preface, and handles
@@ -260,8 +267,13 @@ async fn serve(
 	Ok(())
 }
 
-async fn handle(shared: Arc<Shared>, sni: Option<String>, req: Request<Incoming>) -> Response<BoxBody> {
-	let (request, incoming, length) = match to_proxy_request(sni, req) {
+async fn handle(
+	shared: Arc<Shared>,
+	sni: Option<String>,
+	peer: std::net::SocketAddr,
+	req: Request<Incoming>,
+) -> Response<BoxBody> {
+	let (request, incoming, length) = match to_proxy_request(sni, peer, req) {
 		Ok(parts) => parts,
 		Err(status) => return simple(status, "mach5: malformed request\n"),
 	};
@@ -546,6 +558,26 @@ fn fetch_blocking(
 	// Relay the body. `blocking_send` is the backpressure: it parks this thread
 	// when the client is not draining fast enough, rather than queueing without
 	// bound.
+	//
+	// How full that channel is, is also the only honest measurement of the
+	// client link this front end can take.
+	//
+	// Timing the park itself is the obvious thing and is nearly dead: with
+	// `stream_buffer_mb = 32` at 64 KiB a chunk the channel holds 512 of them,
+	// so `blocking_send` does not park until 32 MB is outstanding on one
+	// response and nothing short of a video ever gets there.
+	//
+	// Occupancy says the same thing far sooner. If the client has not emptied
+	// the channel, the client is the slower half and the rate it drains at is
+	// its link speed. A window in which the channel ever fell empty is thrown
+	// away, because then the *origin* was the slower half and the number would
+	// be about some CDN — and degrading somebody's pictures because a CDN had a
+	// bad minute is worse than never degrading them at all. That discard is
+	// what keeps this a measurement of the client and not of the origin.
+	//
+	// Deliberately not `reader.read`, which is the other obvious thing to time
+	// and measures the origin outright.
+	let mut window = Drain::default();
 	let mut buf = vec![0u8; STREAM_CHUNK_SIZE];
 	loop {
 		let read = match reader.read(&mut buf) {
@@ -581,9 +613,19 @@ fn fetch_blocking(
 
 		metrics.bytes_to_client.add(chunk.len() as u64);
 
+		let carried = chunk.len() as u64;
+		let backlog = body_tx.max_capacity() - body_tx.capacity();
 		if body_tx.blocking_send(Ok(Frame::data(Bytes::from(chunk)))).is_err() {
 			// Client went away.
 			break;
+		}
+
+		let now = std::time::Instant::now();
+		window.push(carried, backlog, now);
+
+		if let Some(kbps) = window.rate(body_tx.max_capacity() - body_tx.capacity(), now) {
+			record_link(shared, &request, kbps);
+			window = Drain::default();
 		}
 	}
 
@@ -618,6 +660,7 @@ fn fetch_blocking(
 /// held in memory at all is the worker's decision, and this is the async side.
 fn to_proxy_request(
 	sni: Option<String>,
+	peer: std::net::SocketAddr,
 	req: Request<Incoming>,
 ) -> Result<(ProxyRequest, Incoming, Option<u64>), u16> {
 	let (parts, body) = req.into_parts();
@@ -665,10 +708,75 @@ fn to_proxy_request(
 			url: format!("https://{}{path}", crate::authority_host(&authority)),
 			headers,
 			body: Vec::new(),
+			peer: Some(peer),
 		},
 		body,
 		length,
 	))
+}
+
+/// One window of "how fast is the client taking this off us".
+///
+/// Held open only while the send channel stays backed up. The moment it is
+/// found empty the client has caught up with the origin, the origin is the
+/// slower half, and the window is abandoned rather than reported — a rate
+/// measured then would be the origin's.
+#[derive(Default)]
+struct Drain {
+	started: Option<std::time::Instant>,
+	pushed: u64,
+	chunks: u64,
+	backlog_at_start: usize,
+}
+
+impl Drain {
+	/// `backlog` is what was still queued *before* this chunk was handed over.
+	fn push(&mut self, bytes: u64, backlog: usize, now: std::time::Instant) {
+		if backlog == 0 {
+			// The client had taken everything already. Nothing about this
+			// window is about the client's speed.
+			*self = Self::default();
+
+			return;
+		}
+
+		if self.started.is_none() {
+			self.started = Some(now);
+			self.backlog_at_start = backlog;
+		}
+
+		self.pushed += bytes;
+		self.chunks += 1;
+	}
+
+	/// What the client drained over the window, as a rate — or `None` while
+	/// there is not yet enough to divide by.
+	fn rate(&self, backlog_now: usize, now: std::time::Instant) -> Option<u32> {
+		let started = self.started?;
+		let elapsed = now.saturating_duration_since(started);
+		if elapsed < LINK_SAMPLE_EVERY || self.chunks == 0 {
+			return None;
+		}
+
+		// Bytes we pushed, adjusted by how the queue moved: a queue that grew
+		// means the client took less than we handed over, and one that shrank
+		// means it took more. Chunk sizes vary once a rewriter has been through
+		// them, so the queue is converted at this window's own mean.
+		let mean = (self.pushed / self.chunks) as i64;
+		let queued = (backlog_now as i64 - self.backlog_at_start as i64) * mean;
+		let drained = (self.pushed as i64 - queued).max(0) as u64;
+
+		crate::link::from_drain(drained, elapsed)
+	}
+}
+
+/// File one client-link measurement against the address it came from.
+fn record_link(shared: &Shared, request: &ProxyRequest, kbps: u32) {
+	if let Some(peer) = request.peer {
+		// The port is dropped: the same phone reaches mach5 over TCP and over
+		// QUIC on different ports, and it is one link either way.
+		shared.links.record(peer.ip(), kbps);
+	}
 }
 
 fn build_response(response: ProxyResponse) -> Response<BoxBody> {
@@ -898,4 +1006,95 @@ fn simple(status: u16, message: &str) -> Response<BoxBody> {
 			message.as_bytes().to_vec(),
 		))))
 		.expect("static response is well formed")
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::time::{Duration, Instant};
+
+	/// The gate that keeps this a measurement of the client rather than of the
+	/// origin, in the one place it can be tested without a real slow socket.
+	#[test]
+	fn a_channel_the_client_keeps_empty_never_produces_a_sample() {
+		let start = Instant::now();
+		let mut window = Drain::default();
+
+		// The origin trickling in: every chunk finds the queue already empty,
+		// because the client took the last one before the next arrived.
+		for tick in 0..50 {
+			window.push(64 * 1024, 0, start + Duration::from_millis(tick * 100));
+		}
+
+		assert_eq!(
+			window.rate(0, start + Duration::from_secs(5)),
+			None,
+			"an origin-limited stream must not be reported as a slow client"
+		);
+	}
+
+	#[test]
+	fn a_client_that_falls_behind_is_measured() {
+		let start = Instant::now();
+		let mut window = Drain::default();
+
+		// Ten 64KiB chunks handed over while the queue never empties.
+		for tick in 0..10 {
+			window.push(64 * 1024, 4, start + Duration::from_millis(tick * 50));
+		}
+
+		// The queue is where it started, so the client took all 640KiB, over
+		// half a second: 640 * 1024 * 8 / 500 ms.
+		assert_eq!(window.rate(4, start + Duration::from_millis(500)), Some(10485));
+	}
+
+	#[test]
+	fn a_queue_that_grew_means_the_client_took_less_than_we_pushed() {
+		let start = Instant::now();
+		let mut window = Drain::default();
+		for tick in 0..10 {
+			window.push(64 * 1024, 2, start + Duration::from_millis(tick * 50));
+		}
+
+		let level = window.rate(2, start + Duration::from_millis(500)).unwrap();
+		let grown = window.rate(7, start + Duration::from_millis(500)).unwrap();
+		let shrunk = window.rate(1, start + Duration::from_millis(500)).unwrap();
+
+		assert!(grown < level, "a growing queue means a slower client: {grown} vs {level}");
+		assert!(shrunk > level, "a shrinking one means a faster client: {shrunk} vs {level}");
+	}
+
+	#[test]
+	fn a_window_is_not_reported_before_it_is_worth_dividing() {
+		let start = Instant::now();
+		let mut window = Drain::default();
+		window.push(64 * 1024, 3, start);
+
+		assert_eq!(
+			window.rate(3, start + Duration::from_millis(499)),
+			None,
+			"below the reporting interval"
+		);
+		assert!(window.rate(3, start + Duration::from_millis(500)).is_some());
+	}
+
+	/// A client that catches up mid-window discards everything before it, so a
+	/// window can never span the moment the origin became the slower half.
+	#[test]
+	fn catching_up_abandons_the_window() {
+		let start = Instant::now();
+		let mut window = Drain::default();
+
+		for tick in 0..10 {
+			window.push(64 * 1024, 5, start + Duration::from_millis(tick * 50));
+		}
+		assert!(window.rate(5, start + Duration::from_millis(500)).is_some());
+
+		window.push(64 * 1024, 0, start + Duration::from_millis(500));
+		assert_eq!(
+			window.rate(5, start + Duration::from_secs(2)),
+			None,
+			"the window restarted, so there is nothing to report yet"
+		);
+	}
 }

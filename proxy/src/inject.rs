@@ -522,6 +522,7 @@ mod tests {
 			url: url.to_string(),
 			headers: Vec::new(),
 			body: Vec::new(),
+			peer: None,
 		}
 	}
 

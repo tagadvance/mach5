@@ -386,6 +386,7 @@ mod tests {
 			url: "https://example.com/photo.jpg".to_string(),
 			headers: headers(&[("accept", accept)]),
 			body: Vec::new(),
+			peer: None,
 		}
 	}
 
@@ -647,6 +648,7 @@ mod tests {
 			url: "https://example.com/photo.jpg".to_string(),
 			headers: headers(pairs),
 			body: Vec::new(),
+			peer: None,
 		}
 	}
 

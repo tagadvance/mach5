@@ -213,6 +213,17 @@ impl Default for Link {
 #[serde(deny_unknown_fields, default)]
 pub struct Passthrough {
 	pub hosts: Vec<String>,
+	/// Lists of hosts to fetch rather than write out by hand, in the same
+	/// formats the blocklist reads. Each is cached under `cache_dir`, so a
+	/// restart without a network still comes up with yesterday's copy.
+	///
+	/// A fetched entry behaves exactly as one written in `hosts` — it covers
+	/// its subdomains — but it is held separately, so nothing a list does can
+	/// remove a host somebody wrote down here.
+	pub urls: Vec<String>,
+	/// How often to re-fetch the URLs. Zero switches refreshing off, which
+	/// leaves every fetched list as stale as the last restart.
+	pub refresh_hours: u32,
 	/// Stop decrypting a host after its origin answers with a bot challenge.
 	///
 	/// mach5 is what causes those: the origin sees its TLS handshake and
@@ -235,6 +246,8 @@ impl Default for Passthrough {
 	fn default() -> Self {
 		Self {
 			hosts: Vec::new(),
+			urls: Vec::new(),
+			refresh_hours: 24,
 			learn_from_challenges: true,
 			port: 443,
 		}

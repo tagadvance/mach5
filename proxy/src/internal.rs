@@ -904,9 +904,14 @@ enum Decryption {
 	On,
 	/// Learned from a bot challenge, or asked for here. Reversible from here.
 	LearnedOff,
-	/// From `[passthrough] hosts`. Deliberately not reversible from a web page:
-	/// somebody wrote that host down, and no page should be able to make mach5
-	/// start reading it.
+	/// From the configured passthrough list — either `hosts`, written down, or
+	/// `urls`, fetched. Deliberately not reversible from a web page: somebody
+	/// chose that list, and no page should be able to make mach5 start reading
+	/// a host on it.
+	///
+	/// The two are not told apart here. They could be, but the answer a person
+	/// wants from this row is "is this being read, and can I change that", and
+	/// that answer is the same for both.
 	ConfiguredOff,
 }
 
@@ -1007,7 +1012,8 @@ fn status_page(page: Page) -> String {
 		)
 		.to_string(),
 		Decryption::ConfiguredOff => concat!(
-			r#"<td>not decrypted <span class="note">· from [passthrough] hosts, so not "#,
+			r#"<td>not decrypted <span class="note">· from the configured passthrough list, "#,
+			r#"so not "#,
 			r#"changeable from here</span></td>"#
 		)
 		.to_string(),

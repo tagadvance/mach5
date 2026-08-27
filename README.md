@@ -28,6 +28,8 @@ Three rules, and none of them is optional:
   work. Listed hosts are never decrypted: mach5 reads the name out of the
   ClientHello without answering it and splices the two sockets, so it holds no
   key and sees no plaintext, and your client checks the real certificate itself.
+  `[passthrough] urls` takes lists to fetch and keep up to date, so the list
+  need not be only what you thought to type.
 
 [`SECURITY.md`](SECURITY.md) has the full threat model, what mach5 does and does
 not defend against, and where to send a finding.
@@ -103,6 +105,12 @@ hosts = [
   "your-bank.example",
 ]
 ```
+
+`urls` takes lists to fetch instead, cached on disk and refreshed on a schedule
+like the blocklist's. A fetched entry covers its subdomains exactly as one typed
+here does, and it is kept apart from what you wrote: a list that fails to
+download, or comes back as an error page, leaves the hosts it gave you last time
+exempt rather than quietly starting to decrypt them.
 
 What you give up on those hosts is blocking, cosmetic filtering, the picker and
 compression. On sites like these that is close to nothing: they are already

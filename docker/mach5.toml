@@ -390,9 +390,37 @@ max_clients = 1024
 # on purpose, so it falls back to TCP where passthrough works.
 # hosts = ["example-bank.com", "myhealthprovider.example"]
 
-# Where a passed-through connection is carried to. 443 unless mach5 is
-# listening somewhere unusual; a transparent deployment cannot recover a
-# nonstandard port without SO_ORIGINAL_DST.
+# Lists of hosts to fetch rather than write out by hand, in the same formats the
+# blocklist reads: one host per line, hosts-file lines, `#` comments, blanks.
+# urls = ["https://example.org/never-decrypt.txt"]
+#
+# A fetched entry behaves exactly as one written above — it covers its
+# subdomains — but it is held separately from `hosts`, so nothing a list does,
+# or fails to do, can drop a host you wrote down yourself.
+#
+# This list is a security boundary and it fails in one direction only: a host
+# wrongly on it keeps its own TLS and loses mach5's blocking and compression,
+# while a host wrongly off it is decrypted. So every way a refresh can go wrong
+# leaves the hosts a list gave us last time exactly as they were — a fetch that
+# fails, a list that arrives as an error page, a list too long to be one. Only a
+# list that parsed to at least one usable host ever replaces anything.
+#
+# Each list is cached under cache_dir as passthrough/<hash-of-url>.txt, so a
+# restart with no network still comes up with the same hosts exempt. The origin
+# certificate is validated, as it is for everything mach5 fetches: a file that
+# decides what is not decrypted is not one to take from whoever is on the wire.
+#
+# Entries that would exempt far more than a site are refused and counted in the
+# log — a public suffix such as `co.uk`, a name that is not a name, and any list
+# naming more than 10000 hosts, which is a blocklist pointed at the wrong
+# setting rather than a list of what to leave alone. Point this at a list you
+# would have been willing to paste into `hosts` yourself.
+
+# How often the URLs are re-fetched, on one background thread; the proxy never
+# waits on it, at startup or afterwards. 0 switches refreshing off: the lists
+# are then whatever they were when the proxy last started.
+refresh_hours = 24
+
 # Stop decrypting a host after its origin answers with a bot challenge.
 #
 # mach5 is what causes those. The origin sees mach5's TLS handshake and
@@ -410,6 +438,9 @@ max_clients = 1024
 # can reach touches `hosts`.
 learn_from_challenges = true
 
+# Where a passed-through connection is carried to. 443 unless mach5 is
+# listening somewhere unusual; a transparent deployment cannot recover a
+# nonstandard port without SO_ORIGINAL_DST.
 port = 443
 
 [log]

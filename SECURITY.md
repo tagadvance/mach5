@@ -66,6 +66,10 @@ What mach5 does **not** defend against:
   ClientHello without answering it and splices the two sockets, so it holds no
   key and sees no plaintext, and your client validates the real certificate
   itself. This is also the only way apps that pin their certificates will work.
+  `[passthrough] urls` takes lists of such hosts to fetch and refresh, so the
+  boundary can be a maintained list rather than whatever you typed once; a list
+  that fails to fetch or arrives unreadable keeps the hosts it last gave you,
+  never fewer.
 - **Know what the log holds.** By default it records scheme, host and path — not
   the query string, where reset tokens and OAuth codes live. `[log] urls = "host"`
   drops the path too. Plugin output goes to the same log and mach5 cannot police

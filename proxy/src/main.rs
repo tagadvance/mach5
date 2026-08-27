@@ -331,6 +331,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 	// here.
 	blocklist::spawn_refresh(config.clone());
 	cosmetic::spawn_refresh(config.clone());
+	passthrough::spawn_refresh(config.clone());
 
 	let ca = Arc::new(CertAuthority::from_config(&config)?);
 	tcp::spawn(config.clone(), ca.clone())?;

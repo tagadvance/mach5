@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
@@ -36,6 +36,28 @@ pub const PEEK_BYTES: usize = 4096;
 /// the challenge stopped. A week is long enough to be useful on a trip and
 /// short enough that a site which fixed itself comes back.
 const LEARNED_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Where fetched lists are kept, under the configured cache directory.
+const CACHE: crate::fetch::Cache = crate::fetch::Cache::new("passthrough", "passthrough list");
+
+/// Ceiling on how many hosts one fetched list may contribute.
+///
+/// A list of the hosts not to decrypt is a curated thing — a few banks, a
+/// health provider, the handful of sites that fingerprint hard — and even a
+/// thorough one is hundreds of names. A file with tens of thousands in it is
+/// not that: it is a hosts *blocklist* pointed at the wrong setting, or a list
+/// gone hostile, and either way honouring it would switch mach5 off for most of
+/// the web without saying so. A list over the ceiling is refused whole rather
+/// than truncated: half of a security list, chosen by whatever order the lines
+/// happened to be in, is worse than none of it.
+const MAX_HOSTS: usize = 10_000;
+
+/// Labels a country-code registry sells names under, so `co.uk` and `com.au`
+/// are the registry's own name and not a site.
+const REGISTRY_LABELS: [&str; 18] = [
+	"ac", "co", "com", "edu", "gen", "go", "gov", "govt", "id", "in", "ltd", "mil", "ne", "net",
+	"nom", "or", "org", "sch",
+];
 
 const HANDSHAKE: u8 = 0x16;
 /// Content type, legacy version, and the two-byte record length.
@@ -246,13 +268,14 @@ pub fn is_a_challenge(status: u16, headers: &[(String, String)]) -> bool {
 		})
 }
 
-/// Whether this name must not be decrypted, for either reason.
+/// Whether this name must not be decrypted, for any of the three reasons.
 ///
-/// The two lists are checked separately and differently on purpose. A
+/// The lists are checked separately and matched differently on purpose. A
 /// configured entry covers its subdomains, because that is what somebody
-/// writing down a bank means. A learned one is exact: a challenge on one host
-/// says nothing about its siblings, and widening it automatically would stop
-/// decrypting far more than was ever observed.
+/// writing down a bank means, and a fetched one is the same statement from a
+/// file so it is matched the same way. A learned one is exact: a challenge on
+/// one host says nothing about its siblings, and widening it automatically
+/// would stop decrypting far more than was ever observed.
 pub fn never_decrypt(configured: &Passthrough, learned: &Learned, host: &str) -> bool {
 	configured.covers(host) || learned.holds(host)
 }
@@ -279,8 +302,26 @@ fn normalize_host(host: &str) -> Option<String> {
 }
 
 /// The hosts never to decrypt.
+///
+/// Two sets, not one, and the split is the same kind of boundary [`Learned`]
+/// draws. `hosts` is what somebody wrote in the configuration file and is
+/// built once and never touched again. `fetched` is what the lists in
+/// `[passthrough] urls` most recently said, and a refresh replaces it every
+/// few hours. Keeping them apart makes "nothing a fetched list does can drop a
+/// host somebody wrote down" true by construction rather than by care: the
+/// refresh has no way to reach `hosts` at all.
+///
+/// For *matching* the two are the same thing — a fetched entry covers its
+/// subdomains exactly as a configured one does, because it is the same kind of
+/// statement, only from a file. That is the difference from `Learned`, which is
+/// exact and expires.
 pub struct Passthrough {
 	hosts: HashSet<String>,
+	/// Swapped whole by a refresh. The `Arc` is cloned out and the lock dropped
+	/// before anything is matched against it, as the blocklist registry does:
+	/// matching walks a host's parents, and holding a read lock across that
+	/// would put the refresh's write lock behind every connection in flight.
+	fetched: RwLock<Arc<HashSet<String>>>,
 	port: u16,
 }
 
@@ -312,10 +353,30 @@ impl Passthrough {
 			})
 			.collect();
 
+		// Only what is already on disk is read here — the last copy of each
+		// URL. Startup must not wait on somebody else's web server, and a
+		// restart with no network still has to come up with the same hosts
+		// exempt as before it.
+		let fetched: HashSet<String> = cached(config).into_iter().flatten().collect();
+
+		if !config.passthrough.urls.is_empty() {
+			report(fetched.len(), config.passthrough.urls.len());
+		}
+
 		Self {
 			hosts,
+			fetched: RwLock::new(Arc::new(fetched)),
 			port: config.passthrough.port,
 		}
+	}
+
+	/// The fetched set to match against right now.
+	fn fetched(&self) -> Arc<HashSet<String>> {
+		Arc::clone(&self.fetched.read().expect("passthrough fetched lock"))
+	}
+
+	fn replace_fetched(&self, hosts: HashSet<String>) {
+		*self.fetched.write().expect("passthrough fetched lock") = Arc::new(hosts);
 	}
 
 	/// Where a passed-through connection is carried to.
@@ -330,10 +391,15 @@ impl Passthrough {
 	/// undecrypted is what anyone writing that line meant.
 	pub fn covers(&self, host: &str) -> bool {
 		crate::blocklist::covers(&self.hosts, host)
+			|| crate::blocklist::covers(&self.fetched(), host)
 	}
 
+	/// Whether anything at all is listed, so the front ends can skip the
+	/// ClientHello peek. A fetched list counts: leaving it out here would have
+	/// every host on it decrypted despite `covers` saying otherwise, which is
+	/// exactly the silent failure this module exists to avoid.
 	pub fn is_empty(&self) -> bool {
-		self.hosts.is_empty()
+		self.hosts.is_empty() && self.fetched().is_empty()
 	}
 }
 
@@ -343,6 +409,245 @@ pub fn shared(config: &Config) -> Arc<Passthrough> {
 	SHARED
 		.get_or_init(|| Arc::new(Passthrough::new(config)))
 		.clone()
+}
+
+/// How often to re-fetch the lists, or `None` when there is nothing to fetch.
+///
+/// Zero hours switches refreshing off deliberately, as it does for the
+/// blocklist: the lists are then whatever they were when the proxy last
+/// started.
+pub fn refresh_interval(config: &Config) -> Option<Duration> {
+	let hours = config.passthrough.refresh_hours;
+
+	(!config.passthrough.urls.is_empty() && hours > 0)
+		.then(|| Duration::from_secs(hours as u64 * 3600))
+}
+
+/// Start the background refresh, and say whether it started.
+///
+/// One thread for the process, like the blocklist's. Returns immediately; the
+/// first fetch happens on the new thread, so nothing here waits on the network.
+pub fn spawn_refresh(config: Arc<Config>) -> bool {
+	let Some(interval) = refresh_interval(&config) else {
+		return false;
+	};
+
+	let list = shared(&config);
+
+	std::thread::spawn(move || {
+		let agent = crate::fetch::agent(&config);
+		// What each URL last gave us, seeded from the copies on disk that
+		// `Passthrough::new` has already matched against. The refresh carries
+		// it forward rather than rebuilding it from nothing, because it is the
+		// only record of which list contributed which hosts — and that is what
+		// a list coming back unreadable has to fall back to.
+		let mut held = cached(&config);
+
+		loop {
+			refresh(&list, &config, &agent, &mut held);
+			std::thread::sleep(interval);
+		}
+	});
+
+	true
+}
+
+/// Re-fetch every list and swap the union in.
+fn refresh(list: &Passthrough, config: &Config, agent: &ureq::Agent, held: &mut [HashSet<String>]) {
+	for (url, held) in config.passthrough.urls.iter().zip(held.iter_mut()) {
+		// One URL at a time, because `fetched` drops a URL it could not get
+		// anything for and a batched call would not say which one that was.
+		// Losing which list a host came from loses the ability to keep it.
+		let text = CACHE.fetched(config, agent, std::slice::from_ref(url)).pop();
+
+		update(held, text.as_deref(), url);
+	}
+
+	let hosts: HashSet<String> = held.iter().flatten().cloned().collect();
+	let changed = hosts != *list.fetched();
+
+	if changed {
+		report(hosts.len(), config.passthrough.urls.len());
+	}
+
+	list.replace_fetched(hosts);
+}
+
+/// What one list contributes, given whatever it gave us this time.
+///
+/// This is where the list fails in one direction only. A host wrongly on it is
+/// a site that keeps its own TLS and loses mach5's blocking and compression; a
+/// host wrongly off it is a bank being decrypted. So every way this can go
+/// wrong — nothing fetched and nothing cached, a body that is an error page
+/// rather than a list, a list over the ceiling — leaves what this URL gave us
+/// last time exactly as it was. The only thing that replaces a contribution is
+/// a list that parsed to at least one usable host.
+fn update(held: &mut HashSet<String>, text: Option<&str>, url: &str) {
+	let Some(text) = text else {
+		// The fetch failed and nothing is cached for it either; `fetch` has
+		// already warned. Whatever this URL gave us before stands.
+		return;
+	};
+
+	let hosts = parse(text, url);
+	if hosts.is_empty() {
+		log::warn!(
+			"[passthrough] {url} gave us no host we can use — keeping the {} it gave us \
+			 last time rather than starting to decrypt them",
+			held.len()
+		);
+
+		return;
+	}
+
+	*held = hosts;
+}
+
+/// What each URL last gave us, parsed, one entry per configured URL.
+///
+/// Per URL rather than merged, and read here rather than through
+/// [`crate::fetch::Cache::cached`], because that drops the URLs it could not
+/// read — and a refresh has to be able to say *which* list a host came from to
+/// be able to keep it when that list next comes back broken.
+fn cached(config: &Config) -> Vec<HashSet<String>> {
+	config
+		.passthrough
+		.urls
+		.iter()
+		.map(|url| match std::fs::read_to_string(CACHE.path(config, url)) {
+			Ok(text) => parse(&text, url),
+			Err(_) => HashSet::new(),
+		})
+		.collect()
+}
+
+/// Say what the fetched lists now hold, at startup and whenever a refresh moves
+/// it. Never silently: this decides what is not decrypted, and a list that
+/// quietly stopped loading looks exactly like one that never had anything in
+/// it.
+fn report(hosts: usize, configured: usize) {
+	if hosts == 0 {
+		log::warn!(
+			"[passthrough] nothing loaded from {configured} fetched list(s); only the \
+			 hosts written down in the configuration are exempt"
+		);
+
+		return;
+	}
+
+	log::info!("[passthrough] {hosts} host(s) from {configured} fetched list(s)");
+}
+
+/// Read a fetched list: one host per line, `#` and `!` comments, blank lines,
+/// and hosts-file lines (`0.0.0.0 bank.example`), because that is the shape
+/// most published lists come in.
+///
+/// Deliberately *not* `blocklist::parse`, which reads the same files.
+/// That returns Adblock rules, and a rule has a scope this list has no reading
+/// for: `@@||bank.example^` is an *exception* — the list saying "do not block
+/// this" — and honouring it here would turn a line that means nothing about
+/// decryption into a host mach5 stops decrypting. `||cdn.example^$third-party`
+/// is the same problem the other way. Only the label rules are shared, through
+/// [`crate::blocklist::normalize`], so that a name means the same thing
+/// wherever it was written.
+fn parse(text: &str, url: &str) -> HashSet<String> {
+	let mut hosts = HashSet::new();
+	let mut refused = 0usize;
+
+	for line in text.lines() {
+		let line = line.trim();
+		if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+			continue;
+		}
+
+		// A hosts file may put a comment after the name. Only after
+		// whitespace, so a `#` inside something else does not split a line in
+		// half and leave a fragment to be read as a host.
+		let line = match line.find(" #").or_else(|| line.find("\t#")) {
+			Some(at) => line[..at].trim(),
+			None => line,
+		};
+
+		// A hosts-file line is an address and then the names pointed at it, of
+		// which there may be several.
+		let names = match line.split_once(char::is_whitespace) {
+			Some((_address, rest)) => rest,
+			None => line,
+		};
+
+		for name in names.split_whitespace() {
+			match entry(name) {
+				Some(host) => {
+					hosts.insert(host);
+				}
+				None => refused += 1,
+			}
+		}
+	}
+
+	if hosts.len() > MAX_HOSTS {
+		log::error!(
+			"[passthrough] {url} names {} hosts, past the ceiling of {MAX_HOSTS}. That is \
+			 not a list of hosts to leave alone, it is something else pointed at the \
+			 wrong setting — refusing all of it rather than an arbitrary half",
+			hosts.len()
+		);
+
+		return HashSet::new();
+	}
+
+	if refused > 0 {
+		log::warn!("[passthrough] {url}: {refused} line(s) are not a host mach5 will exempt");
+	}
+
+	hosts
+}
+
+/// One line of a fetched list as a host, or `None` when it is not one this list
+/// may add.
+///
+/// The label rules are [`crate::blocklist::normalize`]'s — lowercased, no
+/// trailing root dot, at least two labels, ASCII only (a name reaches the wire
+/// as punycode, so a unicode entry could never match anything). What is added
+/// on top is a ceiling on *how much* one line may exempt, because these lists
+/// come from wherever somebody pointed the configuration and a single line is
+/// otherwise enough to switch decryption off for a whole country's registry.
+fn entry(raw: &str) -> Option<String> {
+	// `*.bank.example` is how some published lists spell what an entry here
+	// already means, since a parent covers its subdomains. Stripping the
+	// wildcard keeps the host rather than silently dropping it.
+	let raw = raw.strip_prefix("*.").unwrap_or(raw);
+	let host = crate::blocklist::normalize(raw)?;
+
+	// DNS's own limits. Nothing longer can be a name that ever arrives, so a
+	// longer line is filler.
+	if host.len() > 253 || host.split('.').any(|label| label.len() > 63) {
+		return None;
+	}
+
+	(!is_public_suffix(&host)).then_some(host)
+}
+
+/// Whether this is a registry's own name rather than a site — `com`, `co.uk`.
+///
+/// One such entry exempts every name beneath it, which for `co.uk` is most of
+/// a country. That is not a decision to take from a file fetched over the
+/// network, so it is refused and counted.
+///
+/// Not the full Public Suffix List: that is a megabyte of data and a dependency
+/// to answer one question, and it needs its own refresh to stay right. These
+/// are the two shapes that do the damage. A single label — `com`, `localhost`,
+/// the remains of a line we misread — is already refused by `normalize`, so
+/// what is left is a two-label name under a two-letter (country-code) TLD whose
+/// first label is one a registry sells under. Anything longer is somebody's
+/// name, whoever sold it to them.
+fn is_public_suffix(host: &str) -> bool {
+	let labels: Vec<&str> = host.split('.').collect();
+
+	match labels.as_slice() {
+		[second, tld] => tld.len() == 2 && REGISTRY_LABELS.contains(second),
+		_ => false,
+	}
 }
 
 /// What a caller holding the first bytes off a socket should do next.
@@ -759,6 +1064,7 @@ mod tests {
 	fn listing(hosts: &[&str]) -> Passthrough {
 		Passthrough {
 			hosts: hosts.iter().map(|h| h.to_string()).collect(),
+			fetched: RwLock::new(Arc::new(HashSet::new())),
 			port: 443,
 		}
 	}
@@ -780,5 +1086,315 @@ mod tests {
 	fn an_empty_list_covers_nothing() {
 		assert!(!listing(&[]).covers("example.com"));
 		assert!(listing(&[]).is_empty());
+	}
+
+	/// A config with a cache directory of its own and whatever URLs the test
+	/// wants, so nothing here can read or write the real one.
+	fn configured(dir: &std::path::Path, hosts: &[&str], urls: &[String]) -> Config {
+		let list = |values: &[String]| {
+			values
+				.iter()
+				.map(|value| format!("{value:?}"))
+				.collect::<Vec<_>>()
+				.join(", ")
+		};
+		let hosts: Vec<String> = hosts.iter().map(|h| h.to_string()).collect();
+
+		Config::from_str(&format!(
+			"[paths]\ncache_dir = {:?}\n\n[passthrough]\nhosts = [{}]\nurls = [{}]\n",
+			dir,
+			list(&hosts),
+			list(urls)
+		))
+		.unwrap()
+	}
+
+	/// Leave a copy on disk where a fetch would have left one.
+	fn cache(config: &Config, url: &str, text: &str) -> std::path::PathBuf {
+		let path = CACHE.path(config, url);
+		std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+		std::fs::write(&path, text).unwrap();
+
+		path
+	}
+
+	/// A URL nothing is listening on, so a fetch of it fails for real rather
+	/// than being simulated. Bound and dropped so the port is one the kernel
+	/// just said was free.
+	fn nowhere() -> String {
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let addr = listener.local_addr().unwrap();
+		drop(listener);
+
+		format!("http://{addr}/list.txt")
+	}
+
+	/// A one-shot HTTP server on loopback.
+	///
+	/// The interesting failure is a list that *downloads perfectly* and is not
+	/// a list — a 404 page served as 200, a captive portal — because that is
+	/// the one the cache cannot save us from: the good copy on disk has already
+	/// been overwritten by the time anything notices. Proving that needs a
+	/// fetch that succeeds, and there is no network here to succeed against.
+	fn serving(body: &'static str) -> (String, std::thread::JoinHandle<()>) {
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let url = format!("http://{}/list.txt", listener.local_addr().unwrap());
+
+		let handle = std::thread::spawn(move || {
+			let Ok((mut stream, _)) = listener.accept() else {
+				return;
+			};
+
+			// Read the request before answering it, so the client is not
+			// writing into a socket that has already gone away.
+			let mut request = [0u8; 1024];
+			let _ = std::io::Read::read(&mut stream, &mut request);
+
+			let response = format!(
+				"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\
+				 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+				body.len()
+			);
+			let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+		});
+
+		(url, handle)
+	}
+
+	/// A fetched entry is the same statement as a configured one, only from a
+	/// file, so it is matched the same way — and it has to count towards
+	/// `is_empty`, which is what decides whether the ClientHello is peeked at
+	/// all. A fetched list that did not count there would match in `covers`
+	/// and be decrypted anyway.
+	#[test]
+	fn a_fetched_host_covers_its_subdomains_and_counts_as_listed() {
+		let dir = tempfile::tempdir().unwrap();
+		let url = nowhere();
+		let config = configured(dir.path(), &[], std::slice::from_ref(&url));
+		cache(&config, &url, "example-bank.com\n");
+
+		let list = Passthrough::new(&config);
+
+		assert!(list.covers("example-bank.com"));
+		assert!(
+			list.covers("secure.example-bank.com"),
+			"a fetched entry covers its subdomains exactly as a written one does"
+		);
+		assert!(!list.covers("example-bank.com.evil.example"), "label-aware");
+		assert!(!list.covers("notexample-bank.com"));
+		assert!(
+			!list.is_empty(),
+			"nothing is peeked at when this says empty, so a fetched list that did \
+			 not count here would never match anything"
+		);
+	}
+
+	/// The seam between a fetched list and the two places that act on it.
+	///
+	/// `covers` being right is not enough on its own: the TCP front end splices
+	/// on `never_decrypt`, and the acceptor refuses the handshake on the same
+	/// call when the ClientHello peek did not manage to. A fetched host that
+	/// reached one of those and not the other would be decrypted by whichever
+	/// it missed.
+	#[test]
+	fn a_fetched_host_reaches_never_decrypt_like_any_other() {
+		let dir = tempfile::tempdir().unwrap();
+		let url = nowhere();
+		let config = configured(dir.path(), &[], std::slice::from_ref(&url));
+		cache(&config, &url, "example-bank.com\n");
+
+		let list = Passthrough::new(&config);
+		let learned = Learned::load(dir.path().join("learned.json"));
+
+		assert!(never_decrypt(&list, &learned, "example-bank.com"));
+		assert!(
+			never_decrypt(&list, &learned, "secure.example-bank.com"),
+			"subdomains too, or the splice and the refusal disagree with covers"
+		);
+		assert!(!never_decrypt(&list, &learned, "somewhere.else.example"));
+	}
+
+	/// The direction this list is allowed to fail in. A download that goes
+	/// wrong must leave the same hosts exempt as before it, because the other
+	/// way is a bank being decrypted — and the configured hosts are not the
+	/// refresh's to touch at all.
+	#[test]
+	fn a_failed_fetch_keeps_the_list_it_had() {
+		let dir = tempfile::tempdir().unwrap();
+		let url = nowhere();
+		let config = configured(dir.path(), &["written-down.example"], std::slice::from_ref(&url));
+		cache(&config, &url, "example-bank.com\n");
+
+		let list = Passthrough::new(&config);
+		let mut held = cached(&config);
+		refresh(&list, &config, &crate::fetch::agent(&config), &mut held);
+
+		assert!(
+			list.covers("secure.example-bank.com"),
+			"the fetch failed, so yesterday's copy is still what is in force"
+		);
+		assert!(
+			list.covers("written-down.example"),
+			"and a failing list is never a reason to stop honouring a configured host"
+		);
+	}
+
+	/// A fetch that fails with nothing cached behind it either. There is
+	/// nothing to fall back to on disk, so what the list gave us last time —
+	/// held in memory since startup — is what stands.
+	#[test]
+	fn a_fetch_with_nothing_behind_it_still_keeps_what_it_had() {
+		let mut held: HashSet<String> = ["example-bank.com".to_string()].into_iter().collect();
+
+		update(&mut held, None, "https://example.com/list.txt");
+
+		assert!(held.contains("example-bank.com"));
+	}
+
+	/// The case the cache cannot save us from: a list that downloads perfectly
+	/// and is an error page. The good copy on disk is overwritten before
+	/// anything can notice, so keeping the parsed hosts in memory is the only
+	/// thing between that and a decrypted bank.
+	#[test]
+	fn a_list_that_comes_back_unreadable_keeps_its_hosts() {
+		let dir = tempfile::tempdir().unwrap();
+		let (url, server) = serving("<html><head><title>404 Not Found</title></head></html>");
+		let config = configured(dir.path(), &[], std::slice::from_ref(&url));
+		let path = cache(&config, &url, "example-bank.com\n");
+
+		let list = Passthrough::new(&config);
+		let mut held = cached(&config);
+		refresh(&list, &config, &crate::fetch::agent(&config), &mut held);
+		server.join().unwrap();
+
+		assert!(
+			std::fs::read_to_string(&path).unwrap().contains("<html>"),
+			"the fetch really did succeed, so the cache no longer holds the good copy"
+		);
+		assert!(
+			list.covers("secure.example-bank.com"),
+			"and the hosts it gave us last time are still exempt"
+		);
+	}
+
+	/// A list far too long to be a list of hosts to leave alone — a hosts
+	/// blocklist pointed at the wrong setting, or a list gone hostile. Either
+	/// way honouring it would switch decryption off for most of the web.
+	#[test]
+	fn a_list_past_the_ceiling_is_refused_whole() {
+		let huge: String = (0..=MAX_HOSTS)
+			.map(|n| format!("host{n}.example\n"))
+			.collect();
+		let url = "https://example.com/list.txt";
+
+		assert!(
+			parse(&huge, url).is_empty(),
+			"refused whole, not truncated: half of a security list chosen by line \
+			 order is worse than none of it"
+		);
+
+		// And refusing it is not a way to shrink what is already in force.
+		let mut held: HashSet<String> = ["example-bank.com".to_string()].into_iter().collect();
+		update(&mut held, Some(&huge), url);
+
+		assert!(held.contains("example-bank.com"));
+
+		// One under the ceiling is an ordinary list.
+		let big: String = (0..MAX_HOSTS)
+			.map(|n| format!("host{n}.example\n"))
+			.collect();
+		assert_eq!(parse(&big, url).len(), MAX_HOSTS);
+	}
+
+	/// One line is otherwise enough to exempt a whole registry. These lists
+	/// come from wherever somebody pointed the configuration, so that is not a
+	/// decision to accept from one.
+	#[test]
+	fn an_entry_that_covers_the_world_is_refused() {
+		let hosts = parse(
+			"co.uk\ncom.au\nne.jp\norg.uk\ncom\nuk\n*\nlocalhost\n\
+			 münchen-bank.de\nhttps://bank.example/\nbank.example:443\n\
+			 real-bank.co.uk\nexample-bank.com\n",
+			"https://example.com/list.txt",
+		);
+
+		for refused in [
+			"co.uk", "com.au", "ne.jp", "org.uk", "com", "uk", "*", "localhost",
+		] {
+			assert!(!hosts.contains(refused), "{refused} exempts far too much");
+		}
+		assert!(!hosts.contains("münchen-bank.de"), "a name arrives as punycode");
+		assert!(
+			!hosts.iter().any(|h| h.contains('/') || h.contains(':')),
+			"a URL or a port is not a host, and half of one is not either"
+		);
+
+		assert_eq!(
+			hosts,
+			["real-bank.co.uk".to_string(), "example-bank.com".to_string()]
+				.into_iter()
+				.collect::<HashSet<_>>(),
+			"a name under a public suffix is somebody's site, and is kept"
+		);
+	}
+
+	/// The formats published lists actually come in. A host silently dropped
+	/// here is a host that starts being decrypted, so every shape matters.
+	#[test]
+	fn every_shape_a_published_list_comes_in_parses() {
+		let hosts = parse(
+			"# a comment\n\
+			 ! and the other kind\n\
+			 \n\
+			 bank.example\n\
+			 0.0.0.0 hosts-style.example\n\
+			 127.0.0.1\ttabbed.example\n\
+			 0.0.0.0 first.example second.example\n\
+			 trailing.example  # why it is here\n\
+			 *.wildcard.example\n\
+			 UPPER.example.\n",
+			"https://example.com/list.txt",
+		);
+
+		let expected: HashSet<String> = [
+			"bank.example",
+			"hosts-style.example",
+			"tabbed.example",
+			"first.example",
+			"second.example",
+			"trailing.example",
+			"wildcard.example",
+			"upper.example",
+		]
+		.into_iter()
+		.map(str::to_string)
+		.collect();
+
+		assert_eq!(hosts, expected);
+	}
+
+	/// Nothing configured means no thread and no fetching, and zero hours is
+	/// the deliberate way to freeze the lists where they are.
+	#[test]
+	fn refreshing_only_runs_when_there_is_something_to_fetch() {
+		let dir = tempfile::tempdir().unwrap();
+		let url = nowhere();
+
+		assert_eq!(
+			refresh_interval(&configured(dir.path(), &[], &[])),
+			None,
+			"no urls, nothing to refresh"
+		);
+		assert_eq!(
+			refresh_interval(&configured(dir.path(), &[], std::slice::from_ref(&url))),
+			Some(Duration::from_secs(24 * 3600)),
+			"daily by default"
+		);
+
+		let frozen = Config::from_str(&format!(
+			"[passthrough]\nurls = [{url:?}]\nrefresh_hours = 0\n"
+		))
+		.unwrap();
+		assert_eq!(refresh_interval(&frozen), None);
 	}
 }

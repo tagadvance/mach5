@@ -6,9 +6,10 @@
 //! the CPU, which was the actual weakness.
 //!
 //! **Entries are addressed by the content they came from**: the key is the
-//! SHA-256 of the original bytes and the quality asked for. That is worth
-//! spelling out, because it is what makes this cache safe to build before mach5
-//! has any notion of who is asking:
+//! SHA-256 of the original bytes, the quality asked for, and the
+//! [`Form`](crate::images::Form) it was asked for in. That is worth spelling
+//! out, because it is what makes this cache safe to build before mach5 has any
+//! notion of who is asking:
 //!
 //! - There is no invalidation problem. If an origin changes an image the bytes
 //!   change, so the key changes, so the old entry is simply never asked for
@@ -26,6 +27,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::config::Config;
+use crate::images::Form;
 
 /// How many inserts before checking whether the budget has been passed.
 ///
@@ -68,10 +70,10 @@ impl Cache {
 		Some(cache)
 	}
 
-	/// The re-encoding of these bytes at this quality, if it has been done
-	/// before.
-	pub fn get(&self, original: &[u8], quality: u8) -> Option<Vec<u8>> {
-		let found = std::fs::read(self.path_for(original, quality)).ok();
+	/// The re-encoding of these bytes at this quality and in this form, if it
+	/// has been done before.
+	pub fn get(&self, original: &[u8], quality: u8, form: Form) -> Option<Vec<u8>> {
+		let found = std::fs::read(self.path_for(original, quality, form)).ok();
 
 		if found.is_some() {
 			self.metrics.image_cache_hits.increment();
@@ -82,8 +84,8 @@ impl Cache {
 		found
 	}
 
-	pub fn put(&self, original: &[u8], quality: u8, encoded: &[u8]) {
-		let path = self.path_for(original, quality);
+	pub fn put(&self, original: &[u8], quality: u8, form: Form, encoded: &[u8]) {
+		let path = self.path_for(original, quality, form);
 
 		// Written beside and renamed, so a reader never sees a half-written
 		// image — the same reason the other stores here do it, and through the
@@ -103,23 +105,26 @@ impl Cache {
 		}
 	}
 
-	fn path_for(&self, original: &[u8], quality: u8) -> PathBuf {
-		self.dir.join(name_for(original, quality))
+	fn path_for(&self, original: &[u8], quality: u8, form: Form) -> PathBuf {
+		self.dir.join(name_for(original, quality, form))
 	}
-
 }
 
 /// The filename for a given input. SHA-256 rather than something cheaper
 /// because a collision would mean serving one image in place of another, and a
 /// hash an attacker can collide deliberately is a way to do exactly that.
-fn name_for(original: &[u8], quality: u8) -> String {
+///
+/// The form is in the name because the quality number does not imply it: a
+/// greyscale image and a colour one can be asked for at the same quality, and
+/// they are different pictures, not merely different sizes of the same one.
+fn name_for(original: &[u8], quality: u8, form: Form) -> String {
 	let digest = boring::sha::sha256(original);
 
 	let mut name = String::with_capacity(64 + 8);
 	for byte in digest {
 		name.push_str(&format!("{byte:02x}"));
 	}
-	name.push_str(&format!("-q{quality}.webp"));
+	name.push_str(&format!("-q{quality}-{}.webp", form.tag()));
 
 	name
 }
@@ -152,10 +157,13 @@ mod tests {
 		let dir = tempfile::TempDir::new().unwrap();
 		let cache = cache(&dir, 1024 * 1024);
 
-		assert_eq!(cache.get(b"original bytes", 80), None);
-		cache.put(b"original bytes", 80, b"re-encoded");
+		assert_eq!(cache.get(b"original bytes", 80, Form::Colour), None);
+		cache.put(b"original bytes", 80, Form::Colour, b"re-encoded");
 
-		assert_eq!(cache.get(b"original bytes", 80).as_deref(), Some(&b"re-encoded"[..]));
+		assert_eq!(
+			cache.get(b"original bytes", 80, Form::Colour).as_deref(),
+			Some(&b"re-encoded"[..])
+		);
 		assert_eq!(cache.metrics.image_cache_hits.get(), 1);
 		assert_eq!(cache.metrics.image_cache_misses.get(), 1);
 	}
@@ -166,32 +174,60 @@ mod tests {
 	fn different_input_is_a_different_entry() {
 		let dir = tempfile::TempDir::new().unwrap();
 		let cache = cache(&dir, 1024 * 1024);
-		cache.put(b"one image", 80, b"encoded one");
+		cache.put(b"one image", 80, Form::Colour, b"encoded one");
 
-		assert_eq!(cache.get(b"another image", 80), None);
+		assert_eq!(cache.get(b"another image", 80, Form::Colour), None);
 	}
 
 	#[test]
 	fn quality_is_part_of_the_key() {
 		let dir = tempfile::TempDir::new().unwrap();
 		let cache = cache(&dir, 1024 * 1024);
-		cache.put(b"same bytes", 80, b"at eighty");
+		cache.put(b"same bytes", 80, Form::Colour, b"at eighty");
 
 		assert_eq!(
-			cache.get(b"same bytes", 40),
+			cache.get(b"same bytes", 40, Form::Colour),
 			None,
 			"a panel set to low must not be handed the high-quality copy"
 		);
-		assert_eq!(cache.get(b"same bytes", 80).as_deref(), Some(&b"at eighty"[..]));
+		assert_eq!(
+			cache.get(b"same bytes", 80, Form::Colour).as_deref(),
+			Some(&b"at eighty"[..])
+		);
+	}
+
+	/// The half the quality number cannot carry. Without the form in the key a
+	/// client on 2G that asked for greyscale at 35 is handed the colour copy
+	/// somebody else's link happened to want at 35 — a different picture, not
+	/// a differently sized one.
+	#[test]
+	fn the_form_is_part_of_the_key_too() {
+		let dir = tempfile::TempDir::new().unwrap();
+		let cache = cache(&dir, 1024 * 1024);
+		cache.put(b"same bytes", 35, Form::Colour, b"in colour");
+
+		assert_eq!(cache.get(b"same bytes", 35, Form::Grey), None);
+		assert_eq!(cache.get(b"same bytes", 35, Form::Placeholder), None);
+
+		cache.put(b"same bytes", 35, Form::Grey, b"in grey");
+		assert_eq!(
+			cache.get(b"same bytes", 35, Form::Colour).as_deref(),
+			Some(&b"in colour"[..]),
+			"and neither overwrote the other"
+		);
+		assert_eq!(
+			cache.get(b"same bytes", 35, Form::Grey).as_deref(),
+			Some(&b"in grey"[..])
+		);
 	}
 
 	#[test]
 	fn a_name_is_stable_and_says_what_it_is() {
-		let first = name_for(b"bytes", 80);
+		let first = name_for(b"bytes", 80, Form::Colour);
 
-		assert_eq!(first, name_for(b"bytes", 80));
-		assert!(first.ends_with("-q80.webp"));
-		assert_eq!(first.len(), 64 + "-q80.webp".len());
+		assert_eq!(first, name_for(b"bytes", 80, Form::Colour));
+		assert!(first.ends_with("-q80-colour.webp"));
+		assert_eq!(first.len(), 64 + "-q80-colour.webp".len());
 		assert!(
 			!first.contains('/') && !first.contains(".."),
 			"a key derived from content must never become a path"
@@ -204,7 +240,7 @@ mod tests {
 		let cache = cache(&dir, 100);
 
 		for i in 0..10u8 {
-			cache.put(&[i; 32], 80, &[0u8; 40]);
+			cache.put(&[i; 32], 80, Form::Colour, &[0u8; 40]);
 			// Distinct timestamps, so "oldest first" has something to sort on.
 			std::thread::sleep(std::time::Duration::from_millis(5));
 		}

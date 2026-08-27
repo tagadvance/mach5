@@ -222,6 +222,23 @@ enabled = true
 # WebP quality, 0-100. 80 is the usual "indistinguishable at a glance" setting
 # and is what the measurements above were taken at.
 quality = 80
+
+# The most quality a client whose link measures onto the `reduced` or `grey`
+# rung of [link] may be served.
+#
+# Ceilings and not settings. What is served is the lower of one of these and
+# whatever the panel asked for, so they can only ever take bytes away: asking
+# for high quality on a link measured at 2G still gets greyscale, and asking for
+# no images at all still gets none however fast the link turns out to be. See
+# the panel's own image-quality tiers, which are the other half of the same
+# rule.
+#
+# Measured on one 600x400 image that took 138KB at quality 80: 104KB at reduced
+# and 83KB in greyscale. How much of that second step is the missing colour and
+# how much is the lower number depends on the picture — on a detailed one they
+# are worth about the same, on a smooth one the colour is worth far more.
+reduced_quality = 50
+grey_quality = 35
 # The most pixels an image may have before it is passed through rather than
 # converted. The bound has to be on pixels and not on bytes: a decoded frame
 # costs width x height x 4 whatever the file compressed to, so two megabytes of
@@ -309,8 +326,12 @@ max_cacheable_mb = 8
 # What comes out is a tier — full quality, reduced quality, greyscale, a
 # dimension-preserving placeholder, nothing — shown on `/.mach5/` for whichever
 # client is reading it, which is how you check this from a phone on a real
-# network. Nothing consumes the tier yet: it is measured and reported, and what
-# it does to an image is a separate decision that has not been made here.
+# network.
+#
+# [images] is the one thing that acts on it so far, and it treats the panel's
+# own quality setting as a second ceiling rather than a competitor: what is
+# served is whichever of the two asks for less. reduced_quality and grey_quality
+# there are what the middle rungs come to.
 #
 # Off means every client is assumed fast and nothing is stored.
 enabled = true

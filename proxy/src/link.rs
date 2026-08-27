@@ -210,11 +210,8 @@ impl Links {
 	/// What to serve this client. Answers even for a client never seen, which
 	/// is the whole point of [`COLD_START`].
 	///
-	/// Nothing calls this yet, and that is deliberate: measuring is one piece
-	/// of work and acting on the measurement is another. The status page shows
-	/// the estimate so this can be checked against a real network before
-	/// anything is allowed to depend on it.
-	#[allow(dead_code)]
+	/// What a tier *means* is not decided here: [`crate::images`] is the one
+	/// consumer so far, and it weighs this against what the panel asked for.
 	pub fn tier(&self, peer: IpAddr) -> Tier {
 		self.tier_at(peer, Instant::now())
 	}

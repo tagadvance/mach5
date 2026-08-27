@@ -132,6 +132,15 @@ pub struct Images {
 	/// WebP quality, 0-100. 80 is the usual "indistinguishable at a glance"
 	/// setting and is what the measurements behind this were taken at.
 	pub quality: u8,
+	/// The most quality a client on the `reduced` link tier may be served.
+	///
+	/// A ceiling rather than a setting: what is served is the lower of this and
+	/// whatever the panel asked for, so this can only ever take bytes away.
+	pub reduced_quality: u8,
+	/// The same, for the `grey` tier. Lower than `reduced_quality` because the
+	/// picture has already lost its colour by the time this applies, and a
+	/// link this slow is being asked for a shape rather than a photograph.
+	pub grey_quality: u8,
 	/// The most pixels an image may have before it is passed through rather
 	/// than converted.
 	///
@@ -148,6 +157,8 @@ impl Default for Images {
 		Self {
 			enabled: true,
 			quality: 80,
+			reduced_quality: 50,
+			grey_quality: 35,
 			max_megapixels: 16,
 			cache_mb: 512,
 			origin_cache_mb: 256,

@@ -128,7 +128,11 @@ const rect = (el, [left, top, width, height]) => {
 };
 const act = (p, name) => p.shadow().querySelector(`[data-act="${name}"]`);
 const text = (p, id) => { const el = p.shadow().getElementById(id); return el ? el.textContent : ''; };
-const outline = (p) => p.d.querySelector('[data-mach5="outline"]');
+// Both live in the shadow root, not in the page: a bare div in document.body
+// is reachable by the site's stylesheet and deletable by its framework, and
+// these two are what a person is asked to check before hiding something.
+const outline = (p) => p.shadow().querySelector('[data-mach5="outline"]');
+const badge = (p) => p.shadow().querySelector('[data-mach5="badge"]');
 const pick = (p) => {
   key(p.w, 'KeyH', { ctrlKey: true, shiftKey: true });
   click(p.w, act(p, 'pick'));
@@ -212,7 +216,7 @@ console.log('\n=== 5. tapping an element chooses it, and Hide hides it ===');
   pick(p);
   ok('picker armed, panel closed', !sh.getElementById('panel').classList.contains('open'));
   ok('crosshair cursor', p.d.documentElement.style.cursor === 'crosshair');
-  ok('help badge shown', p.d.querySelector('[data-mach5="badge"]').style.display === 'block');
+  ok('help badge shown', badge(p).style.display === 'block');
 
   const target = p.d.getElementById('ad-slot');
   const ev = click(p.w, target);
@@ -535,7 +539,7 @@ console.log('\n=== 7. Escape and u ===');
   ok('a candidate is waiting to be confirmed', sh.getElementById('panel').classList.contains('confirming'));
   key(p.w, 'Escape');
   ok('Escape leaves picker mode', p.d.documentElement.style.cursor === '');
-  ok('badge hidden again', p.d.querySelector('[data-mach5="badge"]').style.display === 'none');
+  ok('badge hidden again', badge(p).style.display === 'none');
   ok('the candidate goes with it', !sh.getElementById('panel').classList.contains('confirming'));
   ok('outline gone', outline(p).style.display === 'none');
   ok('and nothing was hidden on the way out', p.d.getElementById('ad-slot').style.display === '');
@@ -597,8 +601,8 @@ console.log('\n=== 9b. a proxy that answers and says no ===');
   // be indistinguishable from a save. A selector the proxy threw away looked
   // exactly like one it kept, and the element stayed hidden until the reload
   // that brought it back.
-  const badge = (p) => {
-    const el = p.d.querySelector('[data-mach5="badge"]');
+  const note = (p) => {
+    const el = badge(p);
     return el ? el.textContent : '';
   };
 
@@ -613,7 +617,7 @@ console.log('\n=== 9b. a proxy that answers and says no ===');
   ok('hidden on the spot, before the proxy has answered', target.style.display === 'none');
   await tick();
   ok('a refused selector does not throw', p.errors.length === 0, p.errors.map(e => e.message).join('; '));
-  ok('and says so', /could not save/.test(badge(p)), `badge said: ${badge(p)}`);
+  ok('and says so', /could not save/.test(note(p)), `badge said: ${note(p)}`);
   // Nothing was stored, so leaving it hidden would be a lie until the next load.
   ok('and puts the element back', target.style.display === '', target.style.display);
   ok('with nothing to undo', !p.shadow().getElementById('panel').classList.contains('undoable'));
@@ -659,7 +663,7 @@ console.log('\n=== 9b. a proxy that answers and says no ===');
   key(r2.w, 'KeyU');
   await tick();
   ok('a refused clear does not reload the page', r2.reloads() === 0);
-  ok('and says so', /could not clear/.test(badge(r2)), `badge said: ${badge(r2)}`);
+  ok('and says so', /could not clear/.test(note(r2)), `badge said: ${note(r2)}`);
 }
 
 console.log('\n=== 9c. a page whose body is not there yet ===');
@@ -714,6 +718,60 @@ console.log('\n=== 9d. the tier that means no images at all ===');
   ok('unpressing the rest',
     [...sh.querySelectorAll('[data-tier]')].filter(b => b !== none)
       .every(b => b.getAttribute('aria-pressed') === 'false'));
+}
+
+console.log('\n=== 9e. a page whose framework owns document.body ===');
+{
+  // React, Vue and every other thing that hydrates reconciles body's children
+  // and removes what it did not create. Ours is exactly that. This used to
+  // take the panel, the outline and the badge, and nothing rebuilt them,
+  // because both builders returned early on a variable that was still truthy
+  // while detached — so the picker worked on a static page and silently did
+  // not exist on an app.
+  const p = makePage(NORMAL);
+  pick(p);
+  ok('the furniture is in the shadow root, not the page',
+    !!p.shadow().querySelector('[data-mach5="outline"]') &&
+    p.d.querySelector('[data-mach5="outline"]') === null);
+
+  const host = () => p.d.querySelector('[data-mach5="panel"]');
+  ok('the host is in the page', !!host());
+
+  host().remove();
+  ok('and the page can take it', !host());
+
+  await tick();
+  ok('but it is put back', !!host());
+  ok('with the dot still in it', !!p.shadow().getElementById('dot'));
+  ok('and the outline, which went with it', !!p.shadow().querySelector('[data-mach5="outline"]'));
+  ok('no uncaught error', p.errors.length === 0, p.errors.map(e => e.message).join('; '));
+}
+
+console.log('\n=== 9f. a page that will not have it there at all ===');
+{
+  // Losing is allowed. Trading appends with the page forever is not.
+  const p = makePage(NORMAL);
+  let evicted = 0;
+  const evict = new p.w.MutationObserver(() => {
+    const host = p.d.querySelector('[data-mach5="panel"]');
+    if (host) { evicted++; host.remove(); }
+  });
+  evict.observe(p.d.body, { childList: true });
+  p.d.body.appendChild(p.d.createElement('span'));
+
+  await tick();
+  await tick();
+  const settled = evicted;
+  ok('it did put it back a few times', settled > 1, `${settled} rounds`);
+
+  // The assertion that matters is not the exact cap but that it reaches one:
+  // more rounds now would mean the two are still trading appends.
+  p.d.body.appendChild(p.d.createElement('span'));
+  await tick();
+  await tick();
+  evict.disconnect();
+  ok('and then stops rather than looping forever', evicted === settled, `${settled} then ${evicted}`);
+  ok('and still throws nothing', p.errors.length === 0, p.errors.map(e => e.message).join('; '));
 }
 
 console.log('\n=== 10. runs once, and only in the top frame ===');

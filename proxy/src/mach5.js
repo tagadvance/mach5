@@ -160,7 +160,7 @@
 	};
 
 	const chrome = () => {
-		if (badge || !document.body) {
+		if (badge || !shadow) {
 			return;
 		}
 
@@ -178,7 +178,13 @@
 			'font:12px/1.4 system-ui,sans-serif';
 		badge.textContent = HELP;
 
-		document.body.append(outline, badge);
+		/* In the shadow root rather than in the page, which is where they used
+		 * to be. `position: fixed` is relative to the viewport either way, so
+		 * nothing about how they land changes — but a bare div in document.body
+		 * is reachable by the page's stylesheet and deletable by its framework,
+		 * and these are the two things a person is asked to check before
+		 * hiding something. */
+		shadow.append(outline, badge);
 	};
 
 	/* Never the page's own frame, and never our own furniture. */
@@ -422,6 +428,50 @@
 	/* The panel, in a shadow root so no site's CSS can reach it. Built once, on
 	 * the first frame after load — early enough to be there when wanted, late
 	 * enough not to compete with the page for the first paint. */
+	/* Put the host back when the page takes it away.
+	 *
+	 * A framework that owns document.body reconciles its children and removes
+	 * anything it did not create, which is exactly what ours is. Every SPA
+	 * hydration pass does this, and it took the panel, the outline and the
+	 * badge with it — then nothing rebuilt them, because both builders returned
+	 * early on a variable that was still truthy while detached. That is a
+	 * picker that works on a static page and silently does not exist on a React
+	 * one, which is most of what a phone visits.
+	 *
+	 * Shallow `childList` on each, not a subtree observer: this must not fire
+	 * on every DOM change a busy page makes. documentElement catches the body
+	 * being replaced outright, and body catches its children being reconciled. */
+	const stayMounted = (host) => {
+		if (typeof MutationObserver !== 'function') {
+			return;
+		}
+
+		/* A page determined to remove it will win, and that is fine — what is
+		 * not fine is trading appends with it forever. */
+		let puts = 0;
+		let watched = null;
+
+		const observer = new MutationObserver(() => {
+			if (!document.body) {
+				return;
+			}
+
+			if (document.body !== watched) {
+				watched = document.body;
+				observer.observe(watched, { childList: true });
+			}
+
+			if (!host.isConnected && puts < 20) {
+				puts += 1;
+				document.body.append(host);
+			}
+		});
+
+		observer.observe(document.documentElement, { childList: true });
+		watched = document.body;
+		observer.observe(watched, { childList: true });
+	};
+
 	const buildPanel = () => {
 		if (shadow || !document.body) {
 			return;
@@ -477,6 +527,7 @@
 
 		shadow.append(style, dot, panel);
 		document.body.append(host);
+		stayMounted(host);
 
 		dot.addEventListener('click', guard(() => togglePanel()));
 		panel.addEventListener('click', guard(onPanelClick));

@@ -635,7 +635,6 @@ mod tests {
 
 	/// One that mach5 *can* rewrite: the high bytes are meaningful in this
 	/// encoding and must survive being parsed and written back out.
-	#[test]
 	/// A parameter name is case-insensitive (RFC 9110 §5.6.6). Matching
 	/// `charset=` exactly meant a page announcing `CHARSET=` fell back to the
 	/// `utf-8` default, which is the answer that means "safe to rewrite" — so
@@ -667,6 +666,7 @@ mod tests {
 		}
 	}
 
+	#[test]
 	fn a_windows_1252_page_keeps_its_bytes() {
 		// 0xA9 is © in windows-1252 and not valid UTF-8 on its own.
 		let body = b"<html><head></head><body>caf\xe9 \xa9</body></html>".to_vec();

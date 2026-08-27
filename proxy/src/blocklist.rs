@@ -154,9 +154,6 @@ impl Blocklist {
 			&& self.allowed_embedded == other.allowed_embedded
 	}
 
-	/// True when this host, or any domain it sits under, is listed — so
-	/// `doubleclick.net` covers `ad.g.doubleclick.net`. An allowance wins
-	/// outright, whatever the lists say.
 	/// Whether this request is blocked, which depends on the request and not
 	/// only on the host: a `$third-party` rule applies to a subresource and not
 	/// to the page it is on.

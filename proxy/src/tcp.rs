@@ -120,6 +120,18 @@ pub fn spawn(config: Arc<Config>, ca: Arc<CertAuthority>) -> std::io::Result<()>
 	let acceptor = Arc::new(build_acceptor(&ca, &passthrough, &learned)?);
 	let addr = config.listen_tcp.0;
 
+	// Bound here, synchronously, so a failure is this function's to return.
+	//
+	// It used to be bound inside the runtime thread, where the only thing that
+	// could be done with the error was log it — and the process carried on with
+	// a QUIC listener and no TCP one. That is not a degraded proxy, it is a
+	// useless one: HTTP/3 cannot bootstrap itself, so a browser has nowhere to
+	// start and never sees the `Alt-Svc` that would move it across. The symptom
+	// was a proxy that had said "listening" and answered nothing.
+	let listener = std::net::TcpListener::bind(addr)
+		.map_err(|e| std::io::Error::new(e.kind(), format!("cannot bind {addr}: {e}")))?;
+	listener.set_nonblocking(true)?;
+
 	let shared = Arc::new(Shared {
 		passthrough,
 		learned,
@@ -142,10 +154,12 @@ pub fn spawn(config: Arc<Config>, ca: Arc<CertAuthority>) -> std::io::Result<()>
 		};
 
 		runtime.block_on(async move {
-			let listener = match TcpListener::bind(addr).await {
+			// Already bound above; this only hands it to tokio, and the only
+			// way it fails is the reactor not being there, which it is.
+			let listener = match TcpListener::from_std(listener) {
 				Ok(listener) => listener,
 				Err(e) => {
-					log::error!("cannot bind {addr}: {e}");
+					log::error!("cannot use the bound socket for {addr}: {e}");
 
 					return;
 				}

@@ -287,6 +287,10 @@ pub struct Internal {
 	/// status page reports on it — for the same reason, and through the same
 	/// indirection, as the blocklist above.
 	cosmetic: Option<Arc<crate::cosmetic::Cosmetics>>,
+	/// How fast each client is, or `None` when nothing is measuring. The status
+	/// page is the only way to see this from a phone, which is the only place
+	/// it can be checked against a real network.
+	links: Option<Arc<crate::link::Links>>,
 }
 
 impl Internal {
@@ -312,6 +316,7 @@ impl Internal {
 				.cosmetic
 				.enabled
 				.then(|| crate::cosmetic::shared(config)),
+			links: config.link.enabled.then(|| crate::link::shared(config)),
 		}
 	}
 
@@ -347,6 +352,7 @@ impl Internal {
 	fn route(
 		&self,
 		host: &str,
+		peer: Option<std::net::SocketAddr>,
 		method: &str,
 		path: &str,
 		body: &[u8],
@@ -365,8 +371,8 @@ impl Internal {
 		match (path, method) {
 			// With and without the trailing slash: they are the same page, and a
 			// redirect between them would be one more thing to get wrong.
-			("/.mach5" | "/.mach5/", "GET") => self.status(host),
-			("/.mach5/stats.json", "GET") => self.stats(),
+			("/.mach5" | "/.mach5/", "GET") => self.status(host, peer),
+			("/.mach5/stats.json", "GET") => self.stats(peer),
 			("/.mach5/hidden", "GET") => self.hidden(host),
 			("/.mach5/hidden", "POST") => self.hide(host, body),
 			("/.mach5/hidden/remove", "POST") => self.unhide(host, body),
@@ -407,7 +413,7 @@ impl Internal {
 	/// The status page, which is about this host as much as about the process:
 	/// the counters are the same everywhere, but what is hidden and whether a
 	/// certificate bypass is running are answers only this origin can give.
-	fn status(&self, host: &str) -> ProxyResponse {
+	fn status(&self, host: &str, peer: Option<std::net::SocketAddr>) -> ProxyResponse {
 		let decryption = match self.learned.as_ref() {
 			Some(learned) if learned.holds(host) => Decryption::LearnedOff,
 			_ if self.passthrough.covers(host) => Decryption::ConfiguredOff,
@@ -434,6 +440,7 @@ impl Internal {
 				.filter(|rules| rules.rules > 0),
 			ephemeral: self.ca.is_ephemeral(),
 			live: self.settings.get(),
+			link: self.link_of(peer),
 		});
 
 		let mut response = empty(200);
@@ -472,9 +479,15 @@ impl Internal {
 
 	/// The same numbers, for something that reads them on a schedule rather than
 	/// once. Flat, because that is what every scraper wants to graph.
-	fn stats(&self) -> ProxyResponse {
-		let body =
-			serde_json::to_vec(&self.metrics.snapshot()).expect("counters are serializable");
+	fn stats(&self, peer: Option<std::net::SocketAddr>) -> ProxyResponse {
+		let measured = self.estimate_for(peer);
+		let stats = Stats {
+			counted: &self.metrics.snapshot(),
+			link_tier: measured.map(|estimate| estimate.tier),
+			link_kbps: measured.map(|estimate| estimate.kbps),
+			link_clients: self.links.as_ref().map_or(0, |links| links.tracked()),
+		};
+		let body = serde_json::to_vec(&stats).expect("counters are serializable");
 
 		let mut response = empty(200);
 		response
@@ -527,6 +540,24 @@ impl Internal {
 		log::info!("cache emptied: {removed} file(s) removed");
 
 		empty(204)
+	}
+
+	/// What has been measured about the client that is asking, if anything.
+	fn estimate_for(&self, peer: Option<std::net::SocketAddr>) -> Option<crate::link::Estimate> {
+		self.links.as_ref()?.estimate(peer?.ip())
+	}
+
+	/// The same, in the three states the page has to tell apart: measuring is
+	/// off, nothing has been measured yet, or here is the measurement.
+	fn link_of(&self, peer: Option<std::net::SocketAddr>) -> Link {
+		if self.links.is_none() {
+			return Link::Off;
+		}
+
+		match self.estimate_for(peer) {
+			Some(estimate) => Link::Measured(estimate),
+			None => Link::Unknown,
+		}
 	}
 
 	fn hidden(&self, host: &str) -> ProxyResponse {
@@ -686,7 +717,7 @@ impl Interceptor for Internal {
 		let host = crate::host_of(&req.url);
 		self.metrics.internal.increment();
 
-		Some(self.route(host, &req.method, path, &req.body))
+		Some(self.route(host, req.peer, &req.method, path, &req.body))
 	}
 
 	/// Its `POST` endpoints read what was sent, so the body has to be here
@@ -707,6 +738,23 @@ impl Interceptor for Internal {
 #[derive(Deserialize)]
 struct Redeem {
 	token: String,
+}
+
+/// `stats.json`: every counter, plus what mach5 thinks of the link belonging to
+/// whoever asked. Flattened, because the counters were already flat and a
+/// scraper wants numbers rather than structure.
+#[derive(Serialize)]
+struct Stats<'a> {
+	#[serde(flatten)]
+	counted: &'a Snapshot,
+	/// Absent rather than guessed when nothing has been measured: a cold start
+	/// is a missing measurement, not a fast link, and a graph should be able to
+	/// tell those apart.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	link_tier: Option<crate::link::Tier>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	link_kbps: Option<u32>,
+	link_clients: usize,
 }
 
 /// The body of a `GET /.mach5/hidden`.
@@ -831,9 +879,22 @@ struct Page<'a> {
 	rules: Option<crate::cosmetic::Status>,
 	ephemeral: bool,
 	live: crate::settings::Settings,
+	/// What is known about the link to whoever is reading this page.
+	link: Link,
 	/// Whether this host is decrypted, and if not, whether that is something
 	/// this page is allowed to undo.
 	decryption: Decryption,
+}
+
+/// What the status page can say about the link to the client reading it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Link {
+	/// `[link] enabled = false`. Nothing is measured and nothing degrades.
+	Off,
+	/// Measuring, but this client has not been measured yet — a fresh
+	/// connection, or one whose measurement has expired.
+	Unknown,
+	Measured(crate::link::Estimate),
 }
 
 /// What the status page can say, and offer, about interception for one host.
@@ -860,6 +921,7 @@ fn status_page(page: Page) -> String {
 		ephemeral,
 		live,
 		decryption,
+		link,
 	} = page;
 
 	let host = escape(host);
@@ -951,7 +1013,7 @@ fn status_page(page: Page) -> String {
 		.to_string(),
 		Decryption::On => format!(
 			r#"<td>decrypted <button data-post="/.mach5/passthrough">stop decrypting {}</button></td>"#,
-			escape(&host)
+			host
 		),
 	};
 
@@ -965,6 +1027,24 @@ fn status_page(page: Page) -> String {
 		crate::settings::Injection::Off => format!(
 			r#"<td class="note">off — no panel on any page 			<button data-set='{{"image_quality":"{quality}","inject":"on"}}'>turn on</button></td>"#,
 			quality = quality_name(live.image_quality)
+		),
+	};
+	// The row this whole measurement exists to be checked against: on a phone,
+	// on a real network, with no way to attach a debugger.
+	let client_link = match link {
+		Link::Off => {
+			r#"<td class="note">not measured &mdash; [link] enabled = false</td>"#.to_string()
+		}
+		Link::Unknown => concat!(
+			r#"<td class="note">not measured yet &mdash; assuming a fast link until "#,
+			r#"something has been carried</td>"#
+		)
+		.to_string(),
+		Link::Measured(estimate) => format!(
+			r#"<td>{tier} <span class="note">· {speed} · measured {age} ago</span></td>"#,
+			tier = estimate.tier.label(),
+			speed = crate::link::speed(estimate.kbps),
+			age = metrics::uptime(estimate.age),
 		),
 	};
 	let bypasses = metrics::thousands(counted.bypassed);
@@ -1020,6 +1100,7 @@ fn status_page(page: Page) -> String {
     <tr><th>Passed through undecrypted</th><td>{passed_through}</td></tr>
     <tr><th>Panel in pages</th>{injection}</tr>
     <tr><th>This host</th>{decrypting}</tr>
+    <tr><th>This client&rsquo;s link</th>{client_link}</tr>
     <tr><th>Origins reachable</th>{families}</tr>
     <tr><th>Cache</th>{caching}</tr>
     <tr><th>Fetched unvalidated</th><td>{bypasses}</td></tr>
@@ -1247,6 +1328,9 @@ mod tests {
 				dir.path().join("passthrough.json"),
 			))),
 			passthrough: Arc::new(crate::passthrough::Passthrough::new(&Config::default())),
+			// Its own store per test, so one test's measurements are never
+			// another's.
+			links: Some(Arc::new(crate::link::Links::new(&Config::default()))),
 		}
 	}
 
@@ -1268,6 +1352,7 @@ mod tests {
 			url: url.to_string(),
 			headers: Vec::new(),
 			body: body.as_bytes().to_vec(),
+			peer: None,
 		}
 	}
 
@@ -1279,8 +1364,105 @@ mod tests {
 			.expect("an internal path is always answered")
 	}
 
+	fn call_from(
+		internal: &Internal,
+		peer: &str,
+		method: &str,
+		url: &str,
+		body: &str,
+	) -> ProxyResponse {
+		let mut req = request(method, url, body);
+		req.peer = Some(peer.parse().unwrap());
+
+		internal
+			.on_request(&mut req)
+			.expect("an internal path is always answered")
+	}
+
 	fn body_of(response: &ProxyResponse) -> String {
 		String::from_utf8(response.body.clone()).expect("responses are utf-8")
+	}
+
+	/// The row exists so this can be checked from a phone on a real network,
+	/// where there is no other way to see what mach5 decided.
+	#[test]
+	fn the_status_page_reports_the_asking_client_s_own_link() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		let cold = body_of(&call_from(
+			&internal,
+			"192.0.2.10:51000",
+			"GET",
+			"https://example.com/.mach5/",
+			"",
+		));
+		assert!(cold.contains("not measured yet"), "{cold}");
+
+		// 300 kbps, which the default ladder calls greyscale.
+		internal
+			.links
+			.as_ref()
+			.unwrap()
+			.record("192.0.2.10".parse().unwrap(), 300);
+
+		let measured = body_of(&call_from(
+			&internal,
+			"192.0.2.10:51000",
+			"GET",
+			"https://example.com/.mach5/",
+			"",
+		));
+		assert!(measured.contains("greyscale"), "{measured}");
+		assert!(measured.contains("300 kbps"), "{measured}");
+
+		// And it is that client's link, not the process's: another address has
+		// still not been measured.
+		let other = body_of(&call_from(
+			&internal,
+			"198.51.100.7:40000",
+			"GET",
+			"https://example.com/.mach5/",
+			"",
+		));
+		assert!(other.contains("not measured yet"), "{other}");
+	}
+
+	#[test]
+	fn stats_json_carries_the_asking_client_s_link() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		let cold: serde_json::Value = serde_json::from_str(&body_of(&call_from(
+			&internal,
+			"192.0.2.10:51000",
+			"GET",
+			"https://example.com/.mach5/stats.json",
+			"",
+		)))
+		.unwrap();
+		assert_eq!(cold.get("link_tier"), None, "unmeasured is absent, not fast");
+		assert_eq!(cold["link_clients"], 0);
+		// Still the counters, flat, exactly as before.
+		assert!(cold.get("requests").is_some(), "{cold}");
+
+		internal
+			.links
+			.as_ref()
+			.unwrap()
+			.record("192.0.2.10".parse().unwrap(), 60);
+
+		let warm: serde_json::Value = serde_json::from_str(&body_of(&call_from(
+			&internal,
+			"192.0.2.10:51000",
+			"GET",
+			"https://example.com/.mach5/stats.json",
+			"",
+		)))
+		.unwrap();
+		assert_eq!(warm["link_tier"], "none");
+		assert_eq!(warm["link_kbps"], 60);
+		assert_eq!(warm["link_clients"], 1);
 	}
 
 	#[test]
@@ -2242,6 +2424,25 @@ mod tests {
 		assert!(!page.contains(r##"" onclick=""##), "{page}");
 		assert!(page.contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "{page}");
 		assert!(page.contains("&quot; onclick=&quot;"), "{page}");
+	}
+
+	/// The host on the status page comes out of the Host header, so it is
+	/// attacker-controlled and has to be escaped — and escaped exactly once.
+	/// It was being escaped twice on the one row that interpolated it again
+	/// after the shadowing binding had already done it.
+	#[test]
+	fn the_host_is_escaped_once_and_only_once() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		let page = body_of(&call(&internal, "GET", "https://a&b.example/.mach5/", ""));
+
+		assert!(!page.contains("a&b.example"), "unescaped: {page}");
+		assert!(
+			!page.contains("a&amp;amp;b.example"),
+			"escaped twice, so the button reads a&amp;amp;b: {page}"
+		);
+		assert!(page.contains("a&amp;b.example"), "{page}");
 	}
 
 	/// A zero that means "nothing was blocked" and a zero that means "there is

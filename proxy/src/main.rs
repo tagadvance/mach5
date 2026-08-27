@@ -672,27 +672,43 @@ fn handle_job(
 	let mut reader = resp.into_reader();
 
 	if interceptor.wants_body(&job.request, &head) || worth_keeping {
-		// One byte past the limit is enough to know it was passed, and is all
-		// that is ever held beyond it. Nothing here trusts content-length: an
-		// origin is free to send more than it declared.
-		let mut body = Vec::new();
-		if let Err(e) = reader.by_ref().take((limit as u64).saturating_add(1)).read_to_end(&mut body) {
-			log::warn!(
-				"failed reading upstream body for {}: {e}",
-				redact::url(&job.request.url)
-			);
-		}
+		let buffered = match upstream::read_body(&mut reader, limit) {
+			upstream::Buffered::Whole(body) => Some(body),
+			upstream::Buffered::TooBig(body) => {
+				// Whatever wanted to look at this does not get to; the client
+				// still gets the response. Refusing it outright would turn a
+				// large download into a broken one over a plugin's filter being
+				// wide.
+				log::warn!(
+					"body for {} is over the {limit} byte buffer limit; relaying it uninspected",
+					redact::url(&job.request.url)
+				);
+				reader = Box::new(std::io::Cursor::new(body).chain(reader));
 
-		if body.len() > limit {
-			// Whatever wanted to look at this does not get to; the client
-			// still gets the response. Refusing it outright would turn a large
-			// download into a broken one over a plugin's filter being wide.
-			log::warn!(
-				"body for {} is over the {limit} byte buffer limit; relaying it uninspected",
-				redact::url(&job.request.url)
-			);
-			reader = Box::new(std::io::Cursor::new(body).chain(reader));
-		} else {
+				None
+			}
+			upstream::Buffered::Truncated => {
+				// Neither stored nor served. Storing it would file a partial
+				// stylesheet as a complete, fresh 200 and hand it to every
+				// client behind the proxy for the whole `max-age` — a
+				// one-second blip pinned in a shared cache. Serving it is no
+				// better: the body is rebuilt with a recomputed length, so the
+				// client would be told a short answer was the whole one, with
+				// no way to know otherwise.
+				log::warn!(
+					"upstream stopped part-way through the body for {}; answering 502",
+					redact::url(&job.request.url)
+				);
+
+				return send(Payload::Full(ProxyResponse {
+					status: 502,
+					headers: vec![("content-type".to_string(), "text/plain".to_string())],
+					body: upstream::TRUNCATED.as_bytes().to_vec(),
+				}));
+			}
+		};
+
+		if let Some(body) = buffered {
 			metrics.bytes_from_origin.add(body.len() as u64);
 			// The origin's own bytes, before anything rewrites them.
 			upstream::store(agents, &job.request, head.status, &head.headers, &body);

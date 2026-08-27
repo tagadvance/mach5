@@ -469,6 +469,55 @@ pub fn response_headers(resp: &ureq::Response) -> Vec<(String, String)> {
 	headers
 }
 
+/// The outcome of reading a response body into memory.
+pub enum Buffered {
+	/// The whole body, within the limit.
+	Whole(Vec<u8>),
+	/// Past the limit. Carries what was read, so a caller can chain it back on
+	/// and relay the rest without ever having held all of it.
+	TooBig(Vec<u8>),
+	/// The origin stopped part-way through a body it had declared the length
+	/// of. What arrived is not a response.
+	Truncated,
+}
+
+/// Read a buffered body, telling a truncation apart from an ending.
+///
+/// Both front ends did this inline and both only logged the read error before
+/// carrying on with what they had — which was then stored as a complete, fresh
+/// 200 and served to every client for the whole `max-age`. Here so that the
+/// distinction is made once and can be tested; a body that ended legitimately
+/// reads `Ok(0)`, so an error is always a truncation.
+pub fn read_body(reader: &mut impl std::io::Read, limit: usize) -> Buffered {
+	use std::io::Read;
+
+	let mut body = Vec::new();
+	// One byte past the limit is enough to know it was passed, and is all that
+	// is ever held beyond it. Nothing here trusts content-length: an origin is
+	// free to send more than it declared.
+	if reader
+		.by_ref()
+		.take((limit as u64).saturating_add(1))
+		.read_to_end(&mut body)
+		.is_err()
+	{
+		return Buffered::Truncated;
+	}
+
+	if body.len() > limit {
+		Buffered::TooBig(body)
+	} else {
+		Buffered::Whole(body)
+	}
+}
+
+/// What a client is told when the origin stopped part-way through a body.
+///
+/// A 502 rather than the bytes that arrived: those are not the response the
+/// origin meant to send, and handing them over with a recomputed length tells
+/// the client a short answer is the whole one.
+pub const TRUNCATED: &str = "mach5: the origin closed the connection part-way through its response\n";
+
 /// Repeated request headers folded into one line each, in the order they were
 /// first seen.
 ///
@@ -850,5 +899,83 @@ mod tests {
 		};
 
 		(origin.join().unwrap(), status)
+	}
+
+	/// An origin that stops part-way through a body it declared the length of.
+	///
+	/// What arrives is not a response. Both front ends used to log the read
+	/// error and carry on, so it was filed as a complete, fresh 200 and handed
+	/// to every client behind the proxy for the whole `max-age` — a
+	/// one-second blip pinning a partial stylesheet in a shared cache.
+	#[test]
+	fn a_body_that_stopped_early_is_told_apart_from_one_that_ended() {
+		use std::io::{Read, Write};
+
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let port = listener.local_addr().unwrap().port();
+
+		std::thread::spawn(move || {
+			for cut_short in [true, false] {
+				let Ok((mut socket, _)) = listener.accept() else {
+					return;
+				};
+				let mut scratch = [0u8; 4096];
+				let _ = socket.read(&mut scratch);
+				socket
+					.write_all(
+						b"HTTP/1.1 200 OK\r\n\
+						  content-type: text/css\r\n\
+						  cache-control: public, max-age=600\r\n\
+						  content-length: 9\r\n\
+						  \r\n",
+					)
+					.unwrap();
+				socket
+					.write_all(if cut_short { &b"body"[..] } else { &b"body{a:b}"[..] })
+					.unwrap();
+				drop(socket);
+			}
+		});
+
+		let agents = agents(std::sync::Arc::new(crate::insecure::Bypasses::default()));
+		let fetch = |port| {
+			let mut req = request(Vec::new());
+			req.url = format!("http://127.0.0.1:{port}/style.css");
+			match call(&agents, &req, crate::body::RequestBody::None) {
+				Ok(Fetched::Live(resp)) => resp.into_reader(),
+				_ => panic!("a live response"),
+			}
+		};
+
+		// Four of the nine bytes it declared, then the socket closes.
+		assert!(
+			matches!(read_body(&mut fetch(port), 1024), Buffered::Truncated),
+			"an origin that stopped early must not look like one that finished"
+		);
+
+		// And the control: the same response, all nine bytes, which must not
+		// be mistaken for a truncation.
+		match read_body(&mut fetch(port), 1024) {
+			Buffered::Whole(body) => assert_eq!(body, b"body{a:b}"),
+			_ => panic!("a body that arrived whole is not truncated"),
+		}
+	}
+
+	#[test]
+	fn a_body_past_the_limit_keeps_what_was_read_to_relay() {
+		let mut origin = std::io::Cursor::new(vec![b'x'; 4096]);
+
+		match read_body(&mut origin, 1024) {
+			// One byte past the limit: enough to know it was passed, and all
+			// that is ever held beyond it.
+			Buffered::TooBig(read) => assert_eq!(read.len(), 1025),
+			_ => panic!("4096 bytes is over a 1024 byte limit"),
+		}
+
+		let mut exact = std::io::Cursor::new(vec![b'x'; 1024]);
+		match read_body(&mut exact, 1024) {
+			Buffered::Whole(body) => assert_eq!(body.len(), 1024, "the limit itself is not over it"),
+			_ => panic!("exactly at the limit is whole"),
+		}
 	}
 }

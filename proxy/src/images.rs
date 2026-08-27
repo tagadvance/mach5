@@ -75,7 +75,7 @@ impl Images {
 }
 
 impl Interceptor for Images {
-	/// Text-only mode, decided on the request alone so the image is never
+	/// Text-only mode, decided on the request where that is possible so the image is never
 	/// fetched. Every other tier is a trade between bytes and how the picture
 	/// looks; this one is the only place the bytes stop entirely.
 	fn on_request(&self, req: &mut ProxyRequest) -> Option<ProxyResponse> {
@@ -100,6 +100,28 @@ impl Interceptor for Images {
 	}
 
 	fn on_response(&self, req: &ProxyRequest, resp: &mut ProxyResponse) {
+		// The other half of text-only mode, for images the request did not
+		// announce. An image fetched by script arrives as `sec-fetch-dest:
+		// empty` and is indistinguishable from any other XHR until the origin
+		// says what it sent, so this is the only place it can be caught.
+		//
+		// The bytes have already been paid for by the time we are here, which
+		// looks like it defeats the point — and would, if the constrained link
+		// were the one to the origin. It is not: mach5 sits on a home
+		// connection and the client reaches it over a tunnel from a phone.
+		// What this saves is every byte on the half that is actually metered.
+		if self.settings.get().image_quality.strips_images()
+			&& is_image_response(&resp.headers)
+		{
+			self.metrics.images_stripped.increment();
+			self.metrics
+				.bytes_saved_by_images
+				.add(resp.body.len().saturating_sub(TRANSPARENT_GIF.len()) as u64);
+			strip(resp);
+
+			return;
+		}
+
 		// Asked again here because another link may be the reason the body was
 		// buffered at all.
 		if !claims(req, resp.status, &resp.headers) || resp.body.len() < MIN_BYTES {
@@ -161,15 +183,16 @@ impl Interceptor for Images {
 		// `image_quality: "off"` still bought every JPEG a trip through memory
 		// up to `max_response_body_mb` — the whole cost of the feature, and
 		// none of it, since `on_response` then hands the bytes straight back.
-		if self
-			.settings
-			.get()
-			.image_quality
-			.applied_to(self.configured)
-			.is_none()
-		{
-			// Covers text-only too: nothing there reaches a response body,
-			// because the request was answered before it was ever sent.
+		let quality = self.settings.get().image_quality;
+
+		// Text-only wants the body precisely so it can throw it away. Only for
+		// what is actually an image: claiming anything else here would take the
+		// whole proxy off streaming.
+		if quality.strips_images() {
+			return is_image_response(&head.headers);
+		}
+
+		if quality.applied_to(self.configured).is_none() {
 			return false;
 		}
 
@@ -207,6 +230,42 @@ fn is_image_request(req: &ProxyRequest) -> bool {
 			.trim()
 			.starts_with("image/")
 	})
+}
+
+/// Whether the origin says it sent an image, whatever the request looked like.
+fn is_image_response(headers: &[(String, String)]) -> bool {
+	headers.iter().any(|(name, value)| {
+		name.eq_ignore_ascii_case("content-type")
+			&& value
+				.trim_start()
+				.to_ascii_lowercase()
+				.starts_with("image/")
+	})
+}
+
+/// Replace a response body with the pixel, in place.
+fn strip(resp: &mut ProxyResponse) {
+	resp.headers.retain(|(name, _)| {
+		!name.eq_ignore_ascii_case("content-type")
+			&& !name.eq_ignore_ascii_case("content-length")
+			&& !name.eq_ignore_ascii_case("cache-control")
+			&& !name.eq_ignore_ascii_case("etag")
+			&& !name.eq_ignore_ascii_case("last-modified")
+			// Whatever the origin used is gone with the body it described.
+			&& !name.eq_ignore_ascii_case("content-encoding")
+	});
+
+	resp.headers
+		.push(("content-type".to_string(), "image/gif".to_string()));
+	// Same reasoning as the request side: this must not outlive the setting,
+	// and a validator kept from the real image would let the browser
+	// revalidate its way back to a pixel.
+	resp.headers
+		.push(("cache-control".to_string(), "no-store".to_string()));
+	resp.headers
+		.push(("x-mach5".to_string(), "no-images".to_string()));
+
+	resp.body = TRANSPARENT_GIF.to_vec();
 }
 
 fn claims(req: &ProxyRequest, status: u16, headers: &[(String, String)]) -> bool {
@@ -663,6 +722,100 @@ mod tests {
 					.on_request(&mut with(&[("sec-fetch-dest", "image")]))
 					.is_none(),
 				"{tier:?} must still go to the origin"
+			);
+		}
+	}
+
+	fn image_head(kind: &str) -> ResponseHead {
+		ResponseHead {
+			status: 200,
+			headers: headers(&[("content-type", kind)]),
+		}
+	}
+
+	#[test]
+	fn text_only_strips_an_image_the_request_did_not_announce() {
+		// What a script-fetched image looks like: nothing in the request says
+		// image, so only the origin's answer gives it away.
+		let (images, _dir) = at_tier(crate::settings::Quality::None);
+		let req = with(&[("sec-fetch-dest", "empty"), ("accept", "*/*")]);
+
+		assert!(
+			images
+				.on_request(&mut with(&[("sec-fetch-dest", "empty"), ("accept", "*/*")]))
+				.is_none(),
+			"not caught on the request"
+		);
+		assert!(
+			images.wants_body(&req, &image_head("image/jpeg")),
+			"so the body has to be claimed in order to throw it away"
+		);
+
+		let mut resp = ProxyResponse {
+			status: 200,
+			headers: headers(&[
+				("content-type", "image/jpeg"),
+				("content-length", "72790"),
+				("etag", "\"abc\""),
+				("cache-control", "public, max-age=31536000"),
+			]),
+			body: vec![0u8; 72_790],
+		};
+		images.on_response(&req, &mut resp);
+
+		assert_eq!(resp.body, TRANSPARENT_GIF.to_vec());
+		assert!(resp.headers.iter().any(|(n, v)| n == "content-type" && v == "image/gif"));
+		assert!(
+			resp.headers.iter().any(|(n, v)| n == "cache-control" && v == "no-store"),
+			"the origin's year-long max-age must not survive the swap"
+		);
+		assert!(
+			!resp.headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("etag")),
+			"a validator from the real image would revalidate back to a pixel"
+		);
+		assert!(
+			!resp.headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("content-length")),
+			"the length described a body that is gone"
+		);
+	}
+
+	#[test]
+	fn text_only_leaves_everything_that_is_not_an_image_alone() {
+		let (images, _dir) = at_tier(crate::settings::Quality::None);
+		let req = with(&[("sec-fetch-dest", "empty"), ("accept", "*/*")]);
+
+		for kind in ["text/html", "application/json", "text/css", "font/woff2"] {
+			assert!(
+				!images.wants_body(&req, &image_head(kind)),
+				"{kind} must keep streaming"
+			);
+
+			let mut resp = ProxyResponse {
+				status: 200,
+				headers: headers(&[("content-type", kind)]),
+				body: b"the page itself".to_vec(),
+			};
+			images.on_response(&req, &mut resp);
+			assert_eq!(resp.body, b"the page itself", "{kind} was rewritten");
+		}
+	}
+
+	#[test]
+	fn no_other_tier_claims_a_body_it_only_means_to_discard() {
+		// `wants_body` taking a response off streaming is the expensive
+		// mistake in this file, so every tier is asked directly.
+		let req = with(&[("accept", "text/html")]);
+
+		for tier in [
+			crate::settings::Quality::Auto,
+			crate::settings::Quality::High,
+			crate::settings::Quality::Low,
+			crate::settings::Quality::Off,
+		] {
+			let (images, _dir) = at_tier(tier);
+			assert!(
+				!images.wants_body(&req, &image_head("image/jpeg")),
+				"{tier:?} claimed a body for a client that never asked for webp"
 			);
 		}
 	}

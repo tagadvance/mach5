@@ -42,6 +42,10 @@ pub enum Quality {
 	Low,
 	/// Leave images exactly as the origin sent them.
 	Off,
+	/// Do not fetch them at all. Every image request is answered on the spot
+	/// with a transparent pixel, so the bytes are never paid for — which is
+	/// the whole point, and why this is a tier rather than a stronger `Low`.
+	None,
 }
 
 impl Quality {
@@ -52,7 +56,16 @@ impl Quality {
 			Self::High => Some(configured.saturating_add(12).min(95)),
 			Self::Low => Some(configured.saturating_sub(35).max(20)),
 			Self::Off => None,
+			Self::None => None,
 		}
+	}
+
+	/// Whether image requests are answered with a pixel instead of fetched.
+	///
+	/// Separate from `applied_to` returning `None`, which only says "do not
+	/// re-encode". Both tiers skip the encoder; only this one skips the origin.
+	pub fn strips_images(self) -> bool {
+		matches!(self, Self::None)
 	}
 }
 

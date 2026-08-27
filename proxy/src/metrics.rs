@@ -86,6 +86,10 @@ pub struct Metrics {
 	pub bytes_saved_by_compression: Counter,
 	/// Bytes not sent because an image was re-encoded.
 	pub bytes_saved_by_images: Counter,
+	/// Images answered with a pixel instead of being fetched, in text-only
+	/// mode. Counted rather than measured in bytes: the origin was never
+	/// asked, so what it would have sent is not known.
+	pub images_stripped: Counter,
 	/// Upstream lookups by the families they came back with. Not utilisation —
 	/// see `resolver.rs` for why that would be a guess.
 	/// Re-encodings that did not have to be done again, and those that did.
@@ -133,6 +137,7 @@ impl Default for Metrics {
 			bytes_to_client: Counter::default(),
 			bytes_saved_by_compression: Counter::default(),
 			bytes_saved_by_images: Counter::default(),
+			images_stripped: Counter::default(),
 			origin_cache_hits: Counter::default(),
 			origin_cache_revalidated: Counter::default(),
 			origin_cache_misses: Counter::default(),
@@ -193,6 +198,7 @@ impl Metrics {
 			bytes_to_client: self.bytes_to_client.get(),
 			bytes_saved_by_compression: self.bytes_saved_by_compression.get(),
 			bytes_saved_by_images: self.bytes_saved_by_images.get(),
+			images_stripped: self.images_stripped.get(),
 			origin_cache_hits: self.origin_cache_hits.get(),
 			origin_cache_revalidated: self.origin_cache_revalidated.get(),
 			origin_cache_misses: self.origin_cache_misses.get(),
@@ -260,6 +266,7 @@ pub struct Snapshot {
 	pub bytes_to_client: u64,
 	pub bytes_saved_by_compression: u64,
 	pub bytes_saved_by_images: u64,
+	pub images_stripped: u64,
 	pub origin_cache_hits: u64,
 	pub origin_cache_revalidated: u64,
 	pub origin_cache_misses: u64,

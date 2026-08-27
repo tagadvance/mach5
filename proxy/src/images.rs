@@ -40,6 +40,15 @@ const CONVERTIBLE: [&str; 3] = ["image/jpeg", "image/jpg", "image/png"];
 /// its own. Tracking pixels and spacers live down here.
 const MIN_BYTES: usize = 3 * 1024;
 
+/// A 1x1 transparent GIF, the same one the blocklist serves. An image request
+/// answered with an empty body leaves a broken-image icon; answered with this,
+/// the page merely has a very small image in it.
+const TRANSPARENT_GIF: [u8; 43] = [
+	0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0xff, 0xff, 0xff, 0x21, 0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00,
+	0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b,
+];
+
 pub struct Images {
 	/// What the configuration asked for. The panel moves around this rather
 	/// than replacing it, so the config stays the thing that sets the house
@@ -66,6 +75,30 @@ impl Images {
 }
 
 impl Interceptor for Images {
+	/// Text-only mode, decided on the request alone so the image is never
+	/// fetched. Every other tier is a trade between bytes and how the picture
+	/// looks; this one is the only place the bytes stop entirely.
+	fn on_request(&self, req: &mut ProxyRequest) -> Option<ProxyResponse> {
+		if !self.settings.get().image_quality.strips_images() || !is_image_request(req) {
+			return None;
+		}
+
+		self.metrics.images_stripped.increment();
+
+		Some(ProxyResponse {
+			status: 200,
+			headers: vec![
+				("content-type".to_string(), "image/gif".to_string()),
+				// Must not outlive the setting. Without this, turning images
+				// back on leaves every page the browser cached showing blanks
+				// until the entries expire, which reads as mach5 being broken.
+				("cache-control".to_string(), "no-store".to_string()),
+				("x-mach5".to_string(), "no-images".to_string()),
+			],
+			body: TRANSPARENT_GIF.to_vec(),
+		})
+	}
+
 	fn on_response(&self, req: &ProxyRequest, resp: &mut ProxyResponse) {
 		// Asked again here because another link may be the reason the body was
 		// buffered at all.
@@ -135,11 +168,45 @@ impl Interceptor for Images {
 			.applied_to(self.configured)
 			.is_none()
 		{
+			// Covers text-only too: nothing there reaches a response body,
+			// because the request was answered before it was ever sent.
 			return false;
 		}
 
 		claims(req, head.status, &head.headers)
 	}
+}
+
+/// Whether this request is a browser asking for an image, as opposed to asking
+/// for something that would merely accept one.
+///
+/// Stricter than it looks like it needs to be, and deliberately: a top-level
+/// navigation's `accept` also contains `image/` further down the list, so a
+/// looser test turns text-only mode into blank-page mode.
+fn is_image_request(req: &ProxyRequest) -> bool {
+	let header = |wanted: &str| {
+		req.headers
+			.iter()
+			.find(|(name, _)| name.eq_ignore_ascii_case(wanted))
+			.map(|(_, value)| value.to_ascii_lowercase())
+	};
+
+	// What the browser says the fetch is for. Definitive where it is sent,
+	// which is every browser current enough to be worth proxying.
+	if let Some(dest) = header("sec-fetch-dest") {
+		return dest.trim() == "image";
+	}
+
+	// Otherwise the *first* type offered, which is `image/...` for an <img>
+	// and `text/html` for a page.
+	header("accept").is_some_and(|accept| {
+		accept
+			.split(',')
+			.next()
+			.unwrap_or_default()
+			.trim()
+			.starts_with("image/")
+	})
 }
 
 fn claims(req: &ProxyRequest, status: u16, headers: &[(String, String)]) -> bool {
@@ -485,5 +552,118 @@ mod tests {
 			to_webp(&edge, 80.0, NO_PIXEL_LIMIT).is_some(),
 			"16383 is allowed, and must stay allowed"
 		);
+	}
+
+	/// The `accept` a browser sends for a top-level navigation. It contains
+	/// `image/` further down the list, which is why the looser test the
+	/// blocklist uses is not good enough here.
+	const NAVIGATION: &str =
+		"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
+
+	/// What Chrome sends for an `<img>`.
+	const IMG: &str = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8";
+
+	/// `Images` with a settings store of its own.
+	///
+	/// `settings::shared` is a process-global `OnceLock`, so two tests moving
+	/// the quality tier at once see each other's writes. Giving each its own
+	/// store on a temporary path is what keeps them independent.
+	fn at_tier(tier: crate::settings::Quality) -> (Images, tempfile::TempDir) {
+		let dir = tempfile::TempDir::new().unwrap();
+		let store = crate::settings::Store::load(dir.path().join("settings.json"));
+		store.set(crate::settings::Settings {
+			image_quality: tier,
+			..Default::default()
+		});
+
+		let mut images = Images::new(&Config::default());
+		images.settings = Arc::new(store);
+
+		(images, dir)
+	}
+
+	fn with(pairs: &[(&str, &str)]) -> ProxyRequest {
+		ProxyRequest {
+			method: "GET".to_string(),
+			url: "https://example.com/photo.jpg".to_string(),
+			headers: headers(pairs),
+			body: Vec::new(),
+		}
+	}
+
+	#[test]
+	fn an_image_request_is_told_apart_from_a_page_that_would_accept_one() {
+		assert!(is_image_request(&with(&[("accept", IMG)])));
+		assert!(
+			!is_image_request(&with(&[("accept", NAVIGATION)])),
+			"a navigation lists image/ too; stripping it would blank the page"
+		);
+
+		// Where the browser says outright, that is what is believed — even
+		// when `accept` disagrees, which it does on exactly this fetch.
+		assert!(is_image_request(&with(&[
+			("sec-fetch-dest", "image"),
+			("accept", "*/*"),
+		])));
+		assert!(!is_image_request(&with(&[
+			("sec-fetch-dest", "document"),
+			("accept", IMG),
+		])));
+
+		// And a request that says nothing is left alone rather than guessed at.
+		assert!(!is_image_request(&with(&[("user-agent", "curl/8")])));
+	}
+
+	#[test]
+	fn text_only_answers_the_image_without_asking_the_origin() {
+		let (images, _dir) = at_tier(crate::settings::Quality::None);
+
+		let answer = images
+			.on_request(&mut with(&[("sec-fetch-dest", "image")]))
+			.expect("answered on the spot");
+
+		assert_eq!(answer.status, 200);
+		assert_eq!(answer.body, TRANSPARENT_GIF.to_vec());
+		assert!(answer
+			.headers
+			.iter()
+			.any(|(n, v)| n == "content-type" && v == "image/gif"));
+
+		// The setting can change at any moment from a phone, so nothing this
+		// produced may outlive it.
+		assert!(
+			answer
+				.headers
+				.iter()
+				.any(|(n, v)| n == "cache-control" && v == "no-store"),
+			"a cached pixel would leave blanks after switching back"
+		);
+
+		// The page itself must still be fetched.
+		assert!(images
+			.on_request(&mut with(&[("accept", NAVIGATION)]))
+			.is_none());
+	}
+
+	#[test]
+	fn every_other_tier_still_fetches_the_image() {
+		for tier in [
+			crate::settings::Quality::Auto,
+			crate::settings::Quality::High,
+			crate::settings::Quality::Low,
+			// `Off` is the one worth naming: it means "do not re-encode", not
+			// "do not fetch", and confusing the two is what this tier exists
+			// to stop.
+			crate::settings::Quality::Off,
+		] {
+			let (images, _dir) = at_tier(tier);
+
+			assert!(
+				images
+					.on_request(&mut with(&[("sec-fetch-dest", "image")]))
+					.is_none(),
+				"{tier:?} must still go to the origin"
+			);
+		}
 	}
 }

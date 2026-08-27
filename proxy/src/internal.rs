@@ -729,6 +729,7 @@ fn quality_name(quality: crate::settings::Quality) -> &'static str {
 		crate::settings::Quality::High => "high",
 		crate::settings::Quality::Low => "low",
 		crate::settings::Quality::Off => "off",
+		crate::settings::Quality::None => "none",
 	}
 }
 

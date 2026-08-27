@@ -142,7 +142,8 @@ on the status page. Nothing will trust it and the next restart mints a different
 one; it exists so you can have a look around, not to deploy.
 
 For real use, install the certificate on each device — mach5 serves it at
-`/.mach5/ca` for exactly that.
+`/.mach5/ca.crt` for exactly that — the `.crt` matters, because a phone decides
+what a download is from its filename.
 
 ## Its own endpoints
 
@@ -151,7 +152,7 @@ Because every name resolves to the proxy, `/.mach5/` is reachable on any host:
 | Path | |
 | --- | --- |
 | `/.mach5/` | status: counters, this host's hidden elements, the CA link |
-| `/.mach5/ca` | the root certificate, as a `.crt` download |
+| `/.mach5/ca.crt` | the root certificate, as a `.crt` download |
 | `/.mach5/stats.json` | the same counters, for scraping |
 | `/.mach5/hidden.css` | this host's hidden elements, as a stylesheet |
 | `/.mach5/mach5.js` | the element picker |

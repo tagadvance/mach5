@@ -44,7 +44,17 @@ const BYPASS: &str = "/.mach5/bypass";
 
 /// The root certificate, and the name a device sees it saved under. A `.crt`
 /// rather than a `.der`: that is the extension the install flows recognise.
-const CERTIFICATE: &str = "/.mach5/ca";
+/// The path ends in `.crt` because a phone decides what a download *is* from
+/// its filename, and several browsers take that from the URL rather than from
+/// `content-disposition`. Downloaded from `/.mach5/ca`, Android saved a file
+/// called `ca`, and its certificate installer greys out anything without a
+/// recognised extension — so the endpoint whose entire job is being the first
+/// step on a new device could not be used on the commonest one.
+const CERTIFICATE: &str = "/.mach5/ca.crt";
+/// The original path, kept working: it is in older notes and anyone's muscle
+/// memory, and a redirect would be one more thing to go wrong on a device that
+/// does not yet trust us.
+const CERTIFICATE_ALIAS: &str = "/.mach5/ca";
 const CERTIFICATE_FILENAME: &str = "mach5-root.crt";
 
 /// Bounds on what one page can store. A selector is a handful of characters in
@@ -361,7 +371,7 @@ impl Internal {
 			("/.mach5/settings", "POST") => self.change_settings(body),
 			("/.mach5/hidden.css", "GET") => self.stylesheet(host),
 			("/.mach5/mach5.js", "GET") => script(),
-			(CERTIFICATE, "GET") => self.certificate(),
+			(CERTIFICATE | CERTIFICATE_ALIAS, "GET") => self.certificate(),
 			(
 				"/.mach5"
 				| "/.mach5/"
@@ -373,7 +383,8 @@ impl Internal {
 				| "/.mach5/hidden/clear"
 				| "/.mach5/hidden.css"
 				| "/.mach5/mach5.js"
-				| CERTIFICATE,
+				| CERTIFICATE
+				| CERTIFICATE_ALIAS,
 				_,
 			) => empty(405),
 			_ => empty(404),
@@ -1894,6 +1905,45 @@ mod tests {
 
 	/// A regression guard on somebody later serving a "convenient" bundle: the
 	/// public certificate is the only thing that may ever leave this endpoint.
+	/// A phone decides what a download is from its filename, and browsers take
+	/// that from the URL as often as from `content-disposition`. Served at
+	/// `/.mach5/ca`, Android saved a file called `ca` and its certificate
+	/// installer greyed it out — so the endpoint whose whole job is being the
+	/// first step on a new device did not work on the commonest one.
+	#[test]
+	fn the_certificate_is_served_from_a_path_a_phone_can_recognise() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		assert!(
+			CERTIFICATE.ends_with(".crt"),
+			"the path itself has to carry the extension: {CERTIFICATE}"
+		);
+
+		let served = call(&internal, "GET", &format!("https://example.com{CERTIFICATE}"), "");
+		assert_eq!(served.status, 200);
+
+		// The old path keeps working — it is in older notes, and a redirect is
+		// one more thing to go wrong on a device that does not trust us yet.
+		let old = call(
+			&internal,
+			"GET",
+			&format!("https://example.com{CERTIFICATE_ALIAS}"),
+			"",
+		);
+		assert_eq!(old.status, 200);
+		assert_eq!(old.body, served.body, "the same certificate either way");
+
+		// And the download still names itself, for clients that do read it.
+		let disposition = served
+			.headers
+			.iter()
+			.find(|(name, _)| name.eq_ignore_ascii_case("content-disposition"))
+			.map(|(_, v)| v.clone())
+			.unwrap_or_default();
+		assert!(disposition.contains(".crt"), "{disposition}");
+	}
+
 	#[test]
 	fn the_certificate_endpoint_never_serves_the_private_key() {
 		let dir = TempDir::new().unwrap();
@@ -1998,7 +2048,7 @@ mod tests {
 			"",
 		));
 
-		assert!(dev.contains(r#"href="/.mach5/ca""#), "{dev}");
+		assert!(dev.contains(&format!(r#"href="{CERTIFICATE}""#)), "{dev}");
 		assert!(dev.contains("Settings"), "{dev}");
 		assert!(dev.contains("<strong>This is an ephemeral dev CA</strong>"), "{dev}");
 
@@ -2009,7 +2059,7 @@ mod tests {
 			"",
 		));
 
-		assert!(loaded.contains(r#"href="/.mach5/ca""#), "{loaded}");
+		assert!(loaded.contains(&format!(r#"href="{CERTIFICATE}""#)), "{loaded}");
 		assert!(!loaded.contains("ephemeral"), "a real root is not: {loaded}");
 	}
 

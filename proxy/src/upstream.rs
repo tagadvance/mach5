@@ -203,8 +203,13 @@ pub fn call(
 	// asking about the copy on disk.
 	let revalidating = matches!(cached, Some(Cached::Stale(..)));
 
-	for (name, value) in &req.headers {
-		if !forwarded(name, value) {
+	// Joined before anything is sent, because `set` *replaces*: a header the
+	// client sent twice would arrive at the origin once, carrying only the last
+	// line. HTTP/2 and HTTP/3 clients split `cookie` across several fields as a
+	// matter of course — RFC 9113 §8.2.3 says they may — so what that dropped
+	// was half of somebody's cookies, and the origin saw a signed-out user.
+	for (name, value) in joined_for_upstream(&req.headers) {
+		if !forwarded(&name, &value) {
 			continue;
 		}
 
@@ -215,11 +220,11 @@ pub fn call(
 		// question, which the code below then reads as the origin confirming
 		// what mach5 had stored. That is a stale asset pinned in a shared cache
 		// by anyone who asks for it.
-		if revalidating && conditional(name) {
+		if revalidating && conditional(&name) {
 			continue;
 		}
 
-		request = request.set(name, value);
+		request = request.set(&name, &value);
 	}
 	request = request.set("accept-encoding", &encoding::negotiate(&req.headers));
 	// Last, and with `set` rather than a push: this must be our value even when
@@ -464,6 +469,37 @@ pub fn response_headers(resp: &ureq::Response) -> Vec<(String, String)> {
 	headers
 }
 
+/// Repeated request headers folded into one line each, in the order they were
+/// first seen.
+///
+/// RFC 9113 §8.2.3: a field split across several lines is reassembled by
+/// joining with `", "`, except `cookie`, which uses `"; "` — the separator its
+/// own grammar uses, so an origin parsing it sees the crumbs the client sent.
+fn joined_for_upstream(headers: &[(String, String)]) -> Vec<(String, String)> {
+	let mut order: Vec<String> = Vec::new();
+	let mut joined: std::collections::HashMap<String, (String, String)> =
+		std::collections::HashMap::new();
+
+	for (name, value) in headers {
+		let key = name.to_ascii_lowercase();
+		match joined.get_mut(&key) {
+			Some((_, held)) => {
+				held.push_str(if key == "cookie" { "; " } else { ", " });
+				held.push_str(value);
+			}
+			None => {
+				order.push(key.clone());
+				joined.insert(key, (name.clone(), value.clone()));
+			}
+		}
+	}
+
+	order
+		.into_iter()
+		.filter_map(|key| joined.remove(&key))
+		.collect()
+}
+
 /// Headers that make a request conditional, and therefore belong to whoever is
 /// doing the conditioning.
 fn conditional(name: &str) -> bool {
@@ -487,6 +523,16 @@ fn conditional(name: &str) -> bool {
 ///   refuse what it does not understand.
 fn forwarded(name: &str, value: &str) -> bool {
 	if name.eq_ignore_ascii_case("accept-encoding") {
+		return false;
+	}
+
+	// Ours, and only ours. `set` replaces a header — except one whose name
+	// begins `x-`, which ureq pushes instead, so a client that sent its own
+	// `x-mach5-via` had it relayed to the origin beside the real one. The loop
+	// guard tests incoming requests with `any`, so it was never fooled; what
+	// was wrong is that the comment beside the `set` claimed an exclusivity the
+	// call did not provide.
+	if name.eq_ignore_ascii_case(VIA) {
 		return false;
 	}
 
@@ -714,5 +760,95 @@ mod tests {
 		// The other one that never goes as it came.
 		assert!(!forwarded("accept-encoding", "zstd"));
 		assert!(forwarded("accept", "text/html"));
+	}
+
+	/// A header the client sent twice must reach the origin whole.
+	///
+	/// `set` replaces, so the second line used to be all that arrived. HTTP/2
+	/// and HTTP/3 clients split `cookie` across several fields as a matter of
+	/// course, and half of somebody's cookies going missing looks to the origin
+	/// like a signed-out user.
+	#[test]
+	fn a_repeated_request_header_reaches_the_origin_whole() {
+		let (seen, _) = what_reached_the_origin(vec![
+			("cookie".to_string(), "session=abc".to_string()),
+			("cookie".to_string(), "csrf=xyz".to_string()),
+			("accept-language".to_string(), "en".to_string()),
+			("accept-language".to_string(), "fr".to_string()),
+		]);
+
+		assert!(
+			seen.contains("cookie: session=abc; csrf=xyz"),
+			"cookies join on their own grammar's separator (RFC 9113 8.2.3):\n{seen}"
+		);
+		assert!(
+			seen.contains("accept-language: en, fr"),
+			"everything else joins on a comma:\n{seen}"
+		);
+		assert_eq!(
+			seen.lines()
+				.filter(|line| line.to_ascii_lowercase().starts_with("cookie:"))
+				.count(),
+			1,
+			"and as one line, not several:\n{seen}"
+		);
+	}
+
+	/// The marker that stops mach5 fetching itself is ours to set.
+	///
+	/// ureq's `set` replaces a header — except one named `x-...`, which it
+	/// pushes, so a client sending its own was relayed to the origin beside the
+	/// real one.
+	#[test]
+	fn a_client_cannot_add_its_own_loop_marker() {
+		let (seen, _) = what_reached_the_origin(via("forged-by-the-client"));
+
+		assert_eq!(
+			seen.lines()
+				.filter(|line| line.to_ascii_lowercase().starts_with("x-mach5-via:"))
+				.count(),
+			1,
+			"exactly one, and it is ours:\n{seen}"
+		);
+		assert!(!seen.contains("forged-by-the-client"), "{seen}");
+	}
+
+	/// Runs one request through `call` against a socket that reports what it
+	/// was sent, which is the only way to see what ureq actually put on the
+	/// wire rather than what we asked it to.
+	fn what_reached_the_origin(headers: Vec<(String, String)>) -> (String, u16) {
+		use std::io::{BufRead, BufReader, Write};
+
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let port = listener.local_addr().unwrap().port();
+
+		let origin = std::thread::spawn(move || {
+			let (mut socket, _) = listener.accept().unwrap();
+			let mut reader = BufReader::new(socket.try_clone().unwrap());
+			let mut request = String::new();
+			loop {
+				let mut line = String::new();
+				if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+					break;
+				}
+				request.push_str(&line);
+			}
+			socket
+				.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+				.unwrap();
+
+			request
+		});
+
+		let mut req = request(headers);
+		req.url = format!("http://127.0.0.1:{port}/");
+
+		let agents = agents(std::sync::Arc::new(crate::insecure::Bypasses::default()));
+		let status = match call(&agents, &req, crate::body::RequestBody::None) {
+			Ok(Fetched::Live(live)) => live.status(),
+			_ => 0,
+		};
+
+		(origin.join().unwrap(), status)
 	}
 }

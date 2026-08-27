@@ -639,22 +639,46 @@ impl Config {
 	}
 }
 
-fn home() -> PathBuf {
-	std::env::var_os("HOME")
-		.map(PathBuf::from)
-		.unwrap_or_else(|| PathBuf::from("."))
+/// The home directory, or `None` when there is not a usable one.
+///
+/// Docker sets `HOME=/` for a uid with no passwd entry, which is what happens
+/// the moment a container is told to run as an arbitrary user. `~/.cache/mach5`
+/// then expands to `/.cache/mach5`, which that uid cannot create — so mach5
+/// came up with no cache, no state, and two warnings nobody was watching for.
+/// `/` and the empty string are therefore treated as "no home" rather than
+/// expanded into nonsense.
+fn home() -> Option<PathBuf> {
+	let home = std::env::var_os("HOME").map(PathBuf::from)?;
+
+	if home.as_os_str().is_empty() || home == Path::new("/") {
+		return None;
+	}
+
+	Some(home)
 }
 
 fn config_home() -> PathBuf {
 	std::env::var_os("XDG_CONFIG_HOME")
 		.map(PathBuf::from)
-		.unwrap_or_else(|| home().join(".config"))
+		.unwrap_or_else(|| home().unwrap_or_else(|| PathBuf::from(".")).join(".config"))
+}
+
+/// `<home>/<rest>`, or a literal `~/<rest>` when there is no usable home.
+///
+/// Keeping the tilde is deliberate: the path then fails to create under the
+/// name it was written as, so the error is about the default rather than about
+/// `/.cache/mach5`, which nobody recognises as theirs.
+fn tilde_or(home: Option<PathBuf>, rest: &str) -> PathBuf {
+	match home {
+		Some(home) => home.join(rest),
+		None => PathBuf::from("~").join(rest),
+	}
 }
 
 fn default_cache_dir() -> PathBuf {
 	std::env::var_os("XDG_CACHE_HOME")
 		.map(PathBuf::from)
-		.unwrap_or_else(|| home().join(".cache"))
+		.unwrap_or_else(|| tilde_or(home(), ".cache"))
 		.join("mach5")
 }
 
@@ -663,7 +687,7 @@ fn default_cache_dir() -> PathBuf {
 fn default_state_dir() -> PathBuf {
 	std::env::var_os("XDG_DATA_HOME")
 		.map(PathBuf::from)
-		.unwrap_or_else(|| home().join(".local").join("share"))
+		.unwrap_or_else(|| tilde_or(home(), ".local").join("share"))
 		.join("mach5")
 }
 
@@ -676,12 +700,56 @@ fn expand_tilde(path: &Path) -> PathBuf {
 		return path.to_path_buf();
 	};
 
-	home().join(rest)
+	// With no usable home the path stays as it was written. It will fail to
+	// create, and the caller says why — which beats expanding to `/` and
+	// failing with a path nobody recognises.
+	match home() {
+		Some(home) => home.join(rest),
+		None => path.to_path_buf(),
+	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// These tests are about `~` being expanded, so they need something to
+	/// expand it to. A machine with no usable HOME is a real situation — it is
+	/// what a container gives you — but it is covered by
+	/// `a_path_that_cannot_be_expanded_keeps_its_tilde` below, which needs no
+	/// environment at all.
+	fn a_home() -> PathBuf {
+		home().expect("these tests assume a usable HOME; see tilde_or for the other case")
+	}
+
+	/// Docker sets `HOME=/` for a uid with no passwd entry, so `~/.cache/mach5`
+	/// became `/.cache/mach5` — a path the container could not create, named
+	/// after nothing the operator wrote. Keeping the tilde means the failure
+	/// names the default itself, and `usable_directory` refuses it outright
+	/// rather than creating a directory called `~` next to wherever it started.
+	#[test]
+	fn a_path_that_cannot_be_expanded_keeps_its_tilde() {
+		assert_eq!(
+			tilde_or(None, ".cache"),
+			PathBuf::from("~/.cache"),
+			"no home, so the tilde stays and the error can say so"
+		);
+		assert_eq!(
+			tilde_or(Some(PathBuf::from("/home/someone")), ".cache"),
+			PathBuf::from("/home/someone/.cache")
+		);
+
+		// And the two values Docker actually hands out are both refused.
+		for unusable in ["", "/"] {
+			assert_eq!(
+				tilde_or(Some(PathBuf::from(unusable)).filter(|h| {
+					!h.as_os_str().is_empty() && h != Path::new("/")
+				}), ".cache"),
+				PathBuf::from("~/.cache"),
+				"HOME={unusable:?} is not a home"
+			);
+		}
+	}
 
 	#[test]
 	fn defaults_apply_to_an_empty_file() {
@@ -725,7 +793,7 @@ mod tests {
 	fn tilde_expands_to_home() {
 		let expanded = expand_tilde(Path::new("~/.cache/mach5"));
 
-		assert_eq!(expanded, home().join(".cache/mach5"));
+		assert_eq!(expanded, a_home().join(".cache/mach5"));
 		assert_eq!(expand_tilde(Path::new("/abs/path")), Path::new("/abs/path"));
 	}
 
@@ -733,7 +801,7 @@ mod tests {
 	fn blocklist_paths_expand_like_every_other_path() {
 		let config = Config::from_str("[blocklist]\nfiles = [\"~/lists/hosts\"]\n").unwrap();
 
-		assert_eq!(config.blocklist.files, vec![home().join("lists/hosts")]);
+		assert_eq!(config.blocklist.files, vec![a_home().join("lists/hosts")]);
 		assert!(config.blocklist.enabled, "a list with no files is a no-op");
 		assert!(config.blocklist.urls.is_empty(), "nothing is fetched unasked");
 		assert_eq!(config.blocklist.refresh_hours, 24, "daily by default");
@@ -769,7 +837,7 @@ mod tests {
 		)
 		.unwrap();
 
-		assert_eq!(config.cosmetic.files, vec![home().join("lists/easylist.txt")]);
+		assert_eq!(config.cosmetic.files, vec![a_home().join("lists/easylist.txt")]);
 		assert_eq!(
 			config.cosmetic.urls,
 			vec!["https://example.com/annoyances.txt".to_string()]
@@ -790,7 +858,7 @@ mod tests {
 	fn state_is_kept_apart_from_the_cache() {
 		let config = Config::from_str("[paths]\nstate_dir = \"~/state\"\n").unwrap();
 
-		assert_eq!(config.paths.state_dir, home().join("state"));
+		assert_eq!(config.paths.state_dir, a_home().join("state"));
 		assert_ne!(
 			Config::default().paths.state_dir,
 			Config::default().paths.cache_dir,

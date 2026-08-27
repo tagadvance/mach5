@@ -1,4 +1,13 @@
-# mach5 configuration.
+# mach5 configuration — FOR RUNNING IT LOCALLY, NOT IN A CONTAINER.
+#
+# ============================================================================
+#  Do not mount this file into the container. Use docker/mach5.toml.
+#
+#  This one listens on 4433/4443 rather than 443, leaves [ca] commented out so
+#  a local run gets a throwaway CA, and leaves [paths] commented out so they
+#  fall back to ~/.cache and ~/.local/share — none of which is what a container
+#  wants, and all of which fails there in ways that look like other problems.
+# ============================================================================
 #
 # Every value here is optional — anything omitted falls back to the default
 # shown in the comment. Lookup order:

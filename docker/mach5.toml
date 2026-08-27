@@ -1,4 +1,12 @@
-# mach5 configuration for the container.
+# mach5 configuration — FOR THE CONTAINER. This is the one compose mounts.
+#
+# ============================================================================
+#  The repo-root mach5.toml is for running locally and will not work here: it
+#  listens on 4433/4443, has no [ca], and leaves [paths] at defaults that a
+#  container cannot write. Mounting it by mistake gives you an ephemeral CA,
+#  permission-denied warnings for ~/.cache, and a bind failure — none of which
+#  names the actual cause.
+# ============================================================================
 #
 # Paths are relative to /etc/mach5, which is the image's working directory and
 # where compose mounts the plugins and CA.

@@ -241,6 +241,30 @@ fn answered_on_the_command_line() -> bool {
 	false
 }
 
+/// Make sure a configured directory exists and can be written, with an error
+/// somebody can act on rather than a bare `Permission denied`.
+///
+/// The unexpanded `~` is checked first and on purpose. Docker sets `HOME=/` for
+/// a uid with no passwd entry, which is what happens the moment a container
+/// runs as an arbitrary user — so the default `~/.cache/mach5` cannot be
+/// expanded, and creating it would either fail with a path nobody recognises or
+/// quietly make a directory literally named `~` in the working directory.
+/// Neither is a thing to let happen silently.
+fn usable_directory(path: &std::path::Path, setting: &str) -> Result<(), String> {
+	if path.starts_with("~") {
+		return Err(format!(
+			"[paths] {setting} defaults to {} and there is no usable HOME to expand \
+			 `~` against — normal in a container running as a uid with no passwd \
+			 entry. Set it to an absolute path the container can write, as \
+			 docker/mach5.toml does.",
+			path.display()
+		));
+	}
+
+	std::fs::create_dir_all(path)
+		.map_err(|e| format!("cannot create [paths] {setting} at {} ({e}).", path.display()))
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
 	if answered_on_the_command_line() {
 		return Ok(());
@@ -256,18 +280,22 @@ fn main() -> Result<(), Box<dyn Error>> {
 	let _ = token_key();
 	let listen = config.listen.0;
 
-	if let Err(e) = std::fs::create_dir_all(&config.paths.cache_dir) {
-		log::warn!(
-			"could not create cache dir {}: {e}",
-			config.paths.cache_dir.display()
-		);
+	// A cache mach5 cannot write is survivable — it works, just slower.
+	if let Err(e) = usable_directory(&config.paths.cache_dir, "cache_dir") {
+		log::warn!("no cache: {e} Nothing will be cached, so every image is re-encoded and every asset re-fetched.");
 	}
 
-	if let Err(e) = std::fs::create_dir_all(&config.paths.state_dir) {
-		log::warn!(
-			"could not create state dir {}: {e}",
-			config.paths.state_dir.display()
-		);
+	// The state directory is not survivable, and does not warn. It holds what
+	// somebody typed — the elements they hid, the settings they chose — and a
+	// proxy that runs happily while silently failing to keep any of it is the
+	// worst of the available behaviours. Refusing to start costs one line of
+	// configuration and is impossible to miss.
+	if let Err(e) = usable_directory(&config.paths.state_dir, "state_dir") {
+		return Err(format!(
+			"{e} This is where hidden elements and settings are kept, so mach5 \
+			 will not start without it."
+		)
+		.into());
 	}
 
 	// Before the front ends, so the first fetch of every list is already under
@@ -285,7 +313,17 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 	let mut poll = mio::Poll::new()?;
 	let mut events = mio::Events::with_capacity(1024);
-	let mut socket = mio::net::UdpSocket::bind(listen)?;
+	// Named, because `Os { code: 99, kind: AddrNotAvailable }` on its own tells
+	// nobody which address failed — and the answer is almost always that the
+	// address is not on this machine, or not inside this container's network
+	// namespace, which is a thing you can only check if you know what was tried.
+	let mut socket = mio::net::UdpSocket::bind(listen).map_err(|e| {
+		format!(
+			"cannot bind {listen} for QUIC: {e}. Check that [listen] names an \
+			 address this machine actually has — inside a container that means \
+			 the container's own addresses, not the host's."
+		)
+	})?;
 	poll.registry()
 		.register(&mut socket, SOCKET, mio::Interest::READABLE)?;
 	let waker = Arc::new(mio::Waker::new(poll.registry(), WAKER)?);

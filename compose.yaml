@@ -10,9 +10,22 @@ services:
     # Browsers open TCP 443 first and only move to QUIC once they have seen the
     # Alt-Svc header, so both are required. UDP is not optional either — without
     # it the Alt-Svc advertisement points at a closed door.
+    # MACH5_BIND picks which address to listen on. Unset means all of them,
+    # which is right on a box that does nothing else.
+    #
+    # It matters the moment something else already wants 443 — an nginx or
+    # Caddy reverse proxy, almost always. Two servers cannot share a port on an
+    # address, so either give mach5 a host of its own, or give it an address of
+    # its own here and leave the reverse proxy on the other one.
+    #
+    # Note this is not the same trade as with a normal reverse proxy. mach5
+    # wants to be *the* thing on 443 for every hostname there is, so sharing a
+    # box with something that also wants 443 for a few specific hostnames is
+    # awkward even when the ports do not collide. A separate host is the
+    # simpler answer if you have one.
     ports:
-      - "443:443/tcp"
-      - "443:443/udp"
+      - "${MACH5_BIND:-0.0.0.0}:443:443/tcp"
+      - "${MACH5_BIND:-0.0.0.0}:443:443/udp"
 
     # Run as whoever owns the CA private key on the host — it is mode 600, and
     # rightly so. Override with MACH5_UID/MACH5_GID if yours are not 1000.

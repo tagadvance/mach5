@@ -379,12 +379,25 @@ fn a_hello_split_across_segments_is_still_passed_through() {
 		let Ok((mut peer, _)) = origin.accept() else {
 			return;
 		};
+
+		// A read timeout and a deadline rather than a bare blocking read: the
+		// hello arrives in two segments with a pause between them, and treating
+		// a lull as end-of-stream meant this thread occasionally reported the
+		// first 1400 bytes as though that were all mach5 forwarded. That failed
+		// as a truncated splice, which is a different bug from the one this
+		// test is about, and it only happened when the machine was loaded.
+		peer.set_read_timeout(Some(std::time::Duration::from_millis(200))).ok();
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
 		let mut seen = Vec::new();
 		let mut buf = [0u8; 4096];
-		while seen.len() < expected.len() {
+		while seen.len() < expected.len() && std::time::Instant::now() < deadline {
 			match peer.read(&mut buf) {
-				Ok(0) | Err(_) => break,
+				Ok(0) => break,
 				Ok(read) => seen.extend_from_slice(&buf[..read]),
+				Err(e)
+					if e.kind() == std::io::ErrorKind::WouldBlock
+						|| e.kind() == std::io::ErrorKind::TimedOut => {}
+				Err(_) => break,
 			}
 		}
 		let _ = arrived.send(seen);
@@ -490,5 +503,31 @@ fn an_unlisted_host_the_peek_could_not_read_is_not_refused() {
 		"an unlisted host was refused, so the backstop is firing for \
 		 everything the peek cannot read:\n{}",
 		proxy.log()
+	);
+}
+
+/// A proxy that cannot bind its TCP port must not keep running.
+///
+/// It used to bind inside the runtime thread, where the only thing to be done
+/// with the error was log it — and the process carried on serving QUIC. That
+/// is not a degraded proxy but a useless one: HTTP/3 cannot bootstrap itself,
+/// so a browser starts on TCP, finds nothing, and never sees the `Alt-Svc`
+/// that would have moved it across. It had already said "listening" by then.
+#[test]
+fn a_tcp_port_it_cannot_bind_is_fatal() {
+	use std::net::TcpListener;
+
+	let held = TcpListener::bind("127.0.0.1:0").expect("hold a port");
+	let taken = held.local_addr().unwrap().port();
+
+	let (status, log) = common::run_until_exit(&format!("listen_tcp = \"127.0.0.1:{taken}\""));
+
+	assert!(
+		!status.success(),
+		"mach5 stayed up without a TCP listener:\n{log}"
+	);
+	assert!(
+		log.contains(&format!("cannot bind 127.0.0.1:{taken}")),
+		"and it must say which address it was:\n{log}"
 	);
 }

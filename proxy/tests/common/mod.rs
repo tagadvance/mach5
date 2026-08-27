@@ -37,6 +37,47 @@ pub fn free_port() -> u16 {
 	listener.local_addr().expect("bound address").port()
 }
 
+/// Start a proxy that is expected to fail, and collect why.
+///
+/// Separate from [`Proxy`], which retries a failed start on the assumption
+/// that the port was taken from under it. Here the failure is the subject.
+pub fn run_until_exit(extra: &str) -> (std::process::ExitStatus, String) {
+	let dir = TempDir::new().expect("a temporary directory");
+	let path = dir.path().to_path_buf();
+	let config = path.join("mach5.toml");
+
+	std::fs::write(
+		&config,
+		format!(
+			"listen = \"127.0.0.1:0\"\n\
+			 {extra}\n\
+			 [paths]\n\
+			 cache_dir = \"{cache}\"\n\
+			 state_dir = \"{state}\"\n",
+			cache = path.join("cache").display(),
+			state = path.display(),
+		),
+	)
+	.expect("write the configuration");
+
+	let log = path.join("proxy.log");
+	let out = std::fs::File::create(&log).expect("create the log");
+	let err = out.try_clone().expect("share the log");
+
+	let status = Command::new(env!("CARGO_BIN_EXE_mach5-proxy"))
+		.env("MACH5_CONFIG", &config)
+		.env("RUST_LOG", "info")
+		.stdin(Stdio::null())
+		.stdout(Stdio::from(out))
+		.stderr(Stdio::from(err))
+		.status()
+		.expect("spawn the proxy");
+
+	let text = std::fs::read_to_string(&log).unwrap_or_default();
+
+	(status, text)
+}
+
 /// A running `mach5-proxy`, its configuration and state confined to a
 /// temporary directory that goes away with it.
 pub struct Proxy {
@@ -244,11 +285,25 @@ impl Proxy {
 	/// Whether it came up. `false` means the child died before listening,
 	/// which with a dozen of these starting at once is nearly always the port
 	/// having been taken between `free_port` handing it over and the bind.
+	///
+	/// Readiness is our child's own log saying it bound, and not merely that
+	/// something answers on the port. Those are different questions when two
+	/// tests are handed the same recently-freed ephemeral port: one binds it,
+	/// the other's child dies of `AddrInUse`, and the dead one's probe connects
+	/// happily — to the *other* test's proxy. It then runs against a process it
+	/// does not own until that test's `Drop` kills it, and whatever it does
+	/// next fails with `ConnectionRefused` somewhere unrelated. That is one
+	/// failure in roughly fifteen full-suite runs under load, landing on a
+	/// different test each time.
+	///
+	/// The log file is per-instance, inside this proxy's own temporary
+	/// directory, so nothing else can write the line we are waiting for.
 	fn await_ready(&mut self) -> bool {
 		let deadline = Instant::now() + STARTUP_TIMEOUT;
+		let bound = format!("listening on 127.0.0.1:{}", self.tcp_port);
 
 		while Instant::now() < deadline {
-			if TcpStream::connect(("127.0.0.1", self.tcp_port)).is_ok() {
+			if self.log().contains(&bound) && TcpStream::connect(("127.0.0.1", self.tcp_port)).is_ok() {
 				return true;
 			}
 

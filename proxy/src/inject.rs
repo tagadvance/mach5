@@ -188,11 +188,18 @@ fn charset(headers: &[(String, String)]) -> &str {
 	headers
 		.iter()
 		.find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-		.and_then(|(_, value)| value.split(';').find_map(|part| {
-			let part = part.trim();
-			part.strip_prefix("charset=")
-				.or_else(|| part.strip_prefix("charset ="))
-		}))
+		.and_then(|(_, value)| {
+			value.split(';').find_map(|part| {
+				// A parameter name is case-insensitive (RFC 9110 §5.6.6), and
+				// matching it exactly meant `CHARSET=utf-16le` read as the
+				// `utf-8` default — which is how a page mach5 has decided it
+				// must not rewrite gets rewritten anyway.
+				let part = part.trim();
+				let (name, value) = part.split_once('=')?;
+
+				name.trim().eq_ignore_ascii_case("charset").then_some(value)
+			})
+		})
 		.map(|charset| charset.trim().trim_matches('"'))
 		.unwrap_or("utf-8")
 }
@@ -629,14 +636,40 @@ mod tests {
 	/// One that mach5 *can* rewrite: the high bytes are meaningful in this
 	/// encoding and must survive being parsed and written back out.
 	#[test]
+	/// A parameter name is case-insensitive (RFC 9110 §5.6.6). Matching
+	/// `charset=` exactly meant a page announcing `CHARSET=` fell back to the
+	/// `utf-8` default, which is the answer that means "safe to rewrite" — so
+	/// the guard against rewriting an encoding lol_html cannot handle was
+	/// bypassable by shouting.
+	#[test]
+	fn the_charset_parameter_is_read_however_it_is_spelled() {
+		let named = |value: &str| {
+			charset(&[("content-type".to_string(), value.to_string())]).to_string()
+		};
+
+		assert_eq!(named("text/html; charset=utf-16le"), "utf-16le");
+		assert_eq!(named("text/html; CHARSET=utf-16le"), "utf-16le");
+		assert_eq!(named("text/html; Charset = utf-16le"), "utf-16le");
+		assert_eq!(named("text/html; charset=\"windows-1252\""), "windows-1252");
+		assert_eq!(named("text/html"), "utf-8", "the default when none is given");
+
+		// And what it is for: the encodings lol_html cannot rewrite must be
+		// recognised whatever case the origin used to announce them.
+		for spelling in ["charset=utf-16le", "CHARSET=UTF-16LE", "Charset=Utf-16Le"] {
+			assert!(
+				encoding_for(charset(&[(
+					"content-type".to_string(),
+					format!("text/html; {spelling}")
+				)]))
+				.is_none(),
+				"{spelling} must be refused, not rewritten as if it were utf-8"
+			);
+		}
+	}
+
 	fn a_windows_1252_page_keeps_its_bytes() {
 		// 0xA9 is © in windows-1252 and not valid UTF-8 on its own.
-		let mut body = b"<html><head></head><body>caf\xe9 \xa9</body></html>".to_vec();
-		body = body
-			.iter()
-			.copied()
-			.flat_map(|b| if b == b'\\' { vec![] } else { vec![b] })
-			.collect();
+		let body = b"<html><head></head><body>caf\xe9 \xa9</body></html>".to_vec();
 		let mut resp = ProxyResponse {
 			status: 200,
 			headers: vec![(
@@ -646,6 +679,15 @@ mod tests {
 			body,
 		};
 		run(&inject(&[]), "https://example.com/", &mut resp);
+
+		// First: that anything happened at all. Without this the assertions
+		// below hold just as well when nothing is injected — they only say the
+		// input's own bytes came back, which is what *not* rewriting looks
+		// like. Checked by disabling `rewrite` outright: this test passed.
+		assert!(
+			resp.body.windows(TAGS.len()).any(|w| w == TAGS.as_bytes()),
+			"the page was not rewritten, so it proves nothing about rewriting it"
+		);
 
 		assert!(
 			resp.body.windows(2).any(|w| w == [0xe9, b' ']),

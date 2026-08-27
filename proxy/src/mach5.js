@@ -84,6 +84,10 @@
 			letter-spacing: .06em; text-transform: uppercase }
 		fieldset { border: 0; margin: 0 0 12px; padding: 0 }
 		.tiers { display: flex; gap: 4px }
+		/* What the controls above have actually bought, because otherwise a
+		 * quality tier is an act of faith: the tiers change compression rather
+		 * than colour, so on a cached page nothing visibly happens at all. */
+		.note { margin: 8px 0 0; opacity: .65; font-size: 12px }
 		/* Five of them now, so they may not fit one row on a narrow phone. */
 		.tiers { flex-wrap: wrap }
 		.tiers button {
@@ -503,6 +507,7 @@
 				<fieldset>
 					<p>Image quality</p>
 					<div class="tiers"></div>
+					<p id="saved" class="note"></p>
 				</fieldset>
 				<button class="act" data-act="pick">Hide an element</button>
 				<button class="act" data-act="clear">Unhide all here</button>
@@ -554,7 +559,65 @@
 					refreshTiers();
 				})
 				.catch(() => {});
+
+			refreshSaved();
 		}
+	};
+
+	/* Bytes, in the largest unit that leaves a number worth reading. Mirrors
+	 * what the status page does server-side, rather than printing a count of
+	 * bytes nobody can parse at a glance. */
+	const bytes = (n) => {
+		if (!(n > 0)) {
+			return '0 B';
+		}
+
+		const units = ['B', 'kB', 'MB', 'GB', 'TB'];
+		let scaled = n;
+		let unit = 0;
+		while (scaled >= 1024 && unit < units.length - 1) {
+			scaled /= 1024;
+			unit += 1;
+		}
+
+		return (unit === 0 ? scaled : scaled.toFixed(1)) + ' ' + units[unit];
+	};
+
+	/* What the proxy has saved, and what it thinks this link can carry.
+	 *
+	 * Both are already on the status page, which is a tap away and a page load
+	 * later. Here because the quality control is here: changing a tier and
+	 * seeing no difference is what "the selector isn't working" looks like when
+	 * it is working, since the tiers change compression and the browser is
+	 * serving the old picture from its own cache anyway. */
+	const refreshSaved = () => {
+		if (!panel) {
+			return;
+		}
+
+		window
+			.fetch('/.mach5/stats.json', { credentials: 'omit' })
+			.then(checked)
+			.then((r) => r.json())
+			.then((stats) => {
+				const line = panel.querySelector('#saved');
+				if (!line) {
+					return;
+				}
+
+				const saved = bytes(
+					(stats.bytes_saved_by_images || 0) + (stats.bytes_saved_by_compression || 0),
+				);
+				// Absent means nobody has measured this client yet, which is
+				// not the same as a fast one — so it says so rather than
+				// claiming a tier it has not earned.
+				const link = stats.link_tier
+					? stats.link_tier + (stats.link_kbps ? ' · ' + stats.link_kbps + ' kbps' : '')
+					: 'not measured yet';
+
+				line.textContent = saved + ' saved · link: ' + link;
+			})
+			.catch(() => {});
 	};
 
 	const refreshTiers = () => {

@@ -70,6 +70,9 @@ function makePage(html, opts = {}) {
     if (opts.fetchRefuses) {
       return Promise.resolve({ ok: false, status: opts.fetchRefuses, json: () => Promise.resolve({}) });
     }
+    if (path === '/.mach5/stats.json') {
+      return Promise.resolve({ ok: true, json: () => Promise.resolve(opts.stats || {}) });
+    }
     const echoed = init.body ? JSON.parse(init.body) : (opts.settings || { image_quality: 'auto' });
     return Promise.resolve({ ok: true, json: () => Promise.resolve(echoed) });
   };
@@ -772,6 +775,43 @@ console.log('\n=== 9f. a page that will not have it there at all ===');
   evict.disconnect();
   ok('and then stops rather than looping forever', evicted === settled, `${settled} then ${evicted}`);
   ok('and still throws nothing', p.errors.length === 0, p.errors.map(e => e.message).join('; '));
+}
+
+console.log('\n=== 9g. the panel says what it has bought ===');
+{
+  // The control changes compression rather than colour, and a browser serves
+  // the old picture from its own cache, so on a real page nothing visibly
+  // happens when a tier changes. Without a number here that reads exactly like
+  // a broken feature — which is how it was first reported.
+  const p = makePage(NORMAL, {
+    stats: { bytes_saved_by_images: 1048576, bytes_saved_by_compression: 524288, link_tier: 'grey', link_kbps: 640 },
+  });
+  key(p.w, 'KeyH', { ctrlKey: true, shiftKey: true });
+  await tick();
+
+  ok('it asked for the counters', p.calls.some((c) => c.path === '/.mach5/stats.json'));
+  const line = p.shadow().getElementById('saved').textContent;
+  ok('the two savings are added together', /1\.5 MB saved/.test(line), line);
+  ok('and the link is named', /grey/.test(line) && /640 kbps/.test(line), line);
+}
+
+console.log('\n=== 9h. an unmeasured link does not claim to be fast ===');
+{
+  const p = makePage(NORMAL, { stats: { bytes_saved_by_images: 0, bytes_saved_by_compression: 0 } });
+  key(p.w, 'KeyH', { ctrlKey: true, shiftKey: true });
+  await tick();
+
+  const line = p.shadow().getElementById('saved').textContent;
+  ok('nothing measured says so', /not measured yet/.test(line), line);
+  ok('and zero is shown as zero', /0 B saved/.test(line), line);
+
+  // A proxy that will not answer must leave the panel usable.
+  const q = makePage(NORMAL, { fetchFails: true });
+  key(q.w, 'KeyH', { ctrlKey: true, shiftKey: true });
+  await tick();
+  ok('an offline proxy leaves it blank rather than throwing', q.errors.length === 0,
+    q.errors.map((e) => e.message).join('; '));
+  ok('and the panel still opened', q.shadow().getElementById('panel').classList.contains('open'));
 }
 
 console.log('\n=== 10. runs once, and only in the top frame ===');

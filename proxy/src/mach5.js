@@ -474,8 +474,21 @@
 		}
 	};
 
-	try {
+	/* `defer` means this normally runs with a body already parsed — but "normally"
+	 * is doing work there, and the old code called buildPanel once and gave up if
+	 * document.body was missing, leaving no panel and no way to get one. A page
+	 * that replaces its body, or any parse mach5 did not predict, lost the picker
+	 * silently. Try again when the document says it is ready. */
+	const buildWhenThereIsABody = () => {
 		buildPanel();
+		if (!shadow) {
+			document.addEventListener('DOMContentLoaded', guard(buildPanel), { once: true });
+			window.addEventListener('load', guard(buildPanel), { once: true });
+		}
+	};
+
+	try {
+		buildWhenThereIsABody();
 		document.addEventListener('keydown', guard(keys), true);
 		document.addEventListener('mousemove', guard(track), true);
 		document.addEventListener('click', guard(grab), true);

@@ -57,9 +57,57 @@ adds a hop. Most of the web is now this.
 in exchange for savings you cannot perceive. Fewer bytes over a local hop is not
 the same as faster, and the benchmark reports both columns for that reason.
 
+**Sites that fingerprint their clients.** Google, Reddit, Cloudflare-fronted
+sites and anything else with serious bot detection will start showing you
+CAPTCHAs, because from their side you *do* look like automation. This is worth
+understanding rather than working around — see below.
+
 **Anywhere you cannot accept the trust model.** See above. If installing a root
 CA on your devices makes you uneasy, that instinct is correct and this is not
 the tool for you.
+
+## Why some sites start showing you CAPTCHAs
+
+When mach5 fetches a page on your behalf, the connection the origin sees is
+**mach5's, not your browser's**. Modern bot detection fingerprints exactly that
+connection, and mach5's does not match the browser whose name is in the headers:
+
+| What they see | |
+| --- | --- |
+| TLS handshake | rustls, via ureq — not Chrome's. The JA3/JA4 fingerprint contradicts the `user-agent`. |
+| HTTP version | 1.1. Chrome has not spoken HTTP/1.1 to Google in years. |
+| `accept-encoding` | `gzip, br` — clamped to what mach5 can decode and rewrite. Chrome sends `gzip, deflate, br, zstd`. |
+| Header order | ureq's, which is itself a fingerprint. |
+| Source address | one, shared by every device behind the proxy. |
+
+A Chrome user-agent over a non-Chrome TLS handshake on HTTP/1.1 is close to a
+textbook automation signature. The sites are not wrong; that really is a proxy.
+
+**This is not fixable in any honest way.** Matching Chrome's fingerprint means a
+uTLS-style spoofing layer, maintained against a moving target, so that mach5 can
+claim to be something it is not. That is an arms race, and losing it looks like
+this; winning it is worse.
+
+**The answer is `[passthrough]`.** A listed host is never decrypted, so your
+browser's own handshake reaches it and the fingerprint matches, because it is
+genuinely your browser talking. A reasonable starting point:
+
+```toml
+[passthrough]
+hosts = [
+  # Fingerprint hard, and are already fully optimised — mach5 has nothing
+  # to add to them anyway.
+  "google.com", "gstatic.com", "googleapis.com",
+  "reddit.com", "redd.it",
+  # And everything you would not want decrypted regardless.
+  "your-bank.example",
+]
+```
+
+What you give up on those hosts is blocking, cosmetic filtering, the picker and
+compression. On sites like these that is close to nothing: they are already
+brotli-compressed and serving modern image formats, so mach5 was never going to
+make them lighter.
 
 ## Alongside pi-hole, not instead of it
 

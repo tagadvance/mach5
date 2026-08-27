@@ -314,6 +314,42 @@ console.log('\n=== 9b. a proxy that answers and says no ===');
   ok('and says so', /could not clear/.test(badge(r2)), `badge said: ${badge(r2)}`);
 }
 
+console.log('\n=== 9c. a page whose body is not there yet ===');
+{
+  // buildPanel used to be called once and give up if document.body was
+  // missing, leaving no panel and no way to get one. `defer` usually means a
+  // body is already parsed — but "usually" was carrying the whole feature.
+  const dom = new JSDOM('<!doctype html><html><head></head></html>', {
+    runScripts: 'outside-only', pretendToBeVisual: true, url: 'https://late.example/'
+  });
+  const w = dom.window;
+  let captured = null;
+  const realAttach = w.Element.prototype.attachShadow;
+  w.Element.prototype.attachShadow = function (init) {
+    const root = realAttach.call(this, { ...init, mode: 'open' });
+    captured = root;
+    return root;
+  };
+  w.fetch = () => Promise.resolve({ ok: true, json: () => Promise.resolve({ image_quality: 'auto' }) });
+  w.Element.prototype.getBoundingClientRect = function () {
+    return { left: 0, top: 0, width: 0, height: 0, right: 0, bottom: 0, x: 0, y: 0 };
+  };
+
+  // No body at all when the script runs.
+  w.document.documentElement.removeChild(w.document.body || w.document.createElement('body'));
+  let threw = null;
+  try { w.eval(SCRIPT); } catch (e) { threw = e; }
+  ok('no body: does not throw', threw === null, threw && threw.message);
+  ok('no body: no panel yet', captured === null);
+
+  // The body arrives, and the document announces itself.
+  const body = w.document.createElement('body');
+  w.document.documentElement.appendChild(body);
+  w.document.dispatchEvent(new w.Event('DOMContentLoaded'));
+  ok('the panel is built once the body exists', captured !== null);
+  ok('and the dot is in it', !!(captured && captured.getElementById('dot')));
+}
+
 console.log('\n=== 10. runs once, and only in the top frame ===');
 {
   const p = makePage(NORMAL);

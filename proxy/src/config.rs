@@ -226,15 +226,23 @@ pub struct Passthrough {
 	pub refresh_hours: u32,
 	/// Stop decrypting a host after its origin answers with a bot challenge.
 	///
-	/// mach5 is what causes those: the origin sees its TLS handshake and
-	/// HTTP/1.1 rather than the browser's, so a managed challenge fires and then
-	/// loops, because whatever passed the check is not what retries it. Noticing
-	/// and stepping aside is the only honest answer — the alternative is
-	/// pretending to be a browser, which is an arms race.
+	/// **Off by default, and the reason is worth knowing.** This was written in
+	/// answer to relentless Cloudflare challenge loops and Google CAPTCHAs, on
+	/// the theory that mach5's TLS fingerprint was the cause. It was not. The
+	/// cause was mach5 dropping all but the last `cookie` field of a request —
+	/// see `upstream::joined_for_upstream` — so a client that passed a
+	/// challenge never got its clearance cookie back to the origin and was
+	/// challenged again, for ever. With that fixed, the sites that could not be
+	/// used at all work normally and this is not needed for them.
+	///
+	/// It stays because the fingerprint mismatch is real: the origin does see
+	/// mach5's handshake and HTTP/1.1 rather than the browser's, and some site
+	/// will genuinely challenge on it. Turn it on if you actually meet one.
 	///
 	/// Learned hosts are kept separately from `hosts`, expire after a week, and
-	/// can be added or removed from the `/.mach5/` page of the host in question.
-	/// Nothing reachable from a web page can touch `hosts` itself.
+	/// nothing reachable from a web page can touch `hosts` itself. Note the
+	/// limitation recorded in `mach5.toml`: a learned host cannot be removed
+	/// from the phone, because the splice is decided before any path exists.
 	pub learn_from_challenges: bool,
 	/// The port a passed-through connection is carried to. 443 unless mach5 is
 	/// listening somewhere unusual — a transparent deployment cannot recover a
@@ -248,7 +256,7 @@ impl Default for Passthrough {
 			hosts: Vec::new(),
 			urls: Vec::new(),
 			refresh_hours: 24,
-			learn_from_challenges: true,
+			learn_from_challenges: false,
 			port: 443,
 		}
 	}

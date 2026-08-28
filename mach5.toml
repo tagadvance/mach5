@@ -461,28 +461,34 @@ refresh_hours = 24
 
 # Stop decrypting a host after its origin answers with a bot challenge.
 #
-# mach5 is what causes those. The origin sees mach5's TLS handshake and
-# HTTP/1.1 rather than the browser's, while the headers still say Chrome — a
-# textbook automation signature — so a managed challenge fires, and then loops,
-# because whatever passed the check is not what retries it.
+# OFF by default, and the reason is worth knowing before you turn it on.
 #
-# Noticing and stepping aside is the only honest answer; the alternative is
-# pretending to be a browser, which is an arms race.
+# This was written in answer to Cloudflare challenge loops that could not be
+# completed and Google CAPTCHAs on every search, on the theory that mach5's TLS
+# fingerprint was the cause. It was not. The cause was mach5 dropping all but
+# the last `cookie` field of a request, so a client that passed a challenge
+# never got its clearance cookie back to the origin and was challenged again,
+# for ever. Fixed 2026-08-28; the sites that could not be used at all now work
+# with this off.
+#
+# It stays because the fingerprint mismatch is real: the origin does see mach5's
+# handshake and HTTP/1.1 rather than the browser's, and some site will genuinely
+# challenge on that. Turn it on if you actually meet one — not pre-emptively.
 #
 # Learned hosts are kept apart from `hosts` above: they expire after a week,
 # they are exact rather than covering subdomains, and nothing a web page can
 # reach touches `hosts` itself.
 #
-# KNOWN LIMITATION, and read this before turning it on. A host can be added
-# from the /.mach5/ page of that host, but it cannot be removed there: the
-# decision to splice is made from the name in the ClientHello, before TLS is
-# terminated and therefore before any path exists, so once a host is learned
-# every request to it goes to the origin — /.mach5/ included. The "decrypt it
-# again" button on that page is unreachable for exactly the hosts it is for.
+# KNOWN LIMITATION. A host can be added from the /.mach5/ page of that host, but
+# it cannot be removed there: the decision to splice is made from the name in
+# the ClientHello, before TLS is terminated and therefore before any path
+# exists, so once a host is learned every request to it goes to the origin —
+# /.mach5/ included. The "decrypt it again" button on that page is unreachable
+# for exactly the hosts it is for.
 #
 # The ways back are to delete <state_dir>/passthrough.json and restart, or to
 # wait out the week. Both need more than the phone you are holding.
-learn_from_challenges = true
+learn_from_challenges = false
 
 # Where a passed-through connection is carried to. 443 unless mach5 is
 # listening somewhere unusual; a transparent deployment cannot recover a

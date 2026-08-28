@@ -432,10 +432,18 @@ refresh_hours = 24
 # pretending to be a browser, which is an arms race.
 #
 # Learned hosts are kept apart from `hosts` above: they expire after a week,
-# they are exact rather than covering subdomains, and they can be added or
-# removed from the /.mach5/ page OF THAT HOST — which is reachable even when
-# the site itself will not load, because mach5 serves it. Nothing a web page
-# can reach touches `hosts`.
+# they are exact rather than covering subdomains, and nothing a web page can
+# reach touches `hosts` itself.
+#
+# KNOWN LIMITATION, and read this before turning it on. A host can be added
+# from the /.mach5/ page of that host, but it cannot be removed there: the
+# decision to splice is made from the name in the ClientHello, before TLS is
+# terminated and therefore before any path exists, so once a host is learned
+# every request to it goes to the origin — /.mach5/ included. The "decrypt it
+# again" button on that page is unreachable for exactly the hosts it is for.
+#
+# The ways back are to delete <state_dir>/passthrough.json and restart, or to
+# wait out the week. Both need more than the phone you are holding.
 learn_from_challenges = true
 
 # Where a passed-through connection is carried to. 443 unless mach5 is

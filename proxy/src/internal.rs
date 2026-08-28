@@ -992,6 +992,18 @@ fn status_page(page: Page) -> String {
 	// Zero is the answer to expect, and saying so is more useful than a bare 0:
 	// it means no client has ever been slower than the origin feeding it, and
 	// the buffer bound is generous rather than load-bearing.
+	// Only shown once it has happened. A row reading zero on every proxy that
+	// runs no plugins is noise; a row that appears the day a plugin's `match`
+	// turns out wider than its author meant is the whole point of counting it.
+	let plugin_cost = if counted.not_cached_for_a_plugin == 0 {
+		String::new()
+	} else {
+		format!(
+			r#"<tr><th>Not cached for a plugin</th><td>{kept} <span class="note">responses left streaming so a plugin's chunk hooks could run</span></td></tr>"#,
+			kept = metrics::thousands(counted.not_cached_for_a_plugin),
+		)
+	};
+
 	let parked = if counted.streams_parked == 0 {
 		r#"<td class="note">never — no client has fallen behind an origin</td>"#.to_string()
 	} else {
@@ -1117,6 +1129,7 @@ fn status_page(page: Page) -> String {
     <tr><th>Streams held back</th>{parked}</tr>
     <tr><th>Bytes saved compressing</th><td>{saved}</td></tr>
     <tr><th>Saved by re-encoding images</th><td>{saved_images}</td></tr>
+    {plugin_cost}
   </table>
   {plugins}
   <h2>{host}</h2>
@@ -2430,6 +2443,23 @@ mod tests {
 		assert!(!page.contains(r##"" onclick=""##), "{page}");
 		assert!(page.contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "{page}");
 		assert!(page.contains("&quot; onclick=&quot;"), "{page}");
+	}
+
+	/// The row only exists once the cost has been paid, because a row reading
+	/// zero on every proxy that runs no plugins teaches nobody anything.
+	#[test]
+	fn what_a_plugin_cost_the_cache_is_shown_only_once_it_has_cost_something() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		let quiet = body_of(&call(&internal, "GET", "https://example.com/.mach5/", ""));
+		assert!(!quiet.contains("Not cached for a plugin"), "{quiet}");
+
+		internal.metrics.not_cached_for_a_plugin.add(3);
+
+		let loud = body_of(&call(&internal, "GET", "https://example.com/.mach5/", ""));
+		assert!(loud.contains("Not cached for a plugin"), "{loud}");
+		assert!(loud.contains(">3 <span"), "and how many:\n{loud}");
 	}
 
 	/// The host on the status page comes out of the Host header, so it is

@@ -106,6 +106,11 @@ pub struct Metrics {
 	/// has never been reached and `stream_buffer_mb` could come down; a number
 	/// that climbs with no slow clients about means it is too low.
 	pub streams_parked: Counter,
+	/// Responses that would have been cached but were left streaming so a
+	/// plugin's chunk hooks could run. The plugin wins that contest by design;
+	/// this is here so a `match` filter wider than its author meant shows up as
+	/// a number rather than as a cache that mysteriously never fills.
+	pub not_cached_for_a_plugin: Counter,
 	pub lookups_ipv4_only: Counter,
 	pub lookups_ipv6_only: Counter,
 	pub lookups_dual: Counter,
@@ -145,6 +150,7 @@ impl Default for Metrics {
 			image_cache_hits: Counter::default(),
 			image_cache_misses: Counter::default(),
 			streams_parked: Counter::default(),
+			not_cached_for_a_plugin: Counter::default(),
 			lookups_ipv4_only: Counter::default(),
 			lookups_ipv6_only: Counter::default(),
 			lookups_dual: Counter::default(),
@@ -206,6 +212,7 @@ impl Metrics {
 			image_cache_hits: self.image_cache_hits.get(),
 			image_cache_misses: self.image_cache_misses.get(),
 			streams_parked: self.streams_parked.get(),
+			not_cached_for_a_plugin: self.not_cached_for_a_plugin.get(),
 			lookups_ipv4_only: self.lookups_ipv4_only.get(),
 			lookups_ipv6_only: self.lookups_ipv6_only.get(),
 			lookups_dual: self.lookups_dual.get(),
@@ -276,6 +283,7 @@ pub struct Snapshot {
 	/// Times a worker had to wait for a client before it could hand over the
 	/// next chunk. See [`Metrics::streams_parked`].
 	pub streams_parked: u64,
+	pub not_cached_for_a_plugin: u64,
 	pub lookups_ipv4_only: u64,
 	pub lookups_ipv6_only: u64,
 	pub lookups_dual: u64,

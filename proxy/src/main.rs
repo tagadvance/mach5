@@ -662,11 +662,37 @@ fn handle_job(
 		headers: upstream::response_headers(&resp),
 	};
 
+	// Asked here, once, and before anything decides to buffer.
+	//
+	// It has to be once because a plugin *records* its answer rather than
+	// re-deriving it: the chunk hooks carry no head to test against. And it
+	// belongs here because `wants_body` is asked here, and the two are the same
+	// question about the same response — asked from further down, as this was,
+	// a plugin matched on headers mach5's own links had already rewritten while
+	// every other link matched on the origin's.
+	let wants_chunks = interceptor.wants_chunks(&job.request, &head);
+
 	// Buffered either because something wants to look at it, or because it is
 	// worth keeping — a stylesheet nobody inspects still has to be held whole
 	// to be stored.
-	let worth_keeping =
+	//
+	// Except when a plugin asked for chunks, which wins. Buffering is exactly
+	// what takes a response off the streaming branch where the chunk hooks run,
+	// so keeping it means the plugin silently never fires — and which responses
+	// that happens to depends on whether the origin sent a `content-length`, which
+	// a plugin author cannot see, control or predict. A cache miss is a
+	// performance outcome; a plugin that does not run is a correctness one for
+	// whoever wrote it.
+	let storable =
 		upstream::should_store(agents, config, &job.request, head.status, &head.headers, declared);
+
+	// Counted only where it actually costs something: this response would have
+	// been kept, and is not being, because a plugin claimed it.
+	if storable && wants_chunks {
+		metrics.not_cached_for_a_plugin.increment();
+	}
+
+	let worth_keeping = storable && !wants_chunks;
 
 	let limit = config.max_response_body();
 	let mut reader = resp.into_reader();
@@ -759,7 +785,6 @@ fn handle_job(
 
 	// Asked once, before the head is handed off: the answer holds for the whole
 	// stream, and re-asking per chunk would cost a plugin round trip each time.
-	let wants_chunks = interceptor.wants_chunks(&job.request, &head);
 	// Rewritten on the way past rather than held whole, so the client starts
 	// receiving a page while the origin is still writing it.
 	let mut rewriting = inject::streamer_for(config, &job.request, &mut head);

@@ -59,20 +59,39 @@ adds a hop. Most of the web is now this.
 in exchange for savings you cannot perceive. Fewer bytes over a local hop is not
 the same as faster, and the benchmark reports both columns for that reason.
 
-**Sites that fingerprint their clients.** Google, Reddit, Cloudflare-fronted
-sites and anything else with serious bot detection will start showing you
-CAPTCHAs, because from their side you *do* look like automation. This is worth
-understanding rather than working around — see below.
+**Sites that fingerprint their clients.** Sites with serious bot detection may
+challenge you, because from their side the connection *does* look like
+automation. Less often than this section used to claim — see below for what
+turned out to be mach5's own bug rather than fingerprinting.
 
 **Anywhere you cannot accept the trust model.** See above. If installing a root
 CA on your devices makes you uneasy, that instinct is correct and this is not
 the tool for you.
 
-## Why some sites start showing you CAPTCHAs
+## Why some sites challenge you
 
-When mach5 fetches a page on your behalf, the connection the origin sees is
-**mach5's, not your browser's**. Modern bot detection fingerprints exactly that
-connection, and mach5's does not match the browser whose name is in the headers:
+**First, the part that was our fault.** This section used to say that Google,
+Reddit and Cloudflare-fronted sites would show you CAPTCHAs constantly and that
+`[passthrough]` was the only answer. That was written from real symptoms —
+Cloudflare challenge loops that could never be completed, a CAPTCHA on every
+Google search — and the diagnosis was wrong.
+
+The cause was mach5 dropping all but the last `cookie` field of a request.
+HTTP/2 and HTTP/3 clients split `cookie` across several fields for compression,
+which RFC 9113 §8.2.3 permits and browsers do routinely, and mach5 forwarded
+only the last one. So a client that *passed* a challenge never got its clearance
+cookie back to the origin, and was challenged again, for ever. Fixed on
+2026-08-28; the sites that could not be used at all now work with no passthrough
+at all.
+
+The lesson is worth keeping: being challenged and being challenged *in a loop*
+are different failures. A loop means the thing that proves you passed is not
+arriving, which is a bug somewhere, not a policy.
+
+**What remains is real, and smaller.** When mach5 fetches a page on your behalf,
+the connection the origin sees is **mach5's, not your browser's**. Modern bot
+detection fingerprints exactly that connection, and mach5's does not match the
+browser whose name is in the headers:
 
 | What they see | |
 | --- | --- |
@@ -84,25 +103,29 @@ connection, and mach5's does not match the browser whose name is in the headers:
 
 A Chrome user-agent over a non-Chrome TLS handshake on HTTP/1.1 is close to a
 textbook automation signature. The sites are not wrong; that really is a proxy.
+What is not known is how much this costs in practice, because the one set of
+symptoms that prompted the investigation turned out to be the bug above.
 
 **This is not fixable in any honest way.** Matching Chrome's fingerprint means a
 uTLS-style spoofing layer, maintained against a moving target, so that mach5 can
 claim to be something it is not. That is an arms race, and losing it looks like
 this; winning it is worse.
 
-**The answer is `[passthrough]`.** A listed host is never decrypted, so your
-browser's own handshake reaches it and the fingerprint matches, because it is
-genuinely your browser talking. A reasonable starting point:
+**Where it does happen, the answer is `[passthrough]`.** A listed host is never
+decrypted, so your browser's own handshake reaches it and the fingerprint
+matches, because it is genuinely your browser talking.
+
+Add hosts because you met a problem on them, or because you would not want them
+decrypted in the first place — not pre-emptively against a problem you have not
+seen:
 
 ```toml
 [passthrough]
 hosts = [
-  # Fingerprint hard, and are already fully optimised — mach5 has nothing
-  # to add to them anyway.
-  "google.com", "gstatic.com", "googleapis.com",
-  "reddit.com", "redd.it",
-  # And everything you would not want decrypted regardless.
+  # Everything you would not want decrypted regardless. This is the reason
+  # that does not depend on any of the above being true.
   "your-bank.example",
+  "your-health-provider.example",
 ]
 ```
 
@@ -112,10 +135,9 @@ here does, and it is kept apart from what you wrote: a list that fails to
 download, or comes back as an error page, leaves the hosts it gave you last time
 exempt rather than quietly starting to decrypt them.
 
-What you give up on those hosts is blocking, cosmetic filtering, the picker and
-compression. On sites like these that is close to nothing: they are already
-brotli-compressed and serving modern image formats, so mach5 was never going to
-make them lighter.
+What you give up on a listed host is blocking, cosmetic filtering, the picker
+and compression. For a bank that is nothing you wanted anyway. For a site you
+listed because it challenged you, weigh it against the site working at all.
 
 ## Alongside pi-hole, not instead of it
 

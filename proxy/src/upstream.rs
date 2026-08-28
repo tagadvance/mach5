@@ -406,6 +406,8 @@ pub fn should_store(
 	// `content-length` is hop-by-hop and `response_headers` has already dropped
 	// it by the time a caller has a header list.
 	let Some(length) = declared else {
+		uncacheable(crate::host_of(&req.url));
+
 		return false;
 	};
 
@@ -530,6 +532,48 @@ pub fn read_body(reader: &mut impl std::io::Read, limit: usize) -> Buffered {
 /// origin meant to send, and handing them over with a recomputed length tells
 /// the client a short answer is the whole one.
 pub const TRUNCATED: &str = "mach5: the origin closed the connection part-way through its response\n";
+
+/// Say once per host that nothing from it can be cached, and why.
+///
+/// This is here to be grepped rather than read. An origin that compresses on
+/// the fly cannot know the length it is about to produce, so it frames the
+/// response as chunked and sends no `content-length` — and mach5 is what asked
+/// it to compress. If that is common in practice then the cache is missing the
+/// very assets it exists for, and the fix is to bound the read instead of
+/// requiring a length up front. Nobody knows whether it is common, and counting
+/// it in memory does not survive a redeploy, so it goes in the log where two
+/// weeks of real use can be counted afterwards.
+///
+/// Once per host per run, not once per asset: one page pulls a dozen scripts
+/// and stylesheets from the same origin and every one of them fails for the
+/// same reason, so per-asset would bury the answer under the noise it made.
+static REPORTED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+	std::sync::OnceLock::new();
+
+fn uncacheable(host: &str) {
+	if first_sighting(host) {
+		log::info!("uncacheable: {host} sends no content-length, so nothing from it is cached");
+	}
+}
+
+/// Whether this host has not been reported before, and there is still room to
+/// report it.
+///
+/// Split out from the logging so the once-per-host property can be asserted.
+/// The set alone cannot show it — a `HashSet` holds one entry however many
+/// times it is inserted — so a test that only inspected the set passed just as
+/// well when every asset logged a line.
+fn first_sighting(host: &str) -> bool {
+	/// A proxy that meets thousands of origins must not grow this for ever. Past
+	/// the cap it simply stops reporting new ones; the sample is already ample.
+	const MAX_REPORTED: usize = 500;
+
+	let Ok(mut seen) = REPORTED.get_or_init(Default::default).lock() else {
+		return false;
+	};
+
+	seen.len() < MAX_REPORTED && seen.insert(host.to_string())
+}
 
 /// What an origin is told when the *client* said nothing about itself.
 ///
@@ -1057,6 +1101,62 @@ mod tests {
 				.count(),
 			1,
 			"exactly one, not the client's and ours:\n{named}"
+		);
+	}
+
+	/// The grep target, and the thing that makes it usable: a page pulling a
+	/// dozen assets from one origin must not write a dozen lines.
+	#[test]
+	fn an_origin_with_no_length_is_named_once_and_not_once_per_asset() {
+		let host = "cdn.a-name-no-other-test-uses.example";
+
+		assert!(first_sighting(host), "the first asset from it reports");
+		for _ in 0..12 {
+			assert!(
+				!first_sighting(host),
+				"and every asset after it is silent, however many there are"
+			);
+		}
+
+		assert!(
+			first_sighting("another.a-name-no-other-test-uses.example"),
+			"a different origin is still worth saying, since which ones these \
+			 are is the useful half"
+		);
+	}
+
+	/// And the refusal itself, which is what puts a host in front of it.
+	#[test]
+	fn a_response_with_no_declared_length_is_not_stored() {
+		let dir = tempfile::TempDir::new().unwrap();
+		let mut config = crate::config::Config::default();
+		config.paths.cache_dir = dir.path().to_path_buf();
+
+		let mut agents = agents(std::sync::Arc::new(crate::insecure::Bypasses::default()));
+		agents.cache = crate::httpcache::Cache::new(&config).map(std::sync::Arc::new);
+
+		let host = "wiring.a-name-no-other-test-uses.example";
+		let mut req = request(Vec::new());
+		req.url = format!("https://{host}/app.js");
+		let headers = vec![
+			("content-type".to_string(), "application/javascript".to_string()),
+			("cache-control".to_string(), "public, max-age=600".to_string()),
+		];
+
+		// Cacheable in every respect but the missing length, which is exactly
+		// what an origin compressing on the fly produces.
+		assert!(
+			should_store(&agents, &config, &req, 200, &headers, Some(4096)),
+			"with a length it stores, so nothing else is the reason below"
+		);
+		assert!(!should_store(&agents, &config, &req, 200, &headers, None));
+
+		// And that the refusal is the thing that names it. Without this, the
+		// call could be deleted and only the log would go quiet, which is the
+		// one place nobody looks until they need it two weeks later.
+		assert!(
+			!first_sighting(host),
+			"should_store refused it without reporting the host"
 		);
 	}
 }

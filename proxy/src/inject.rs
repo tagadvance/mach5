@@ -71,7 +71,7 @@ impl Inject {
 		// Switched off from the panel counts as excluded everywhere, which is
 		// what somebody debugging a site is asking for.
 		self.settings.get().inject == crate::settings::Injection::Off
-			|| crate::blocklist::covers(&self.exclude, crate::host_of(&req.url))
+			|| crate::host::covers(&self.exclude, crate::host_of(&req.url))
 	}
 }
 

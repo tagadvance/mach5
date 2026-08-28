@@ -408,8 +408,8 @@ impl Passthrough {
 	/// `example-bank.com` and then being handed `secure.example-bank.com`
 	/// undecrypted is what anyone writing that line meant.
 	pub fn covers(&self, host: &str) -> bool {
-		crate::blocklist::covers(&self.hosts, host)
-			|| crate::blocklist::covers(&self.fetched(), host)
+		crate::host::covers(&self.hosts, host)
+			|| crate::host::covers(&self.fetched(), host)
 	}
 
 	/// Whether anything at all is listed, so the front ends can skip the
@@ -566,8 +566,8 @@ fn report(hosts: usize, configured: usize) {
 /// this" — and honouring it here would turn a line that means nothing about
 /// decryption into a host mach5 stops decrypting. `||cdn.example^$third-party`
 /// is the same problem the other way. Only the label rules are shared, through
-/// [`crate::blocklist::normalize`], so that a name means the same thing
-/// wherever it was written.
+/// [`crate::host::normalize`], so that a name means the same thing wherever it
+/// was written.
 fn parse(text: &str, url: &str) -> HashSet<String> {
 	let mut hosts = HashSet::new();
 	let mut refused = 0usize;
@@ -624,18 +624,18 @@ fn parse(text: &str, url: &str) -> HashSet<String> {
 /// One line of a fetched list as a host, or `None` when it is not one this list
 /// may add.
 ///
-/// The label rules are [`crate::blocklist::normalize`]'s — lowercased, no
-/// trailing root dot, at least two labels, ASCII only (a name reaches the wire
-/// as punycode, so a unicode entry could never match anything). What is added
-/// on top is a ceiling on *how much* one line may exempt, because these lists
-/// come from wherever somebody pointed the configuration and a single line is
+/// The label rules are [`crate::host::normalize`]'s — lowercased, no trailing
+/// root dot, at least two labels, ASCII only (a name reaches the wire as
+/// punycode, so a unicode entry could never match anything). What is added on
+/// top is a ceiling on *how much* one line may exempt, because these lists come
+/// from wherever somebody pointed the configuration and a single line is
 /// otherwise enough to switch decryption off for a whole country's registry.
 fn entry(raw: &str) -> Option<String> {
 	// `*.bank.example` is how some published lists spell what an entry here
 	// already means, since a parent covers its subdomains. Stripping the
 	// wildcard keeps the host rather than silently dropping it.
 	let raw = raw.strip_prefix("*.").unwrap_or(raw);
-	let host = crate::blocklist::normalize(raw)?;
+	let host = crate::host::normalize(raw)?;
 
 	// DNS's own limits. Nothing longer can be a name that ever arrives, so a
 	// longer line is filler.

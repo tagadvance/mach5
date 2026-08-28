@@ -130,7 +130,7 @@ impl Chain {
 		// First, so a blocked request never reaches a plugin at all. Added even
 		// when the list is empty, because a refresh may fill it later and the
 		// chain is built once: an empty set costs one early return in
-		// `blocklist::covers` per request, and nothing else.
+		// `host::covers` per request, and nothing else.
 		if config.blocklist.enabled {
 			links.push(Box::new(crate::blocklist::shared(config)));
 		}

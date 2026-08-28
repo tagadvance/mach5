@@ -15,6 +15,7 @@ mod disk;
 mod cosmetic;
 mod encoding;
 mod fetch;
+mod host;
 mod httpcache;
 mod imagecache;
 mod images;

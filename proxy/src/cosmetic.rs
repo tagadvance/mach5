@@ -426,10 +426,10 @@ fn parse(line: &str) -> Option<Rule> {
 			// An unreadable exclusion is the dangerous half: honouring the rest
 			// of the rule would apply it in exactly the place the list said not
 			// to, so the whole rule goes.
-			Some(name) => excluded.push(crate::blocklist::normalize(name)?),
+			Some(name) => excluded.push(crate::host::normalize(name)?),
 			// An unreadable inclusion only ever narrows the rule, so the rest of
 			// it still stands.
-			None => wanted.extend(crate::blocklist::normalize(entry)),
+			None => wanted.extend(crate::host::normalize(entry)),
 		}
 	}
 

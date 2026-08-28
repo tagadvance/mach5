@@ -25,6 +25,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
+use crate::host::{covers, normalize};
 use crate::interceptor::{Interceptor, ProxyRequest, ProxyResponse, ResponseHead};
 
 /// A 1×1 transparent GIF. Serving this rather than an empty body keeps a
@@ -33,15 +34,6 @@ const TRANSPARENT_GIF: [u8; 43] = [
 	0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0xff, 0xff, 0xff, 0x21, 0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00,
 	0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b,
-];
-
-/// Names a hosts file points at loopback for its own housekeeping. Blocking
-/// them would be pointless at best and confusing at worst.
-const HOUSEKEEPING: [&str; 4] = [
-	"localhost",
-	"localhost.localdomain",
-	"local",
-	"broadcasthost",
 ];
 
 /// Where fetched lists are kept, under the configured cache directory.
@@ -305,25 +297,6 @@ fn wants_image(req: &ProxyRequest) -> bool {
 	})
 }
 
-/// Whether the host, or any domain above it, is in the set. Walking the parents
-/// is what makes this label-aware: `notdoubleclick.net` never reaches
-/// `doubleclick.net`, where a substring test would have matched it.
-///
-/// Shared with [`crate::inject`], so that "a parent domain covers its
-/// subdomains" means the same thing wherever a host is matched against a list.
-pub fn covers(set: &HashSet<String>, host: &str) -> bool {
-	if set.is_empty() {
-		return false;
-	}
-
-	let host = host.trim_end_matches('.').to_ascii_lowercase();
-
-	std::iter::successors(Some(host.as_str()), |name| {
-		name.split_once('.').map(|(_label, parent)| parent)
-	})
-	.any(|name| set.contains(name))
-}
-
 /// How often to rebuild the list, or `None` when nothing is to be rebuilt.
 ///
 /// Zero hours switches refreshing off deliberately: it is the old behaviour,
@@ -576,35 +549,6 @@ fn anchored(rule: &str) -> Anchored<'_> {
 	}
 }
 
-/// A name a hosts file points at loopback for its own sake, not to block it.
-/// The `ip6-*` family are the same idea.
-fn housekeeping(domain: &str) -> bool {
-	HOUSEKEEPING.contains(&domain) || domain.starts_with("ip6-")
-}
-
-/// Lowercase and drop a trailing root dot. Single-label names are rejected: a
-/// stray `localhost`, or the remains of a line we misread, would otherwise be a
-/// parent of nothing useful — or, worse, of everything.
-///
-/// Shared with [`crate::cosmetic`], whose rules name domains in the same shape
-/// and have the same reasons to refuse the ones that are not.
-pub fn normalize(raw: &str) -> Option<String> {
-	let domain = raw.trim().trim_end_matches('.').to_ascii_lowercase();
-
-	if !domain.contains('.') || housekeeping(&domain) {
-		return None;
-	}
-
-	let plausible = domain.split('.').all(|label| {
-		!label.is_empty()
-			&& label
-				.chars()
-				.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-	});
-
-	plausible.then_some(domain)
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -831,12 +775,6 @@ mod tests {
 			"a bare TLD must not block a site"
 		);
 		assert!(!list.blocks("nodot"));
-		assert_eq!(normalize("localhost"), None);
-		assert_eq!(normalize("example.com."), Some("example.com".to_string()));
-		assert_eq!(
-			normalize("ADS.Example.COM"),
-			Some("ads.example.com".to_string())
-		);
 	}
 
 	#[test]

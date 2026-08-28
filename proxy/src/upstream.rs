@@ -86,15 +86,28 @@ pub struct Agents {
 	metrics: std::sync::Arc<crate::metrics::Metrics>,
 }
 
+/// Everything an upstream agent carries that does not depend on configuration.
+///
+/// Separated so the tests can build their own `Agents` — they need the bypass
+/// registry and the counters to belong to the test rather than to the process —
+/// without thereby exercising a differently configured HTTP client from the one
+/// that ships. That is not hypothetical: this existed as a closure, the test
+/// helper called `AgentBuilder::new()` instead, and so nothing set here was
+/// covered by anything.
+fn base() -> ureq::AgentBuilder {
+	ureq::AgentBuilder::new()
+		.user_agent(NO_AGENT_STATED)
+		// Pass 3xx through to the client; it re-requests and we intercept again.
+		.redirects(0)
+}
+
 /// Builds the shared upstream HTTP agents.
 pub fn agents(config: &Config) -> Agents {
 	let builder = || {
-		ureq::AgentBuilder::new()
+		base()
 			// Ours, so which family an origin is reached over is a decision
 			// rather than an accident of whatever the resolver felt like.
 			.resolver(crate::resolver::Ordered::new(config.upstream.addresses))
-			// Pass 3xx through to the client; it re-requests and we intercept again.
-			.redirects(0)
 			.timeout_connect(Duration::from_secs(config.limits.connect_timeout_seconds))
 			.timeout_read(Duration::from_secs(config.limits.read_timeout_seconds))
 	};
@@ -518,6 +531,31 @@ pub fn read_body(reader: &mut impl std::io::Read, limit: usize) -> Buffered {
 /// the client a short answer is the whole one.
 pub const TRUNCATED: &str = "mach5: the origin closed the connection part-way through its response\n";
 
+/// What an origin is told when the *client* said nothing about itself.
+///
+/// A client's own `user-agent` is forwarded untouched and never reaches this;
+/// ureq only fills one in when the request carries none, and it cannot be told
+/// to send nothing at all — an empty value writes an empty header, which is its
+/// own oddity and is refused outright by some filters. So the choice is which
+/// string, not whether.
+///
+/// `ureq/2.12.1` was the wrong one. It named a dependency and its exact
+/// version, which is a detail an origin has no business learning and which
+/// helps somebody choose an exploit.
+///
+/// Naming mach5 would be worse: unique to this proxy, so every user of it
+/// becomes identifiable as one, which is precisely the tracking this is meant
+/// to avoid. Claiming to be Chrome would be worse still. Every other signal on
+/// the connection says otherwise — the TLS handshake is rustls, the version is
+/// HTTP/1.1 — so it would *manufacture* the contradiction the README describes
+/// as the reason sites challenge us, and it would need chasing every four weeks
+/// or become a fingerprint meaning "something is pretending, and gave up".
+///
+/// This is the most common token on the web and belongs to nothing: no version
+/// of any real product, no claim to be one, and nothing that singles out a
+/// mach5 user from anyone else who sent it.
+const NO_AGENT_STATED: &str = "Mozilla/5.0";
+
 /// Repeated request headers folded into one line each, in the order they were
 /// first seen.
 ///
@@ -688,11 +726,12 @@ mod tests {
 	}
 
 	/// Built by hand rather than through [`agents`], so the registry and the
-	/// counters belong to this test instead of to the process.
+	/// counters belong to this test instead of to the process — but through
+	/// [`base`], so what goes on the wire is what ships.
 	fn agents(bypasses: std::sync::Arc<crate::insecure::Bypasses>) -> Agents {
 		Agents {
-			strict: ureq::AgentBuilder::new().build(),
-			permissive: ureq::AgentBuilder::new().build(),
+			strict: base().build(),
+			permissive: base().build(),
 			bypasses,
 			metrics: std::sync::Arc::new(crate::metrics::Metrics::default()),
 			cache: None,
@@ -977,5 +1016,47 @@ mod tests {
 			Buffered::Whole(body) => assert_eq!(body.len(), 1024, "the limit itself is not over it"),
 			_ => panic!("exactly at the limit is whole"),
 		}
+	}
+
+	/// A client that named itself is relayed untouched; one that did not gets a
+	/// token that names nothing.
+	#[test]
+	fn an_origin_is_never_told_which_http_client_this_is() {
+		let (bare, _) = what_reached_the_origin(Vec::new());
+
+		assert!(
+			!bare.to_ascii_lowercase().contains("ureq"),
+			"the dependency and its version leaked to the origin:\n{bare}"
+		);
+		assert!(
+			bare.contains(&format!("User-Agent: {NO_AGENT_STATED}")),
+			"and something has to be sent, because an empty value writes an \
+			 empty header:\n{bare}"
+		);
+		assert!(
+			!bare.to_ascii_lowercase().contains("mach5 ")
+				&& !bare.contains("Chrome")
+				&& !bare.contains("Safari"),
+			"it must not name this proxy, or claim to be a browser the rest of \
+			 the connection contradicts:\n{bare}"
+		);
+
+		// The common case, and the one that must not change: a client with a
+		// user-agent of its own keeps it.
+		let chrome = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/131";
+		let (named, _) = what_reached_the_origin(vec![(
+			"user-agent".to_string(),
+			chrome.to_string(),
+		)]);
+
+		assert!(named.contains(&format!("user-agent: {chrome}")), "{named}");
+		assert_eq!(
+			named
+				.lines()
+				.filter(|line| line.to_ascii_lowercase().starts_with("user-agent:"))
+				.count(),
+			1,
+			"exactly one, not the client's and ours:\n{named}"
+		);
 	}
 }

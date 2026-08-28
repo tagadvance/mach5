@@ -450,12 +450,19 @@ enum Allowed {
 	/// then the conditional request is mach5's question and not the client's
 	/// (RFC 9110 §13.1.3). `upstream::conditional`.
 	ConditionalWhileRevalidating,
-	/// ureq's own default, put on a request the client left bare. Nothing in
-	/// `src/` asks for these or documents them — they are the HTTP client
-	/// library showing through, and this harness is what found them. See
-	/// [`the_http_client_fills_in_its_own_defaults`], which pins the exact
-	/// values so a change of library or version cannot pass unnoticed.
-	AddedByTheHttpClient,
+	/// Supplied on a request the client left bare, because the HTTP client
+	/// cannot be told to send nothing at all — an empty value writes an empty
+	/// header.
+	///
+	/// This harness found these arriving as ureq's own defaults, naming the
+	/// library and its exact version to every origin. `user-agent` is now
+	/// chosen deliberately in `upstream::NO_AGENT_STATED`; `accept` is still
+	/// the library showing through, and is semantically free (RFC 9110
+	/// §12.5.1: an absent `accept` means `*/*`).
+	///
+	/// [`what_a_bare_request_is_given`] pins both, so neither can drift back
+	/// into naming something.
+	SuppliedWhenTheClientSaidNothing,
 }
 
 /// Whether mach5 has a cache entry of its own it is asking the origin about.
@@ -497,7 +504,7 @@ fn allowance(name: &str, sent: &[String], cache: Cache) -> Option<Allowed> {
 		{
 			Allowed::ConditionalWhileRevalidating
 		}
-		"user-agent" | "accept" if sent.is_empty() => Allowed::AddedByTheHttpClient,
+		"user-agent" | "accept" if sent.is_empty() => Allowed::SuppliedWhenTheClientSaidNothing,
 		_ => return None,
 	})
 }
@@ -831,7 +838,7 @@ fn an_upload_reaches_the_origin_byte_for_byte() {
 /// Pinned here rather than waved through, so that a change of client library or
 /// version has to come past this test.
 #[test]
-fn the_http_client_fills_in_its_own_defaults() {
+fn what_a_bare_request_is_given() {
 	let _serial = one_at_a_time();
 	let harness = Harness::start();
 
@@ -850,11 +857,17 @@ fn the_http_client_fills_in_its_own_defaults() {
 		.get("user-agent")
 		.and_then(|values| values.first().cloned())
 		.unwrap_or_default();
-	assert!(
-		agent.starts_with("ureq/"),
-		"the origin is told which HTTP client mach5 uses, and its version: \
-		 {agent}\n{arrived}"
-	);
+
+	// Something has to be sent, so the question is only what. Not the HTTP
+	// library and its version, which is what this harness found here and which
+	// tells an origin what mach5 is built from. Not mach5's own name either:
+	// unique to this proxy, so every user of it becomes identifiable as one.
+	// And not a browser's, which every other signal on the connection would
+	// contradict.
+	assert!(!agent.to_ascii_lowercase().contains("ureq"), "{arrived}");
+	assert!(!agent.to_ascii_lowercase().contains("mach5"), "{arrived}");
+	assert!(!agent.contains("Chrome") && !agent.contains("Safari"), "{arrived}");
+	assert_eq!(agent, "Mozilla/5.0", "{arrived}");
 }
 
 /// A client's own conditional is the client's question, and mach5 has no cache

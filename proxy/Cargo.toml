@@ -37,6 +37,10 @@ image = { version = "0.25.10", default-features = false, features = ["jpeg", "pn
 
 [dev-dependencies]
 tempfile = "3"
+# Unions with the features above: the fidelity harness needs a client that can
+# speak h2 and send the same header field twice, which is the input the cookie
+# bug turned on and no hand-rolled HTTP/1.1 test client could express.
+hyper = { version = "1", features = ["client"] }
 
 [[bin]]
 name = "mach5-proxy"

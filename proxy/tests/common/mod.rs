@@ -149,6 +149,7 @@ impl Proxy {
 				 enabled = false\n\
 				 \n\
 				 [blocklist]\n\
+				 enabled = {filtering}\n\
 				 files = [\"{blocklist_file}\"]\n\
 				 \n\
 				 [paths]\n\
@@ -159,6 +160,10 @@ impl Proxy {
 				 worker_threads = 2\n\
 				 max_request_body_mb = 1\n\
 				 {extra}\n",
+				// An empty list means the blocklist is *off*, not merely empty:
+				// a test asserting that mach5 relays a request untouched wants the
+				// link out of the chain, not sitting in it matching nothing.
+				filtering = !blocklist.trim().is_empty(),
 				blocklist_file = path.join("blocklist.txt").display(),
 				cache = path.join("cache").display(),
 				state = path.display(),

@@ -89,3 +89,6 @@ Temporary Items
 # node, for the client-side tests
 node_modules/
 .env
+
+# scratch: working notes and history backups, never published
+tmp/

@@ -969,8 +969,13 @@ fn status_page(page: Page) -> String {
 			r#"{saved_origin} not re-fetched · {hits} served, {revalidated} revalidated"#,
 			r#"</span> <button data-post="/.mach5/cache/clear">empty it</button></td>"#,
 		),
-		saved_images = metrics::bytes(counted.bytes_saved_by_images),
-		saved_origin = metrics::bytes(counted.bytes_saved_by_origin_cache),
+		saved_images = metrics::share(counted.bytes_saved_by_images, counted.without_mach5()),
+		// Its own denominator: a cached body still reached the client, so what it
+		// saved was the fetch, and the fetch is what it is a share of.
+		saved_origin = metrics::share(
+			counted.bytes_saved_by_origin_cache,
+			counted.bytes_from_origin + counted.bytes_saved_by_origin_cache,
+		),
 		hits = metrics::thousands(counted.origin_cache_hits),
 		revalidated = metrics::thousands(counted.origin_cache_revalidated),
 	);
@@ -1069,9 +1074,18 @@ fn status_page(page: Page) -> String {
 	let tls_failures = metrics::thousands(counted.tls_failures);
 	let upstream_failures = metrics::thousands(counted.upstream_failures);
 	let from_origin = metrics::bytes(counted.bytes_from_origin);
-	let to_client = metrics::bytes(counted.bytes_to_client);
-	let saved = metrics::bytes(counted.bytes_saved_by_compression);
-	let saved_images = metrics::bytes(counted.bytes_saved_by_images);
+	// The comparison the savings below are shares of, spelled out once. A
+	// megabyte off is nothing or nearly everything depending on this number, and
+	// nobody should have to hold the arithmetic in their head from three rows
+	// away.
+	let without = counted.without_mach5();
+	let to_client = format!(
+		r#"{sent} <span class="note">of {without} without mach5</span>"#,
+		sent = metrics::bytes(counted.bytes_to_client),
+		without = metrics::bytes(without),
+	);
+	let saved = metrics::share(counted.bytes_saved_by_compression, without);
+	let saved_images = metrics::share(counted.bytes_saved_by_images, without);
 	let plugins = plugin_table(&counted.plugins);
 	let certificates = if bypassed {
 		"<p>Certificate validation is <strong>bypassed</strong> for this site until \
@@ -2443,6 +2457,32 @@ mod tests {
 		assert!(!page.contains(r##"" onclick=""##), "{page}");
 		assert!(page.contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "{page}");
 		assert!(page.contains("&quot; onclick=&quot;"), "{page}");
+	}
+
+	/// A byte count with nothing beside it cannot be judged: the same 4 MB is
+	/// nothing off a 100 MB day and most of the page off an 8 MB one.
+	#[test]
+	fn every_saving_is_shown_as_a_share_of_what_would_have_been_sent() {
+		let dir = TempDir::new().unwrap();
+		let internal = internal(&dir);
+
+		internal.metrics.bytes_to_client.add(6 * 1024 * 1024);
+		internal.metrics.bytes_saved_by_compression.add(2 * 1024 * 1024);
+		internal.metrics.bytes_saved_by_images.add(2 * 1024 * 1024);
+		// The client read these, so they are no part of its share — but the
+		// origin was never asked for them, so they are all of the fetch's.
+		internal.metrics.bytes_from_origin.add(3 * 1024 * 1024);
+		internal.metrics.bytes_saved_by_origin_cache.add(1024 * 1024);
+
+		let page = body_of(&call(&internal, "GET", "https://example.com/.mach5/", ""));
+
+		// 2 MB each off the 10 MB that would have crossed the wire.
+		assert!(page.contains("2.0 MB (20%)"), "{page}");
+		// And the whole, once, so the shares have something to be shares of.
+		assert!(page.contains("6.0 MB <span class=\"note\">of 10.0 MB without mach5"), "{page}");
+		// The cache saved a fetch rather than a delivery, so it is measured
+		// against the fetches: 1 MB of the 4 MB the origins would have sent.
+		assert!(page.contains("1.0 MB (25%) not re-fetched"), "{page}");
 	}
 
 	/// The row only exists once the cost has been paid, because a row reading

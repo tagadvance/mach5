@@ -292,6 +292,26 @@ pub struct Snapshot {
 	pub plugins: BTreeMap<String, PluginStats>,
 }
 
+impl Snapshot {
+	/// What clients would have had to read had mach5 not been in the way: what
+	/// they did read, plus every byte taken out of the stream before they read
+	/// it.
+	///
+	/// One denominator for every client-side saving, so the shares on the page
+	/// are of the same whole and add up to the share of it.
+	///
+	/// Images dropped in text-only mode are in neither half — the origin was
+	/// never asked, so what it would have sent is not known — which makes this
+	/// an understatement rather than a guess.
+	///
+	/// The origin cache is deliberately not in here. Those bytes still reached
+	/// the client; what they saved was the fetch, so the cache row divides by
+	/// `bytes_from_origin` instead.
+	pub fn without_mach5(&self) -> u64 {
+		self.bytes_to_client + self.bytes_saved_by_compression + self.bytes_saved_by_images
+	}
+}
+
 /// One set per process, exactly as [`crate::blocklist::shared`] does it. Both
 /// front ends and every chain count into the same numbers.
 pub fn shared() -> Arc<Metrics> {
@@ -327,6 +347,34 @@ pub fn bytes(n: u64) -> String {
 	}
 
 	format!("{} B", thousands(n))
+}
+
+/// A saving, and the share it is of what would have crossed the wire without
+/// it.
+///
+/// The number on its own is not an answer: 4 MB off a 100 MB day is nothing,
+/// and 4 MB off an 8 MB day is most of the page. The denominator is therefore
+/// the counterfactual — what was sent *plus* what was not — so the figure can
+/// approach 100% and never pass it. Dividing by what was actually sent would
+/// call a body squeezed to a fifth a 400% saving, which is a true ratio and
+/// not the one anybody reads it as.
+///
+/// Rounded to whole percent, since a tenth of a percent is below the accuracy
+/// of counters that drop the occasional relaxed increment. `<1%` rather than
+/// `0%` when something was saved, because a saving reported as zero reads as a
+/// broken feature.
+pub fn share(part: u64, whole: u64) -> String {
+	if part == 0 || whole == 0 {
+		return bytes(part);
+	}
+
+	let percent = (part as f64 * 100.0 / whole as f64).round() as u64;
+
+	if percent == 0 {
+		return format!("{} (<1%)", bytes(part));
+	}
+
+	format!("{} ({percent}%)", bytes(part))
 }
 
 /// How long a plugin took, in the unit that leaves a number worth reading:
@@ -436,6 +484,36 @@ mod tests {
 			"the two together are what the origin gave us"
 		);
 		assert_eq!(bytes(metrics.bytes_saved_by_compression.get()), "3.0 KB");
+	}
+
+	#[test]
+	fn a_saving_is_shown_against_what_would_have_been_sent() {
+		// A fifth of the bytes went out, so four fifths were saved — not the
+		// 400% that dividing by what was actually sent would report.
+		assert_eq!(share(4096, 5120), "4.0 KB (80%)");
+		assert_eq!(share(1, 5000), "1 B (<1%)", "a saving is never rounded away");
+		assert_eq!(share(0, 5000), "0 B", "nothing saved says nothing");
+		assert_eq!(share(0, 0), "0 B", "before any traffic at all");
+		assert_eq!(share(4096, 0), "4.0 KB", "a whole nobody has counted");
+	}
+
+	#[test]
+	fn one_denominator_covers_every_client_side_saving() {
+		let metrics = Metrics::default();
+
+		metrics.bytes_to_client.add(6000);
+		metrics.bytes_saved_by_compression.add(3000);
+		metrics.bytes_saved_by_images.add(1000);
+		// The client read these; the cache only saved fetching them, so they
+		// are no part of what the client would have had to read.
+		metrics.bytes_saved_by_origin_cache.add(50_000);
+
+		let counted = metrics.snapshot();
+		let whole = counted.without_mach5();
+
+		assert_eq!(whole, 10_000);
+		assert_eq!(share(counted.bytes_saved_by_compression, whole), "2.9 KB (30%)");
+		assert_eq!(share(counted.bytes_saved_by_images, whole), "1,000 B (10%)");
 	}
 
 	#[test]

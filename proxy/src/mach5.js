@@ -583,6 +583,20 @@
 		return (unit === 0 ? scaled : scaled.toFixed(1)) + ' ' + units[unit];
 	};
 
+	/* A saving as a share of what would have been sent without it. Mirrors
+	 * `share` in metrics.rs, denominator included: what was sent plus what was
+	 * not, so it approaches 100% and never passes it. Empty when there is
+	 * nothing to divide, since "(0%)" beside a zero saving is noise. */
+	const percent = (part, whole) => {
+		if (!(part > 0) || !(whole > 0)) {
+			return '';
+		}
+
+		const rounded = Math.round((part * 100) / whole);
+
+		return rounded === 0 ? ' (<1%)' : ' (' + rounded + '%)';
+	};
+
 	/* What the proxy has saved, and what it thinks this link can carry.
 	 *
 	 * Both are already on the status page, which is a tap away and a page load
@@ -605,9 +619,10 @@
 					return;
 				}
 
-				const saved = bytes(
-					(stats.bytes_saved_by_images || 0) + (stats.bytes_saved_by_compression || 0),
-				);
+				const total =
+					(stats.bytes_saved_by_images || 0) + (stats.bytes_saved_by_compression || 0);
+				const saved =
+					bytes(total) + ' saved' + percent(total, total + (stats.bytes_to_client || 0));
 				// Absent means nobody has measured this client yet, which is
 				// not the same as a fast one — so it says so rather than
 				// claiming a tier it has not earned.
@@ -615,7 +630,7 @@
 					? stats.link_tier + (stats.link_kbps ? ' · ' + stats.link_kbps + ' kbps' : '')
 					: 'not measured yet';
 
-				line.textContent = saved + ' saved · link: ' + link;
+				line.textContent = saved + ' · link: ' + link;
 			})
 			.catch(() => {});
 	};

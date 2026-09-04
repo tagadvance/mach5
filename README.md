@@ -59,7 +59,7 @@ to WebP, and defers off-screen ones. Benchmarked across a mixed set of pages:
 hiding an element permanently on a site that will not stop showing it to you,
 and rewriting any page with a plugin.
 
-## When it is not
+## When it is not worth running
 
 **A modern site behind a CDN.** It is already brotli-compressed, already serving
 WebP or AVIF, already lazy-loading. There is nothing left for mach5 to win and it
@@ -71,37 +71,17 @@ the same as faster, and the benchmark reports both columns for that reason.
 
 **Sites that fingerprint their clients.** Sites with serious bot detection may
 challenge you, because from their side the connection *does* look like
-automation. Less often than this section used to claim — see below for what
-turned out to be mach5's own bug rather than fingerprinting.
+automation. See below for what they see, and what to do about it.
 
 **Anywhere you cannot accept the trust model.** See above. If installing a root
 CA on your devices makes you uneasy, that instinct is correct and this is not
 the tool for you.
 
-## Why some sites challenge you
+## If a site challenges you
 
-**First, the part that was our fault.** This section used to say that Google,
-Reddit and Cloudflare-fronted sites would show you CAPTCHAs constantly and that
-`[passthrough]` was the only answer. That was written from real symptoms —
-Cloudflare challenge loops that could never be completed, a CAPTCHA on every
-Google search — and the diagnosis was wrong.
-
-The cause was mach5 dropping all but the last `cookie` field of a request.
-HTTP/2 and HTTP/3 clients split `cookie` across several fields for compression,
-which RFC 9113 §8.2.3 permits and browsers do routinely, and mach5 forwarded
-only the last one. So a client that *passed* a challenge never got its clearance
-cookie back to the origin, and was challenged again, for ever. Fixed on
-2026-08-28; the sites that could not be used at all now work with no passthrough
-at all.
-
-The lesson is worth keeping: being challenged and being challenged *in a loop*
-are different failures. A loop means the thing that proves you passed is not
-arriving, which is a bug somewhere, not a policy.
-
-**What remains is real, and smaller.** When mach5 fetches a page on your behalf,
-the connection the origin sees is **mach5's, not your browser's**. Modern bot
-detection fingerprints exactly that connection, and mach5's does not match the
-browser whose name is in the headers:
+When mach5 fetches a page on your behalf, the connection the origin sees is
+**mach5's, not your browser's**. Modern bot detection fingerprints exactly that
+connection, and mach5's does not match the browser whose name is in the headers:
 
 | What they see | |
 | --- | --- |
@@ -113,8 +93,8 @@ browser whose name is in the headers:
 
 A Chrome user-agent over a non-Chrome TLS handshake on HTTP/1.1 is close to a
 textbook automation signature. The sites are not wrong; that really is a proxy.
-What is not known is how much this costs in practice, because the one set of
-symptoms that prompted the investigation turned out to be the bug above.
+How much this costs in day-to-day use is not known — the mechanism is certain,
+its frequency is not.
 
 **This is not fixable in any honest way.** Matching Chrome's fingerprint means a
 uTLS-style spoofing layer, maintained against a moving target, so that mach5 can

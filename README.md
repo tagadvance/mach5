@@ -1,5 +1,15 @@
 # mach5
 
+**TL;DR** — mach5 is a self-hosted web accelerator: a proxy you run on your own
+network that shrinks pages on their way to your devices. It is a hobby project,
+built for one person on hardware they own, and it is not a product. Opera Mini
+and Google's Chrome Data Saver were this exact idea with real money behind it;
+Google retired theirs in 2022 citing cheap mobile data, and Opera's still ships
+in the markets where bytes are not cheap. Which is the honest pitch: run it
+where bandwidth still costs you something.
+
+---
+
 An intercepting proxy that makes the web lighter on slow connections, blocks
 what you tell it to, and lets you rewrite pages with a plugin in any language.
 

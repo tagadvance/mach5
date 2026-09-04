@@ -1,5 +1,9 @@
 # mach5
 
+[![CI](https://github.com/tagadvance/mach5/actions/workflows/ci.yml/badge.svg)](https://github.com/tagadvance/mach5/actions/workflows/ci.yml)
+[![Audit](https://github.com/tagadvance/mach5/actions/workflows/audit.yml/badge.svg)](https://github.com/tagadvance/mach5/actions/workflows/audit.yml)
+[![Licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
+
 **TL;DR** — mach5 is a self-hosted web accelerator: a proxy you run on your own
 network that shrinks pages on their way to your devices. It is a hobby project,
 built for one person on hardware they own, and it is not a product. Opera Mini

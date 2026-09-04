@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: clippy and tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: proxy
+    steps:
+      - uses: actions/checkout@v7
+
+      # quiche compiles BoringSSL from source: cmake and a C compiler build it,
+      # and libclang is what boring-sys generates its bindings with. None of it
+      # is needed at runtime.
+      - name: Install the BoringSSL build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends cmake libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # BoringSSL alone is minutes of the build and only changes when the
+      # manifests do, so keep it out of the edit loop here as well.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: proxy
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- --deny warnings
+
+      # The fidelity harness binds 127.0.0.1:443, because mach5 takes the origin
+      # from the SNI and an SNI carries no port. Lowering the floor for a
+      # throwaway runner is the cheap equivalent of CAP_NET_BIND_SERVICE, and
+      # leaves the tests themselves unprivileged.
+      - name: Allow an unprivileged bind to 443
+        run: sudo sysctl --write net.ipv4.ip_unprivileged_port_start=443
+
+      - name: Test
+        run: cargo test

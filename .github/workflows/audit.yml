@@ -1,0 +1,41 @@
+name: Audit
+
+# Kept apart from CI because it fails for a different reason: not that the code
+# broke, but that somebody published an advisory against a dependency. The
+# schedule is the point — the advisory database moves when the code does not.
+on:
+  push:
+    branches: [main]
+    paths:
+      - proxy/Cargo.toml
+      - proxy/Cargo.lock
+      - .github/workflows/audit.yml
+  pull_request:
+    paths:
+      - proxy/Cargo.toml
+      - proxy/Cargo.lock
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Reads the lockfile only, so none of the BoringSSL build is needed here.
+      - name: Audit
+        run: cargo audit
+        working-directory: proxy
